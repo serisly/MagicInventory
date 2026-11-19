@@ -78,7 +78,8 @@ public sealed unsafe class InventorySortPlanner
         armouryFreeByType[InventoryType.ArmorySoulCrystal] = CountEmptySlots(manager, [InventoryType.ArmorySoulCrystal]);
 
         // 1. Merge split partial stacks inside Bags (identical RawItemId = same item + same NQ/HQ)
-        var partialStacks = new Dictionary<uint, List<(InventoryType Container, int Slot, int Qty, int StackSize, uint BaseId, string Name)>>();
+        // Keyed by (ItemId, IsHq) so NQ and HQ stacks are never "merged" (which would just swap them).
+        var partialStacks = new Dictionary<(uint ItemId, bool IsHq), List<(InventoryType Container, int Slot, int Qty, int StackSize, uint BaseId, string Name)>>();
         foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
         {
             var container = manager->GetInventoryContainer(bag);
@@ -102,10 +103,11 @@ public sealed unsafe class InventorySortPlanner
                     continue;
                 }
 
-                if (!partialStacks.TryGetValue(slot->ItemId, out var list))
+                var stackKey = (slot->ItemId, slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality));
+                if (!partialStacks.TryGetValue(stackKey, out var list))
                 {
                     list = new List<(InventoryType, int, int, int, uint, string)>();
-                    partialStacks[slot->ItemId] = list;
+                    partialStacks[stackKey] = list;
                 }
 
                 list.Add((bag, i, slot->Quantity, (int)row.Value.StackSize, baseId, row.Value.Name.ExtractText()));

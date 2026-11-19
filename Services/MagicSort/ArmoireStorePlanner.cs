@@ -26,16 +26,19 @@ public sealed unsafe class ArmoireStorePlanner
 {
     private readonly IDataManager dataManager;
     private readonly IGameGui gameGui;
+    private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
     private readonly Dictionary<uint, uint> cabinetRowByItemId = new();
 
     public ArmoireStorePlanner(
         IDataManager dataManager,
         IGameGui gameGui,
+        SafeTransactionQueue transactionQueue,
         InventorySafetyEvaluator safety)
     {
         this.dataManager = dataManager;
         this.gameGui = gameGui;
+        this.transactionQueue = transactionQueue;
         this.safety = safety;
         LoadCabinetLookup();
     }
@@ -215,6 +218,15 @@ public sealed unsafe class ArmoireStorePlanner
                         var yesNo = (AddonSelectYesno*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectYesno");
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
+                            // Only confirm a prompt that is clearly about this item / the armoire; never blind-click Yes.
+                            var promptText = yesNo->PromptText != null ? yesNo->PromptText->NodeText.ToString() : string.Empty;
+                            if (!promptText.Contains(captured.Name, StringComparison.OrdinalIgnoreCase)
+                                && !promptText.Contains("armoire", StringComparison.OrdinalIgnoreCase))
+                            {
+                                transactionQueue.Cancel("Stopped: unexpected confirmation prompt.", QueueBatchOutcome.AbortedOnError);
+                                return false;
+                            }
+
                             var now = DateTime.UtcNow;
                             if (yesReadyUtc == DateTime.MinValue)
                             {

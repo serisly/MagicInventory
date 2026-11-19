@@ -114,7 +114,33 @@ public sealed unsafe class MagicSortService : IDisposable
         materiaPlanner = new MateriaExtractPlanner(dataManager, gameGui, condition, transactionQueue, InvalidateButtonCache);
         usePlanner = new UseItemsPlanner(dataManager, condition, chatGui, transactionQueue, safety);
         inventorySortPlanner = new InventorySortPlanner(dataManager, condition, transactionQueue, safety);
-        armoirePlanner = new ArmoireStorePlanner(dataManager, gameGui, safety);
+        armoirePlanner = new ArmoireStorePlanner(dataManager, gameGui, transactionQueue, safety);
+
+        // One-time migration: the old "Lock Item" feature was removed. Preserve the user's intent by
+        // converting any previously locked items into a "Keep" rule so they stay protected.
+        var migratedLocks = false;
+        foreach (var profile in configuration.Characters.Values)
+        {
+            foreach (var lockedId in profile.LockedItemIds)
+            {
+                if (lockedId != 0 && !configuration.ManualRouteOverrides.ContainsKey(lockedId))
+                {
+                    configuration.ManualRouteOverrides[lockedId] = "Keep";
+                    migratedLocks = true;
+                }
+            }
+
+            if (profile.LockedItemIds.Count > 0)
+            {
+                profile.LockedItemIds.Clear();
+                migratedLocks = true;
+            }
+        }
+
+        if (migratedLocks)
+        {
+            configuration.Save(pluginInterface);
+        }
     }
 
     public int ManifestItemCount => GetLatestManifest().Count;
