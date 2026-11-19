@@ -67,7 +67,10 @@ $repoEntry = [ordered]@{
 }
 
 $repoJsonPath = Join-Path $repoRoot "repo.json"
-@($repoEntry) | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 -Path $repoJsonPath
+$entryJson = $repoEntry | ConvertTo-Json -Depth 4
+$repoJson = "[$entryJson]"
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($repoJsonPath, $repoJson, $utf8NoBom)
 Copy-Item -Force $repoJsonPath (Join-Path $distDir "repo.json")
 
 Write-Host "Packaged cleanly:" -ForegroundColor Green
