@@ -10,6 +10,7 @@ using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
+using MagicInventory.Core;
 using MagicInventory.Services;
 
 namespace MagicInventory.UI;
@@ -284,7 +285,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     effectiveSlot = hoveredSlot;
                 }
                 else if (agent != null
-                    && agent->DetailKind == DetailKind.InventoryItem
+                    && (agent->DetailKind is DetailKind.InventoryItem or DetailKind.InventoryContext)
                     && agent->Index < 250)
                 {
                     effectiveContainer = (InventoryType)agent->TypeOrId;
@@ -311,6 +312,114 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                 == HoldingsService.NormalizeBaseItemId(rawId))
                             {
                                 liveItem = candidate;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback for ArmouryBoard (where AgentItemDetail may report a visual container ID or clear hoveredContainer):
+                // if we still didn't bind a physical InventoryItem* for this hovered item, resolve it from Armoury Chest.
+                if (liveItem == null && rawId != 0)
+                {
+                    var targetBase = HoldingsService.NormalizeBaseItemId(rawId);
+                    var manager = InventoryManager.Instance();
+                    if (manager != null)
+                    {
+                        var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
+                        var inBags = false;
+                        if (!armouryOpen)
+                        {
+                            foreach (var bagType in Core.InventorySafetyEvaluator.PlayerBagContainers)
+                            {
+                                var bag = manager->GetInventoryContainer(bagType);
+                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(bag))
+                                {
+                                    continue;
+                                }
+
+                                for (var i = 0; i < bag->Size; i++)
+                                {
+                                    var s = bag->GetInventorySlot(i);
+                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
+                                    {
+                                        inBags = true;
+                                        break;
+                                    }
+                                }
+
+                                if (inBags)
+                                {
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (armouryOpen || !inBags)
+                        {
+                            // Prefer active Armoury tab first when ArmouryBoard is open
+                            InventoryType? activeTabContainer = null;
+                            if (armouryOpen)
+                            {
+                                activeTabContainer = InventoryHighlightController.GetActiveArmouryTabContainer(gameGui);
+                            }
+
+                            InventoryItem* TryFindInContainer(InventoryType cType, out short foundSlot)
+                            {
+                                foundSlot = -1;
+                                var c = manager->GetInventoryContainer(cType);
+                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(c))
+                                {
+                                    return null;
+                                }
+
+                                for (var i = 0; i < c->Size; i++)
+                                {
+                                    var s = c->GetInventorySlot(i);
+                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
+                                    {
+                                        foundSlot = (short)i;
+                                        return s;
+                                    }
+                                }
+
+                                return null;
+                            }
+
+                            if (activeTabContainer.HasValue)
+                            {
+                                var hit = TryFindInContainer(activeTabContainer.Value, out var hitSlot);
+                                if (hit != null)
+                                {
+                                    effectiveContainer = activeTabContainer.Value;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
+                                }
+                            }
+
+                            if (liveItem == null)
+                            {
+                                foreach (var armType in Core.InventorySafetyEvaluator.ArmouryGearContainers)
+                                {
+                                    var hit = TryFindInContainer(armType, out var hitSlot);
+                                    if (hit != null)
+                                    {
+                                        effectiveContainer = armType;
+                                        effectiveSlot = hitSlot;
+                                        liveItem = hit;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if (liveItem == null)
+                            {
+                                var hit = TryFindInContainer(InventoryType.ArmorySoulCrystal, out var hitSlot);
+                                if (hit != null)
+                                {
+                                    effectiveContainer = InventoryType.ArmorySoulCrystal;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
+                                }
                             }
                         }
                     }

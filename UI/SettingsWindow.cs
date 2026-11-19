@@ -954,7 +954,7 @@ public sealed class SettingsWindow : Window
         }
 
         ImGui.SameLine();
-        ImGui.TextColored(ColorMuted, "Pinned item overrides are never reset.");
+        ImGui.TextColored(ColorMuted, "Custom item overrides are never reset.");
 
         if (changed)
         {

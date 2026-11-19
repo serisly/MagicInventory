@@ -259,7 +259,10 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         return cachedEntries;
     }
 
-    public MagicSortEntry? ClassifySingleItemOnDemand(uint baseItemId, bool queuePriceIfMissing = false)
+    public MagicSortEntry? ClassifySingleItemOnDemand(
+        uint baseItemId,
+        bool queuePriceIfMissing = false,
+        bool ignoreManualOverride = false)
     {
         var normalized = HoldingsService.NormalizeBaseItemId(baseItemId);
         if (normalized == 0)
@@ -267,10 +270,13 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return null;
         }
 
-        var entries = GetCurrentEntries();
-        if (entries.TryGetValue(normalized, out var existing))
+        if (!ignoreManualOverride)
         {
-            return existing;
+            var entries = GetCurrentEntries();
+            if (entries.TryGetValue(normalized, out var existing))
+            {
+                return existing;
+            }
         }
 
         var itemSheet = dataManager.GetExcelSheet<Item>();
@@ -290,13 +296,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var upcomingCrafts = GetUpcomingCraftIngredients(cid);
         var missingPrices = new List<uint>();
 
-        var context = new ItemObservation(
-            TotalQty: 1,
-            HasNq: true,
-            HasHq: false,
-            AnyMelded: false,
-            AnyGlamoured: false,
-            AllEquipSoulbound: false);
+        var context = BuildSingleItemObservation(normalized, retainers);
 
         var entry = ClassifyItem(
             normalized,
@@ -309,7 +309,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             gearsets,
             unlockedTop,
             upcomingCrafts,
-            missingPrices);
+            missingPrices,
+            ignoreManualOverride);
 
         if (queuePriceIfMissing && missingPrices.Count > 0 && !string.IsNullOrWhiteSpace(world))
         {
@@ -317,6 +318,111 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         }
 
         return entry;
+    }
+
+    private ItemObservation BuildSingleItemObservation(uint normalizedBaseId, IReadOnlyList<KnownRetainerInfo> retainers)
+    {
+        var totalQty = 0;
+        var hasNq = false;
+        var hasHq = false;
+        var anyMelded = false;
+        var anyGlamoured = false;
+        var equipCount = 0;
+        var soulboundCount = 0;
+
+        var manager = InventoryManager.Instance();
+        if (manager != null)
+        {
+            void Scan(InventoryType type, bool isArmoury)
+            {
+                var container = manager->GetInventoryContainer(type);
+                if (!InventorySafetyEvaluator.IsContainerReadable(container))
+                {
+                    return;
+                }
+
+                for (var i = 0; i < container->Size; i++)
+                {
+                    var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                    if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (HoldingsService.NormalizeBaseItemId(slot->ItemId) != normalizedBaseId)
+                    {
+                        continue;
+                    }
+
+                    totalQty += (int)slot->Quantity;
+                    var isHq = slot->ItemId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
+                    if (isHq)
+                    {
+                        hasHq = true;
+                    }
+                    else
+                    {
+                        hasNq = true;
+                    }
+
+                    if (slot->GetMateriaCount() > 0 || slot->Materia[0] != 0)
+                    {
+                        anyMelded = true;
+                    }
+
+                    if (slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0)
+                    {
+                        anyGlamoured = true;
+                    }
+
+                    equipCount++;
+                    if (slot->SpiritbondOrCollectability > 0)
+                    {
+                        soulboundCount++;
+                    }
+                }
+            }
+
+            foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
+            {
+                Scan(bag, isArmoury: false);
+            }
+
+            foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
+            {
+                Scan(arm, isArmoury: true);
+            }
+
+            Scan(InventoryType.ArmorySoulCrystal, isArmoury: true);
+        }
+
+        foreach (var ret in retainers)
+        {
+            if (ret.Quantities.TryGetValue(normalizedBaseId, out var retQty) && retQty > 0)
+            {
+                totalQty += retQty;
+                hasNq = true;
+            }
+        }
+
+        if (totalQty <= 0)
+        {
+            return new ItemObservation(
+                TotalQty: 1,
+                HasNq: true,
+                HasHq: false,
+                AnyMelded: false,
+                AnyGlamoured: false,
+                AllEquipSoulbound: false);
+        }
+
+        return new ItemObservation(
+            TotalQty: totalQty,
+            HasNq: hasNq,
+            HasHq: hasHq,
+            AnyMelded: anyMelded,
+            AnyGlamoured: anyGlamoured,
+            AllEquipSoulbound: equipCount > 0 && soulboundCount == equipCount);
     }
 
     private void OnExternalDataUpdated()
@@ -529,7 +635,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         HashSet<uint> gearsetIds,
         Dictionary<uint, int> unlockedJobTopIlvl,
         HashSet<uint> upcomingCraftIngredients,
-        List<uint> missingPriceIds)
+        List<uint> missingPriceIds,
+        bool ignoreManualOverride = false)
     {
         var name = itemRow.Name.ExtractText();
         if (string.IsNullOrWhiteSpace(name))
@@ -567,7 +674,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             : 0L;
 
         // 0. Explicit Manual User Override (always wins over automatic rules)
-        if (configuration.ManualRouteOverrides.TryGetValue(baseId, out var overrideSpec)
+        if (!ignoreManualOverride
+            && configuration.ManualRouteOverrides.TryGetValue(baseId, out var overrideSpec)
             && !string.IsNullOrWhiteSpace(overrideSpec))
         {
             if (overrideSpec.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
@@ -587,14 +695,16 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         0,
                         priceLow,
                         untradable,
-                        $"Pinned to {retMatch.Name}");
+                        $"Override: {retMatch.Name}");
                 }
             }
             else
             {
                 var overrideLabel = string.Equals(overrideSpec, "GrandCompany", StringComparison.OrdinalIgnoreCase)
-                    ? "Grand Company"
-                    : overrideSpec;
+                    ? "GC Seals"
+                    : (string.Equals(overrideSpec, "Glamour", StringComparison.OrdinalIgnoreCase)
+                        ? "Glamour Dresser"
+                        : overrideSpec);
                 return new MagicSortEntry(
                     baseId,
                     name,
@@ -605,7 +715,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     string.Equals(overrideSpec, "Market", StringComparison.OrdinalIgnoreCase) ? targetHq : 0,
                     priceLow,
                     untradable,
-                    $"Pinned to {overrideLabel}");
+                    $"Override: {overrideLabel}");
             }
         }
 

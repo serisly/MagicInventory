@@ -5,7 +5,6 @@ using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using KamiToolKit;
-using Lumina.Excel.Sheets;
 using MagicInventory.Core;
 using MagicInventory.Services;
 using MagicInventory.Services.MagicSort;
@@ -29,6 +28,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WindowSystem windowSystem = new("MagicInventory");
     private readonly SettingsWindow settingsWindow;
     private readonly WorldHopPromptWindow worldHopPromptWindow;
+    private readonly ContextFlyoutWindow contextFlyoutWindow;
     private readonly ItemTooltipController itemTooltipController;
     private readonly InventoryHighlightController inventoryHighlightController;
     private RecipeNoteController? recipeNoteController;
@@ -144,7 +144,17 @@ public sealed class Plugin : IDalamudPlugin
         itemTooltipController = new ItemTooltipController(gameInteropProvider, gameGui, log, MagicSort);
         itemTooltipController.Enable();
 
-        inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, Holdings, MagicSort);
+        inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, MagicSort);
+        contextFlyoutWindow = new ContextFlyoutWindow(
+            gameGui,
+            dataManager,
+            chatGui,
+            Holdings,
+            Safety,
+            TriageEngine,
+            MagicSort,
+            MaterialTracker,
+            inventoryHighlightController);
 
         settingsWindow = new SettingsWindow(
             pluginInterface,
@@ -222,7 +232,11 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private void DrawUi() => windowSystem.Draw();
+    private void DrawUi()
+    {
+        windowSystem.Draw();
+        contextFlyoutWindow.Draw();
+    }
 
     private void ToggleSettingsWindow() => settingsWindow.IsOpen = !settingsWindow.IsOpen;
 
@@ -304,13 +318,15 @@ public sealed class Plugin : IDalamudPlugin
     private unsafe void OnContextMenuOpened(IMenuOpenedArgs args)
     {
         uint baseItemId = 0;
+        var fromArmoury = string.Equals(args.AddonName, "ArmouryBoard", StringComparison.Ordinal);
+
         if (args.Target is MenuTargetInventory invTarget && invTarget.TargetItem is { } invItem)
         {
             baseItemId = invItem.BaseItemId;
         }
         else if (args.Target is MenuTargetDefault)
         {
-            // Support right-clicking items in Market Board, Crafting Log, chat links, etc. via AgentItemDetail
+            // Support right-clicking items in Market Board, Crafting Log, chat links, Armoury Chest, etc. via AgentItemDetail
             var detail = AgentItemDetail.Instance();
             if (detail != null && detail->ItemId != 0)
             {
@@ -329,254 +345,15 @@ public sealed class Plugin : IDalamudPlugin
 
         var capturedId = baseItemId;
         var itemName = MagicSort.GetItemDisplayName(capturedId);
-        var isPinned = MagicSort.IsItemOverwritten(capturedId);
+        contextFlyoutWindow.ArmForItem(capturedId, itemName, fromArmoury);
 
         args.AddMenuItem(new MenuItem
         {
-            Name = isPinned ? "Magic Inventory (Pinned)" : "Magic Inventory",
+            Name = "Magic Inventory",
             UseDefaultPrefix = true,
             IsSubmenu = true,
-            OnClicked = clickedArgs => OpenItemRuleSubmenu(clickedArgs, capturedId, itemName),
+            OnClicked = _ => contextFlyoutWindow.PinOpenFromClick(),
         });
-    }
-
-    private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
-    {
-        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
-
-        var items = new List<IMenuItem>();
-        var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId);
-        var canTag = MagicSortService.CanLockOrTagBaseId(baseItemId);
-        var isPinned = MagicSort.IsItemOverwritten(baseItemId);
-
-        if (canTag)
-        {
-            var entry = TriageEngine.ClassifySingleItemOnDemand(baseItemId, queuePriceIfMissing: false);
-            var currentDest = entry == null
-                ? "Keep"
-                : (entry.Route == "Retainer" && !string.IsNullOrEmpty(entry.TargetRetainerName)
-                    ? entry.TargetRetainerName
-                    : (entry.Route == "GrandCompany"
-                        ? "GC Seals"
-                        : (entry.Route == "Glamour" ? "Glamour Dresser" : entry.Route)));
-            if (entry != null && string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
-            {
-                var prio = Safety.GetMarketPriority(baseItemId);
-                if (prio > 0)
-                {
-                    currentDest += " (High)";
-                }
-                else if (prio < 0)
-                {
-                    currentDest += " (Low)";
-                }
-            }
-
-            items.Add(new MenuItem
-            {
-                Name = isPinned ? $"Current: {currentDest} [Pinned]" : $"Current: {currentDest} [Auto]",
-                IsEnabled = false,
-            });
-
-            items.Add(new MenuItem
-            {
-                Name = "Keep in Bag",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Keep", null, "Keep in Bag"),
-            });
-
-            if (itemRow is { ItemAction.RowId: > 0 })
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Use",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Use", null, "Use"),
-                });
-            }
-
-            var retainers = Holdings.GetKnownRetainersForCurrentCharacter();
-            if (retainers.Count > 0)
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Store",
-                    IsSubmenu = true,
-                    OnClicked = subArgs => OpenStoreSubmenu(subArgs, baseItemId, itemName),
-                });
-            }
-
-            var canMarket = itemRow is null || !itemRow.Value.IsUntradable;
-            var canVendor = itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique);
-            var canGc = itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15;
-            if (canMarket || canVendor || canGc)
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Sell",
-                    IsSubmenu = true,
-                    OnClicked = subArgs => OpenSellSubmenu(subArgs, baseItemId, itemName, canMarket, canVendor, canGc),
-                });
-            }
-
-            if (itemRow is { EquipSlotCategory.RowId: > 0 })
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Glamour Dresser",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Glamour", null, "Glamour Dresser"),
-                });
-            }
-
-            if (TriageEngine.IsCabinetItem(baseItemId))
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Armoire",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Armoire", null, "Armoire"),
-                });
-            }
-        }
-
-        items.Add(new MenuItem
-        {
-            Name = "Track",
-            IsSubmenu = true,
-            OnClicked = subArgs => OpenTrackSubmenu(subArgs, baseItemId, itemName),
-        });
-
-        if (canTag)
-        {
-            var isLocked = MagicSort.IsItemLocked(baseItemId);
-            items.Add(new MenuItem
-            {
-                Name = isLocked ? "Unlock Item" : "Lock Item",
-                OnClicked = _ =>
-                {
-                    if (MagicSort.ToggleItemLock(baseItemId, out var locked))
-                    {
-                        chatGui.Print(locked ? $"Locked {itemName}." : $"Unlocked {itemName}.");
-                    }
-                },
-            });
-
-            if (isPinned)
-            {
-                items.Add(new MenuItem
-                {
-                    Name = "Reset to Auto",
-                    OnClicked = _ =>
-                    {
-                        MagicSort.SetItemOverride(baseItemId, string.Empty);
-                        chatGui.Print($"Reset {itemName} back to automatic rules.");
-                    },
-                });
-            }
-        }
-
-        clickedArgs.OpenSubmenu("Magic Inventory", items);
-    }
-
-    private void OpenStoreSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
-    {
-        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
-
-        var items = new List<IMenuItem>();
-        foreach (var ret in Holdings.GetKnownRetainersForCurrentCharacter())
-        {
-            var retId = ret.RetainerId;
-            var retName = ret.Name;
-            items.Add(new MenuItem
-            {
-                Name = retName,
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, $"Retainer:{retId}", null, retName),
-            });
-        }
-
-        clickedArgs.OpenSubmenu("Store", items);
-    }
-
-    private void OpenSellSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName, bool canMarket, bool canVendor, bool canGc)
-    {
-        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
-
-        var items = new List<IMenuItem>();
-        if (canMarket)
-        {
-            items.Add(new MenuItem
-            {
-                Name = "Market (High Priority)",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 1, "Market (High Priority)"),
-            });
-            items.Add(new MenuItem
-            {
-                Name = "Market",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 0, "Market"),
-            });
-            items.Add(new MenuItem
-            {
-                Name = "Market (Low Priority)",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", -1, "Market (Low Priority)"),
-            });
-        }
-
-        if (canVendor)
-        {
-            items.Add(new MenuItem
-            {
-                Name = "Vendor",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Vendor", null, "Vendor"),
-            });
-        }
-
-        if (canGc)
-        {
-            items.Add(new MenuItem
-            {
-                Name = "GC Seals",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GrandCompany", null, "GC Seals"),
-            });
-        }
-
-        clickedArgs.OpenSubmenu("Sell", items);
-    }
-
-    private void OpenTrackSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
-    {
-        var items = new List<IMenuItem>();
-        var isItemTracked = MaterialTracker.IsItemTracked(baseItemId);
-
-        items.Add(new MenuItem
-        {
-            Name = isItemTracked ? "Untrack Item" : "Item",
-            OnClicked = _ =>
-            {
-                MaterialTracker.ToggleSingleItem(baseItemId);
-                chatGui.Print(isItemTracked ? $"Stopped tracking {itemName}." : $"Tracking item: {itemName}.");
-            },
-        });
-
-        if (MaterialTracker.HasRecipeForItem(baseItemId))
-        {
-            items.Add(new MenuItem
-            {
-                Name = "Recipe",
-                OnClicked = _ =>
-                {
-                    MaterialTracker.TrackRecipeForResultItem(baseItemId, out var msg);
-                    if (!string.IsNullOrWhiteSpace(msg))
-                    {
-                        chatGui.Print(msg);
-                    }
-                },
-            });
-        }
-
-        clickedArgs.OpenSubmenu("Track", items);
-    }
-
-    private void ApplyContextOverride(uint baseItemId, string itemName, string routeSpec, int? marketPriority, string displayLabel)
-    {
-        MagicSort.SetItemOverride(baseItemId, routeSpec, marketPriority);
-        chatGui.Print($"Pinned {itemName} -> {displayLabel}.");
     }
 
     public void Dispose()
@@ -589,6 +366,7 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(MagicCommandName);
         commandManager.RemoveHandler(MagicShortCommandName);
         contextMenu.OnMenuOpened -= OnContextMenuOpened;
+        contextFlyoutWindow.Dispose();
         inventoryHighlightController.Dispose();
         itemTooltipController.Dispose();
         MagicActions.Dispose();

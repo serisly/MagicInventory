@@ -870,17 +870,19 @@ public sealed unsafe class MagicSortService : IDisposable
     }
 
     /// <summary>
-    /// Collects all live player-bag and open-retainer slots matching a route filter
-    /// ("Keep", "Use", "Market", "Vendor", "GrandCompany", "Armoire", "Glamour", "Retainer", or "Retainer:&lt;id&gt;")
+    /// Collects all live player-bag, Armoury Chest, and open-retainer slots matching a route filter
+    /// ("Keep", "Use", "Sell", "Market", "Vendor", "GrandCompany", "Armoire", "Glamour", "Retainer", or "Retainer:&lt;id&gt;")
     /// for live sibling highlighting when hovering context-menu override options.
     /// </summary>
     public void GetSlotsMatchingRouteFilter(
         string routeFilter,
         out HashSet<(InventoryType Container, int Slot)> playerSlots,
-        out HashSet<(InventoryType Container, int Slot)> retainerSlots)
+        out HashSet<(InventoryType Container, int Slot)> retainerSlots,
+        out HashSet<(InventoryType Container, int Slot)> armourySlots)
     {
         playerSlots = new HashSet<(InventoryType Container, int Slot)>();
         retainerSlots = new HashSet<(InventoryType Container, int Slot)>();
+        armourySlots = new HashSet<(InventoryType Container, int Slot)>();
 
         if (string.IsNullOrWhiteSpace(routeFilter))
         {
@@ -896,6 +898,7 @@ public sealed unsafe class MagicSortService : IDisposable
         }
 
         var filterRetainerId = 0UL;
+        var matchAnySell = string.Equals(routeFilter, "Sell", StringComparison.OrdinalIgnoreCase);
         var matchRoute = routeFilter;
         if (routeFilter.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
             && ulong.TryParse(routeFilter["Retainer:".Length..], out var parsedRetId))
@@ -955,7 +958,16 @@ public sealed unsafe class MagicSortService : IDisposable
                     targetRetId = entry.TargetRetainerId;
                 }
 
-                if (!string.Equals(effective, matchRoute, StringComparison.OrdinalIgnoreCase))
+                if (matchAnySell)
+                {
+                    if (!string.Equals(effective, "Market", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(effective, "Vendor", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(effective, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+                else if (!string.Equals(effective, matchRoute, StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -976,6 +988,13 @@ public sealed unsafe class MagicSortService : IDisposable
                 ScanContainer(bag, playerSlots);
             }
         }
+
+        foreach (var armoury in InventorySafetyEvaluator.ArmouryGearContainers)
+        {
+            ScanContainer(armoury, armourySlots);
+        }
+
+        ScanContainer(InventoryType.ArmorySoulCrystal, armourySlots);
 
         if (HoldingsService.GetActiveRetainerId() != 0)
         {

@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Generic;
-using Dalamud.Memory;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
@@ -66,12 +65,29 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         "RetainerGrid3",
         "RetainerGrid4",
         "RetainerGrid",
+        "ArmouryBoard",
+    ];
+
+    // Standard 12 Armoury Chest tab order: Left 6 top-to-bottom, Right 6 top-to-bottom.
+    private static readonly InventoryType[] ArmouryTabContainers =
+    [
+        InventoryType.ArmoryMainHand,
+        InventoryType.ArmoryHead,
+        InventoryType.ArmoryBody,
+        InventoryType.ArmoryHands,
+        InventoryType.ArmoryLegs,
+        InventoryType.ArmoryFeets,
+        InventoryType.ArmoryOffHand,
+        InventoryType.ArmoryEar,
+        InventoryType.ArmoryNeck,
+        InventoryType.ArmoryWrist,
+        InventoryType.ArmoryRings,
+        InventoryType.ArmorySoulCrystal,
     ];
 
     private readonly IFramework framework;
     private readonly IGameGui gameGui;
     private readonly Configuration configuration;
-    private readonly HoldingsService holdings;
     private readonly MagicSortService magicSort;
 
     private readonly Dictionary<(string AddonName, uint NodeId), (short R, short G, short B)> activeTints = new();
@@ -79,26 +95,31 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private bool clearedOrphansOnStartup;
     private string? hoveredSellAddon;
     private string? hoveredRetainerSortAddon;
-    private bool contextMenuTrackingActive;
+    private string? hoveredRouteFilter;
 
     public InventoryHighlightController(
         IFramework framework,
         IGameGui gameGui,
         Configuration configuration,
-        HoldingsService holdings,
         MagicSortService magicSort)
     {
         this.framework = framework;
         this.gameGui = gameGui;
         this.configuration = configuration;
-        this.holdings = holdings;
         this.magicSort = magicSort;
         this.framework.Update += OnFrameworkUpdate;
     }
 
-    public void NotifyMagicContextSubmenuOpened()
+    public void SetHoveredRouteFilter(string? routeFilter)
     {
-        contextMenuTrackingActive = true;
+        var normalized = string.IsNullOrWhiteSpace(routeFilter) ? null : routeFilter;
+        if (string.Equals(hoveredRouteFilter, normalized, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        hoveredRouteFilter = normalized;
+        RefreshHighlights();
     }
 
     public void SetHoveredSellAddon(string addonName, bool isHovered)
@@ -172,12 +193,24 @@ public sealed unsafe class InventoryHighlightController : IDisposable
 
         var desiredNodes = new Dictionary<(string AddonName, uint NodeId), (short R, short G, short B)>();
 
-        if (TryResolveHoveredContextMenuRouteFilter(out var contextRouteFilter))
+        if (!string.IsNullOrEmpty(hoveredRouteFilter))
         {
-            magicSort.GetSlotsMatchingRouteFilter(contextRouteFilter, out var ctxPlayerSlots, out var ctxRetainerSlots);
+            magicSort.GetSlotsMatchingRouteFilter(
+                hoveredRouteFilter,
+                out var ctxPlayerSlots,
+                out var ctxRetainerSlots,
+                out var ctxArmourySlots);
             if (ctxPlayerSlots.Count > 0)
             {
                 foreach (var key in ResolvePlayerVisualHighlightNodes(ctxPlayerSlots))
+                {
+                    desiredNodes[key] = DepositOrSellTint;
+                }
+            }
+
+            if (ctxArmourySlots.Count > 0)
+            {
+                foreach (var key in ResolveArmouryVisualHighlightNodes(ctxArmourySlots))
                 {
                     desiredNodes[key] = DepositOrSellTint;
                 }
@@ -282,115 +315,146 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         }
     }
 
-    private bool TryResolveHoveredContextMenuRouteFilter(out string routeFilter)
+    /// <summary>
+    /// Detects the active ArmouryBoard tab (0..11) by reading its 12 RadioButton nodes (NodeId 7..18),
+    /// ordered spatially into Left Column (6 top-to-bottom) and Right Column (6 top-to-bottom) so it is
+    /// completely independent of client language or ULD node ID order.
+    /// </summary>
+    public static int GetActiveArmouryTabIndex(IGameGui gameGui)
     {
-        routeFilter = string.Empty;
-        if (!contextMenuTrackingActive)
+        var armoury = NativeUiHelpers.GetReadyAddon(gameGui, "ArmouryBoard");
+        if (armoury == null || !armoury->IsVisible)
         {
-            return false;
+            return -1;
         }
 
-        var menu = NativeUiHelpers.GetReadyAddon(gameGui, "ContextMenu");
-        if (menu == null || !menu->IsVisible)
+        var buttons = new List<(float X, float Y, bool Selected)>(12);
+        for (uint nodeId = 7; nodeId <= 18; nodeId++)
         {
-            contextMenuTrackingActive = false;
-            return false;
-        }
-
-        var listNode = menu->GetNodeById(2);
-        var list = listNode != null ? listNode->GetAsAtkComponentList() : null;
-        if (list == null || list->ItemRendererList == null || list->ListLength <= 0)
-        {
-            return false;
-        }
-
-        var hoveredIdx = list->HoveredItemIndex;
-        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
-        {
-            hoveredIdx = list->SelectedItemIndex;
-        }
-
-        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
-        {
-            return false;
-        }
-
-        var renderer = list->ItemRendererList[hoveredIdx].AtkComponentListItemRenderer;
-        if (renderer == null)
-        {
-            return false;
-        }
-
-        var textNode = renderer->AtkComponentButton.ButtonTextNode;
-        if (textNode == null)
-        {
-            return false;
-        }
-
-        var label = textNode->NodeText.ToString().Trim();
-        if (string.IsNullOrEmpty(label))
-        {
-            return false;
-        }
-
-        if (string.Equals(label, "Keep in Bag", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Keep";
-            return true;
-        }
-
-        if (string.Equals(label, "Use", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Use";
-            return true;
-        }
-
-        if (string.Equals(label, "Glamour Dresser", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Glamour";
-            return true;
-        }
-
-        if (string.Equals(label, "Armoire", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Armoire";
-            return true;
-        }
-
-        if (string.Equals(label, "Vendor", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Vendor";
-            return true;
-        }
-
-        if (string.Equals(label, "GC Seals", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "GrandCompany";
-            return true;
-        }
-
-        if (label.StartsWith("Market", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Market";
-            return true;
-        }
-
-        if (string.Equals(label, "Store", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Retainer";
-            return true;
-        }
-
-        foreach (var ret in holdings.GetKnownRetainersForCurrentCharacter())
-        {
-            if (string.Equals(label, ret.Name, StringComparison.OrdinalIgnoreCase))
+            var node = armoury->GetNodeById(nodeId);
+            if (node == null)
             {
-                routeFilter = $"Retainer:{ret.RetainerId}";
-                return true;
+                continue;
+            }
+
+            var radio = node->GetAsAtkComponentRadioButton();
+            if (radio == null)
+            {
+                continue;
+            }
+
+            buttons.Add((node->X, node->Y, radio->IsSelected));
+        }
+
+        if (buttons.Count != 12)
+        {
+            // Fallback: find any selected radio button directly in 7..18
+            for (var i = 0; i < buttons.Count; i++)
+            {
+                if (buttons[i].Selected)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        // Split into left column (6 smallest X) and right column (6 largest X), each sorted top-to-bottom by Y
+        buttons.Sort((a, b) => a.X.CompareTo(b.X));
+        var left = buttons.GetRange(0, 6);
+        var right = buttons.GetRange(6, 6);
+        left.Sort((a, b) => a.Y.CompareTo(b.Y));
+        right.Sort((a, b) => a.Y.CompareTo(b.Y));
+
+        for (var i = 0; i < 6; i++)
+        {
+            if (left[i].Selected)
+            {
+                return i;
             }
         }
 
-        return false;
+        for (var i = 0; i < 6; i++)
+        {
+            if (right[i].Selected)
+            {
+                return 6 + i;
+            }
+        }
+
+        return -1;
+    }
+
+    public static InventoryType? GetActiveArmouryTabContainer(IGameGui gameGui)
+    {
+        var tabIdx = GetActiveArmouryTabIndex(gameGui);
+        return tabIdx >= 0 && tabIdx < ArmouryTabContainers.Length
+            ? ArmouryTabContainers[tabIdx]
+            : null;
+    }
+
+    private HashSet<(string AddonName, uint NodeId)> ResolveArmouryVisualHighlightNodes(
+        HashSet<(InventoryType Container, int Slot)> physicalTargets)
+    {
+        var result = new HashSet<(string AddonName, uint NodeId)>();
+        var tabIdx = GetActiveArmouryTabIndex(gameGui);
+        if (tabIdx < 0 || tabIdx >= ArmouryTabContainers.Length)
+        {
+            return result;
+        }
+
+        var activeContainer = ArmouryTabContainers[tabIdx];
+        var orderModule = ItemOrderModule.Instance();
+        ItemOrderModuleSorter* sorter = null;
+        if (orderModule != null)
+        {
+            sorter = tabIdx switch
+            {
+                0 => orderModule->ArmouryMainHandSorter,
+                1 => orderModule->ArmouryHeadSorter,
+                2 => orderModule->ArmouryBodySorter,
+                3 => orderModule->ArmouryHandsSorter,
+                4 => orderModule->ArmouryLegsSorter,
+                5 => orderModule->ArmouryFeetSorter,
+                6 => orderModule->ArmouryOffHandSorter,
+                7 => orderModule->ArmouryEarsSorter,
+                8 => orderModule->ArmouryNeckSorter,
+                9 => orderModule->ArmouryWristsSorter,
+                10 => orderModule->ArmouryRingsSorter,
+                11 => orderModule->ArmourySoulCrystalSorter,
+                _ => null,
+            };
+        }
+
+        if (sorter != null && sorter->Items.Count > 0)
+        {
+            for (var v = 0; v < sorter->Items.Count && v < 50; v++)
+            {
+                var entryPtr = sorter->Items[v].Value;
+                if (entryPtr == null)
+                {
+                    continue;
+                }
+
+                if (physicalTargets.Contains((activeContainer, entryPtr->Slot)))
+                {
+                    result.Add(("ArmouryBoard", (uint)(71 + v)));
+                }
+            }
+        }
+        else
+        {
+            foreach (var (container, slot) in physicalTargets)
+            {
+                if (container == activeContainer && slot is >= 0 and < 50)
+                {
+                    result.Add(("ArmouryBoard", (uint)(71 + slot)));
+                }
+            }
+        }
+
+        return result;
     }
 
     private HashSet<(string AddonName, uint NodeId)> ResolvePlayerVisualHighlightNodes(
@@ -631,7 +695,9 @@ public sealed unsafe class InventoryHighlightController : IDisposable
                 continue;
             }
 
-            for (uint nodeId = 3; nodeId < 38; nodeId++)
+            uint startNode = string.Equals(addonName, "ArmouryBoard", StringComparison.Ordinal) ? 71u : 3u;
+            uint endNode = string.Equals(addonName, "ArmouryBoard", StringComparison.Ordinal) ? 121u : 38u;
+            for (uint nodeId = startNode; nodeId < endNode; nodeId++)
             {
                 var node = addon->GetNodeById(nodeId);
                 if (node == null)
