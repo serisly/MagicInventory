@@ -262,7 +262,7 @@ public sealed unsafe class GrandCompanyPlanner
 
                     if (!DoesRewardAddonMatchItem(rewardAddon, captured.Name))
                     {
-                        transactionQueue.Cancel("Selection changed in Grand Company turn-in window.");
+                        transactionQueue.Cancel($"Selection changed in Grand Company turn-in window (expected '{captured.Name}').");
                         return false;
                     }
 
@@ -283,11 +283,6 @@ public sealed unsafe class GrandCompanyPlanner
                     if (manager == null)
                     {
                         return false;
-                    }
-
-                    if (manager->GetCompanySeals(grandCompany) > preSeals)
-                    {
-                        return true;
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
@@ -369,7 +364,11 @@ public sealed unsafe class GrandCompanyPlanner
             for (var r = 0; r < list->AllocatedItemRendererListLength; r++)
             {
                 var renderer = list->ItemRendererList[r].AtkComponentListItemRenderer;
-                if (renderer == null || renderer->ListItemIndex < 0 || renderer->ListItemIndex >= list->ListLength)
+                if (renderer == null
+                    || renderer->ListItemIndex < 0
+                    || renderer->ListItemIndex >= list->ListLength
+                    || renderer->AtkComponentButton.AtkComponentBase.OwnerNode == null
+                    || !renderer->AtkComponentButton.AtkComponentBase.OwnerNode->IsVisible())
                 {
                     continue;
                 }
