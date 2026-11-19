@@ -97,6 +97,7 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private bool clearedOrphansOnStartup;
     private string? hoveredSellAddon;
     private string? hoveredRetainerSortAddon;
+    private string? activeContextSubmenuTitle;
     private IReadOnlyList<string?>? activeContextRouteFilters;
     private DateTime contextSubmenuArmedUtc = DateTime.MinValue;
 
@@ -113,8 +114,9 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         this.framework.Update += OnFrameworkUpdate;
     }
 
-    public void SetActiveContextSubmenuRoutes(IReadOnlyList<string?>? routeFiltersByIndex)
+    public void SetActiveContextSubmenuRoutes(string? submenuTitle, IReadOnlyList<string?>? routeFiltersByIndex)
     {
+        activeContextSubmenuTitle = submenuTitle;
         activeContextRouteFilters = routeFiltersByIndex;
         contextSubmenuArmedUtc = DateTime.UtcNow;
         if (routeFiltersByIndex == null || routeFiltersByIndex.Count == 0)
@@ -154,7 +156,8 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private void OnFrameworkUpdate(IFramework _)
     {
         var now = DateTime.UtcNow;
-        if ((now - lastPollUtc).TotalMilliseconds < PollIntervalMs)
+        var intervalMs = activeContextRouteFilters != null ? 50.0 : PollIntervalMs;
+        if ((now - lastPollUtc).TotalMilliseconds < intervalMs)
         {
             return;
         }
@@ -326,33 +329,66 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         }
 
         var elapsedMs = (DateTime.UtcNow - contextSubmenuArmedUtc).TotalMilliseconds;
-        var menu = NativeUiHelpers.GetReadyAddon(gameGui, "ContextMenu");
+
+        // Native FFXIV submenus opened via IContextMenu.OpenSubmenu live in "AddonContextSub" (not "ContextMenu").
+        var menu = NativeUiHelpers.GetReadyAddon(gameGui, "AddonContextSub");
         if (menu == null || !menu->IsVisible)
         {
             // Keep armed briefly across the 1-2 frame close/reopen transition of OpenSubmenu.
             if (elapsedMs > 450.0)
             {
                 activeContextRouteFilters = null;
+                activeContextSubmenuTitle = null;
             }
 
             return false;
         }
 
-        // Locate the active AtkComponentList dynamically (never hardcode NodeId 2).
-        AtkComponentList* list = null;
-        for (var n = 0; n < menu->UldManager.NodeListCount; n++)
+        // Verify the open AddonContextSub belongs to our expected submenu title (NodeId 2).
+        if (!string.IsNullOrEmpty(activeContextSubmenuTitle))
         {
-            var node = menu->UldManager.NodeList[n];
-            if (node == null)
+            var titleNode = menu->GetNodeById(2);
+            var titleTextNode = titleNode != null ? titleNode->GetAsAtkTextNode() : null;
+            if (titleTextNode != null)
             {
-                continue;
-            }
+                var actualTitle = titleTextNode->NodeText.ToString().Trim();
+                if (!string.Equals(actualTitle, activeContextSubmenuTitle, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (elapsedMs > 450.0)
+                    {
+                        activeContextRouteFilters = null;
+                        activeContextSubmenuTitle = null;
+                    }
 
-            var candidate = node->GetAsAtkComponentList();
-            if (candidate != null && candidate->ItemRendererList != null && candidate->ListLength > 0)
+                    return false;
+                }
+            }
+        }
+
+        // Locate the AtkComponentList inside AddonContextSub (typically NodeId 4).
+        AtkComponentList* list = null;
+        var node4 = menu->GetNodeById(4);
+        if (node4 != null)
+        {
+            list = node4->GetAsAtkComponentList();
+        }
+
+        if (list == null)
+        {
+            for (var n = 0; n < menu->UldManager.NodeListCount; n++)
             {
-                list = candidate;
-                break;
+                var node = menu->UldManager.NodeList[n];
+                if (node == null)
+                {
+                    continue;
+                }
+
+                var candidate = node->GetAsAtkComponentList();
+                if (candidate != null && candidate->ItemRendererList != null && candidate->ListLength > 0)
+                {
+                    list = candidate;
+                    break;
+                }
             }
         }
 
@@ -361,32 +397,18 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             return false;
         }
 
-        // Wait until the submenu has replaced the root menu; allow +1 in case a header row is inside the list
-        var indexOffset = 0;
-        if (list->ListLength == routes.Count + 1)
-        {
-            indexOffset = -1;
-        }
-        else if (list->ListLength != routes.Count)
-        {
-            if (elapsedMs > 600.0)
-            {
-                activeContextRouteFilters = null;
-            }
-
-            return false;
-        }
-
+        // Note: AddonContextSub pools ~21 ListItemRenderers; only indices 0..routes.Count-1 are active rows.
+        var activeRowCount = Math.Min(routes.Count, list->ListLength);
         var hoveredIdx = list->HoveredItemIndex;
 
-        // Fallback: hit-test live cursor position against each renderer's screen rect
-        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        // Fallback: hit-test live cursor position against each active row's screen rect
+        if (hoveredIdx < 0 || hoveredIdx >= activeRowCount)
         {
             var mouse = ImGui.GetMousePos();
             var vpPos = ImGui.GetMainViewport().Pos;
             var addonScale = menu->Scale > 0.01f ? menu->Scale : 1f;
 
-            for (var i = 0; i < list->ListLength; i++)
+            for (var i = 0; i < activeRowCount; i++)
             {
                 var renderer = list->ItemRendererList[i].AtkComponentListItemRenderer;
                 if (renderer == null || renderer->OwnerNode == null)
@@ -427,18 +449,17 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             }
         }
 
-        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        if (hoveredIdx < 0 || hoveredIdx >= activeRowCount)
         {
             hoveredIdx = list->SelectedItemIndex;
         }
 
-        var mappedIdx = hoveredIdx + indexOffset;
-        if (mappedIdx < 0 || mappedIdx >= routes.Count)
+        if (hoveredIdx < 0 || hoveredIdx >= activeRowCount)
         {
             return false;
         }
 
-        var matched = routes[mappedIdx];
+        var matched = routes[hoveredIdx];
         if (string.IsNullOrWhiteSpace(matched))
         {
             return false;

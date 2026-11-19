@@ -303,6 +303,34 @@ public sealed unsafe class InventorySafetyEvaluator
         return ids;
     }
 
+    public static bool IsUntouchedUnlockJob(PlayerState* ps, ClassJob job, bool hasGearset)
+    {
+        if (ps == null || job.RowId == 0 || job.ExpArrayIndex < 0 || job.ExpArrayIndex >= ps->ClassJobLevels.Length)
+        {
+            return true;
+        }
+
+        var jobLevel = ps->ClassJobLevels[job.ExpArrayIndex];
+        if (jobLevel <= 0)
+        {
+            return true;
+        }
+
+        var isDoHOrDoL = job.RowId is >= 8 and <= 18;
+        var isCurrent = job.RowId == (uint)ps->CurrentClassJobId;
+        if (hasGearset || isCurrent || isDoHOrDoL)
+        {
+            return false;
+        }
+
+        var jobExp = job.ExpArrayIndex < ps->ClassJobExperience.Length
+            ? ps->ClassJobExperience[job.ExpArrayIndex]
+            : 0;
+
+        // Ignore untouched Lv 1 class unlocks (e.g. ROG Lv 1, 0 XP) and untouched 0-XP expansion unlocks (DRK Lv 30, etc.)
+        return jobLevel <= 1 || (jobExp == 0 && jobLevel is 30 or 50 or 60 or 70 or 80);
+    }
+
     public Dictionary<uint, int> BuildUnlockedJobTopIlvl()
     {
         var now = DateTime.UtcNow;
@@ -428,10 +456,20 @@ public sealed unsafe class InventorySafetyEvaluator
                     }
                 }
 
+                if (!hasChildSet && IsUntouchedUnlockJob(ps, job, hasGearset: false))
+                {
+                    continue;
+                }
+
                 result[job.RowId] = hasChildSet ? inherited : 0;
             }
             else if (ownedSoulCrystalJobs.Contains(job.RowId))
             {
+                if (IsUntouchedUnlockJob(ps, job, hasGearset: false))
+                {
+                    continue;
+                }
+
                 result[job.RowId] = 0;
             }
         }
@@ -637,8 +675,9 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                // Protect BOTH future gear saved to level into (LevelEquip > jobLevel) AND current upgrades/BiS
-                if (itemRow.LevelEquip > jobLevel || (int)itemRow.LevelItem.RowId >= topIlvl - 5)
+                // Protect near-future leveling gear (up to +4 levels ahead) and current upgrades/BiS (within 5 iLvl)
+                if ((itemRow.LevelEquip > jobLevel && itemRow.LevelEquip <= jobLevel + 4)
+                    || (itemRow.LevelEquip <= jobLevel && topIlvl > 0 && (int)itemRow.LevelItem.RowId >= topIlvl - 5))
                 {
                     return false;
                 }

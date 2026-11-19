@@ -449,6 +449,11 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
 
     private bool IsStepAddonReady(TransactionStep step)
     {
+        if (string.IsNullOrEmpty(step.RequiredAddon) && string.IsNullOrEmpty(step.SecondaryRequiredAddon))
+        {
+            return true;
+        }
+
         if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, step.RequiredAddon))
         {
             return true;

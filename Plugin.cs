@@ -469,7 +469,7 @@ public sealed class Plugin : IDalamudPlugin
             routeFilters.Add(null);
         }
 
-        inventoryHighlightController.SetActiveContextSubmenuRoutes(routeFilters);
+        inventoryHighlightController.SetActiveContextSubmenuRoutes("Magic Inventory", routeFilters);
         clickedArgs.OpenSubmenu("Magic Inventory", items);
     }
 
@@ -491,7 +491,7 @@ public sealed class Plugin : IDalamudPlugin
             routeFilters.Add($"Retainer:{retId}");
         }
 
-        inventoryHighlightController.SetActiveContextSubmenuRoutes(routeFilters);
+        inventoryHighlightController.SetActiveContextSubmenuRoutes("Store", routeFilters);
         clickedArgs.OpenSubmenu("Store", items);
     }
 
@@ -557,7 +557,7 @@ public sealed class Plugin : IDalamudPlugin
             routeFilters.Add("GrandCompany");
         }
 
-        inventoryHighlightController.SetActiveContextSubmenuRoutes(routeFilters);
+        inventoryHighlightController.SetActiveContextSubmenuRoutes("Sell", routeFilters);
         clickedArgs.OpenSubmenu("Sell", items);
     }
 
@@ -592,7 +592,7 @@ public sealed class Plugin : IDalamudPlugin
             });
         }
 
-        inventoryHighlightController.SetActiveContextSubmenuRoutes(null);
+        inventoryHighlightController.SetActiveContextSubmenuRoutes(null, null);
         clickedArgs.OpenSubmenu("Track", items);
     }
 
