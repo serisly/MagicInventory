@@ -1,0 +1,30 @@
+﻿{
+    "Author":  "Seris",
+    "Name":  "Magic Inventory",
+    "InternalName":  "MagicInventory",
+    "AssemblyVersion":  "1.0.0.0",
+    "Description":  "Automatic inventory organizer for FFXIV. Sorts items between bags and retainers, sells junk to vendors or Grand Company, lists profitable surplus on the Market Board, uses unlockables and coffers, tracks recipes, and buys missing materials. Right-click any item to set a custom rule.",
+    "ApplicableVersion":  "any",
+    "RepoUrl":  "https://github.com/serisly/MagicInventory",
+    "IconUrl":  "https://raw.githubusercontent.com/serisly/MagicInventory/main/images/icon.png",
+    "DalamudApiLevel":  15,
+    "LoadRequiredState":  0,
+    "LoadSync":  false,
+    "CanUnloadAsync":  false,
+    "LoadPriority":  0,
+    "Punchline":  "Sort retainers, sell clutter, track recipes, and buy missing mats.",
+    "AcceptsFeedback":  true,
+    "IsHide":  false,
+    "IsTestingExclusive":  false,
+    "LastUpdate":  1795089762,
+    "DownloadLinkInstall":  "https://raw.githubusercontent.com/serisly/MagicInventory/main/dist/latest.zip",
+    "DownloadLinkUpdate":  "https://raw.githubusercontent.com/serisly/MagicInventory/main/dist/latest.zip",
+    "DownloadLinkTesting":  "https://raw.githubusercontent.com/serisly/MagicInventory/main/dist/latest.zip",
+    "Tags":  [
+                 "inventory",
+                 "retainer",
+                 "market",
+                 "crafting",
+                 "utility"
+             ]
+}
