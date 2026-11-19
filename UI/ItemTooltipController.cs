@@ -422,6 +422,35 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                 }
                             }
                         }
+
+                        if (liveItem == null && HoldingsService.GetActiveRetainerId() != 0)
+                        {
+                            foreach (var retType in Core.InventorySafetyEvaluator.RetainerBagContainers)
+                            {
+                                var c = manager->GetInventoryContainer(retType);
+                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(c))
+                                {
+                                    continue;
+                                }
+
+                                for (var i = 0; i < c->Size; i++)
+                                {
+                                    var s = c->GetInventorySlot(i);
+                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
+                                    {
+                                        effectiveContainer = retType;
+                                        effectiveSlot = (short)i;
+                                        liveItem = s;
+                                        break;
+                                    }
+                                }
+
+                                if (liveItem != null)
+                                {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -432,12 +461,16 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     && numberArrayData->Size > FlagIntIndex)
                 {
                     var visibilityFlags = numberArrayData->IntArray[FlagIntIndex];
+                    var hasDescriptionText = stringArrayData->Size > DescriptionStringIndex
+                        && stringArrayData->StringArray[DescriptionStringIndex].Value != null
+                        && stringArrayData->StringArray[DescriptionStringIndex].Value[0] != 0;
                     int targetIndex;
                     var prepend = true;
 
-                    if ((visibilityFlags & VisibilityDescriptionBit) != 0)
+                    if ((visibilityFlags & VisibilityDescriptionBit) != 0 || hasDescriptionText)
                     {
                         targetIndex = DescriptionStringIndex;
+                        numberArrayData->IntArray[FlagIntIndex] |= VisibilityDescriptionBit;
                     }
                     else if ((visibilityFlags & VisibilityEffectsBit) != 0)
                     {
