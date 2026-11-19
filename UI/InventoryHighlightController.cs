@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Numerics;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
@@ -95,7 +97,8 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private bool clearedOrphansOnStartup;
     private string? hoveredSellAddon;
     private string? hoveredRetainerSortAddon;
-    private string? hoveredRouteFilter;
+    private IReadOnlyList<string?>? activeContextRouteFilters;
+    private DateTime contextSubmenuArmedUtc = DateTime.MinValue;
 
     public InventoryHighlightController(
         IFramework framework,
@@ -110,16 +113,14 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         this.framework.Update += OnFrameworkUpdate;
     }
 
-    public void SetHoveredRouteFilter(string? routeFilter)
+    public void SetActiveContextSubmenuRoutes(IReadOnlyList<string?>? routeFiltersByIndex)
     {
-        var normalized = string.IsNullOrWhiteSpace(routeFilter) ? null : routeFilter;
-        if (string.Equals(hoveredRouteFilter, normalized, StringComparison.Ordinal))
+        activeContextRouteFilters = routeFiltersByIndex;
+        contextSubmenuArmedUtc = DateTime.UtcNow;
+        if (routeFiltersByIndex == null || routeFiltersByIndex.Count == 0)
         {
-            return;
+            RefreshHighlights();
         }
-
-        hoveredRouteFilter = normalized;
-        RefreshHighlights();
     }
 
     public void SetHoveredSellAddon(string addonName, bool isHovered)
@@ -193,10 +194,10 @@ public sealed unsafe class InventoryHighlightController : IDisposable
 
         var desiredNodes = new Dictionary<(string AddonName, uint NodeId), (short R, short G, short B)>();
 
-        if (!string.IsNullOrEmpty(hoveredRouteFilter))
+        if (TryResolveHoveredContextMenuRouteFilter(out var contextRouteFilter))
         {
             magicSort.GetSlotsMatchingRouteFilter(
-                hoveredRouteFilter,
+                contextRouteFilter,
                 out var ctxPlayerSlots,
                 out var ctxRetainerSlots,
                 out var ctxArmourySlots);
@@ -313,6 +314,138 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             node->AddGreen = tint.G;
             node->AddBlue = tint.B;
         }
+    }
+
+    private bool TryResolveHoveredContextMenuRouteFilter(out string routeFilter)
+    {
+        routeFilter = string.Empty;
+        var routes = activeContextRouteFilters;
+        if (routes == null || routes.Count == 0)
+        {
+            return false;
+        }
+
+        var elapsedMs = (DateTime.UtcNow - contextSubmenuArmedUtc).TotalMilliseconds;
+        var menu = NativeUiHelpers.GetReadyAddon(gameGui, "ContextMenu");
+        if (menu == null || !menu->IsVisible)
+        {
+            // Keep armed briefly across the 1-2 frame close/reopen transition of OpenSubmenu.
+            if (elapsedMs > 450.0)
+            {
+                activeContextRouteFilters = null;
+            }
+
+            return false;
+        }
+
+        // Locate the active AtkComponentList dynamically (never hardcode NodeId 2).
+        AtkComponentList* list = null;
+        for (var n = 0; n < menu->UldManager.NodeListCount; n++)
+        {
+            var node = menu->UldManager.NodeList[n];
+            if (node == null)
+            {
+                continue;
+            }
+
+            var candidate = node->GetAsAtkComponentList();
+            if (candidate != null && candidate->ItemRendererList != null && candidate->ListLength > 0)
+            {
+                list = candidate;
+                break;
+            }
+        }
+
+        if (list == null || list->ItemRendererList == null || list->ListLength <= 0)
+        {
+            return false;
+        }
+
+        // Wait until the submenu has replaced the root menu; allow +1 in case a header row is inside the list
+        var indexOffset = 0;
+        if (list->ListLength == routes.Count + 1)
+        {
+            indexOffset = -1;
+        }
+        else if (list->ListLength != routes.Count)
+        {
+            if (elapsedMs > 600.0)
+            {
+                activeContextRouteFilters = null;
+            }
+
+            return false;
+        }
+
+        var hoveredIdx = list->HoveredItemIndex;
+
+        // Fallback: hit-test live cursor position against each renderer's screen rect
+        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        {
+            var mouse = ImGui.GetMousePos();
+            var vpPos = ImGui.GetMainViewport().Pos;
+            var addonScale = menu->Scale > 0.01f ? menu->Scale : 1f;
+
+            for (var i = 0; i < list->ListLength; i++)
+            {
+                var renderer = list->ItemRendererList[i].AtkComponentListItemRenderer;
+                if (renderer == null || renderer->OwnerNode == null)
+                {
+                    continue;
+                }
+
+                var owner = (AtkResNode*)renderer->OwnerNode;
+                if (!owner->IsVisible())
+                {
+                    continue;
+                }
+
+                var rx = 0f;
+                var ry = 0f;
+                var sx = 1f;
+                var sy = 1f;
+                var cur = owner;
+                while (cur != null && cur->ParentNode != null)
+                {
+                    rx = rx * cur->ScaleX + cur->X;
+                    ry = ry * cur->ScaleY + cur->Y;
+                    sx *= cur->ScaleX;
+                    sy *= cur->ScaleY;
+                    cur = cur->ParentNode;
+                }
+
+                var left = vpPos.X + menu->X + rx * addonScale;
+                var top = vpPos.Y + menu->Y + ry * addonScale;
+                var width = owner->Width * sx * addonScale;
+                var height = owner->Height * sy * addonScale;
+
+                if (mouse.X >= left && mouse.X <= left + width && mouse.Y >= top && mouse.Y <= top + height)
+                {
+                    hoveredIdx = i;
+                    break;
+                }
+            }
+        }
+
+        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        {
+            hoveredIdx = list->SelectedItemIndex;
+        }
+
+        var mappedIdx = hoveredIdx + indexOffset;
+        if (mappedIdx < 0 || mappedIdx >= routes.Count)
+        {
+            return false;
+        }
+
+        var matched = routes[mappedIdx];
+        if (string.IsNullOrWhiteSpace(matched))
+        {
+            return false;
+        }
+
+        routeFilter = matched;
+        return true;
     }
 
     /// <summary>
