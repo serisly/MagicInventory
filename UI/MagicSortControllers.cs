@@ -19,6 +19,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
     private readonly MagicSortAddonBinding<AddonShop> shopController;
     private readonly MagicSortAddonBinding<AddonGrandCompanySupplyList> grandCompanyController;
     private readonly MagicSortAddonBinding<AtkUnitBase> materializeController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> cabinetController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> glamourDresserController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionSortController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeSortController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalSortController;
@@ -96,6 +98,22 @@ public sealed unsafe class MagicSortControllers : IDisposable
             addon => addon->RootNode,
             addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false));
 
+        cabinetController = new MagicSortAddonBinding<AtkUnitBase>(
+            "Cabinet",
+            magicSort.GetArmoireStoreButtonState,
+            magicSort.ExecuteArmoireStore,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: true),
+            hovered => highlightController.SetHoveredSellAddon("Cabinet", hovered));
+
+        glamourDresserController = new MagicSortAddonBinding<AtkUnitBase>(
+            "MiragePrismPrismBoxCrystallize",
+            magicSort.GetGlamourDresserButtonState,
+            magicSort.ExecuteGlamourDresserNotice,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 126f, 26f, preferRightSide: false),
+            hovered => highlightController.SetHoveredSellAddon("MiragePrismPrismBoxCrystallize", hovered));
+
         inventoryExpansionSortController = new MagicSortAddonBinding<AtkUnitBase>(
             "InventoryExpansion",
             magicSort.GetInventorySortButtonState,
@@ -159,6 +177,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
         shopController.Enable();
         grandCompanyController.Enable();
         materializeController.Enable();
+        cabinetController.Enable();
+        glamourDresserController.Enable();
         inventoryExpansionSortController.Enable();
         inventoryLargeSortController.Enable();
         inventoryNormalSortController.Enable();
@@ -175,6 +195,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
         shopController.Dispose();
         grandCompanyController.Dispose();
         materializeController.Dispose();
+        cabinetController.Dispose();
+        glamourDresserController.Dispose();
         inventoryExpansionSortController.Dispose();
         inventoryLargeSortController.Dispose();
         inventoryNormalSortController.Dispose();

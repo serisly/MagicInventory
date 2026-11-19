@@ -55,6 +55,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     private enum StationKind
     {
         SummoningBell,
+        Armoire,
         MarketBoard,
         VendorNpc,
         GrandCompanyNpc,
@@ -214,6 +215,12 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                     return true;
                 }
 
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
+                {
+                    magicSort.ExecuteArmoireStore();
+                    return true;
+                }
+
                 return false;
 
             case MagicActionIntent.Sell:
@@ -308,6 +315,34 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                     {
                         pendingStation = null;
                         bellSweep.StartBellSweep(marketSellOnly: req.Intent == MagicActionIntent.Sell);
+                    }
+                }
+
+                break;
+
+            case StationKind.Armoire:
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
+                {
+                    if (WaitHumanBeat(req, now))
+                    {
+                        pendingStation = null;
+                        magicSort.ExecuteArmoireStore();
+                    }
+                }
+                else if (!req.ClickedSubMenu && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString"))
+                {
+                    if (WaitHumanBeat(req, now))
+                    {
+                        if (TryClickArmoirePlaceMenuEntry())
+                        {
+                            req.ClickedSubMenu = true;
+                            req.ReadyAtUtc = DateTime.MinValue;
+                        }
+                        else
+                        {
+                            pendingStation = null;
+                            chatGui.Print("Select 'Place items in the armoire' and click Magic Store.");
+                        }
                     }
                 }
 
@@ -440,6 +475,36 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         return false;
     }
 
+    private bool TryClickArmoirePlaceMenuEntry()
+    {
+        var selectAddon = (AddonSelectString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectString");
+        if (selectAddon == null || selectAddon->PopupMenu.EntryNames == null)
+        {
+            return false;
+        }
+
+        var count = selectAddon->PopupMenu.EntryCount;
+        for (var i = 0; i < count; i++)
+        {
+            var ptr = selectAddon->PopupMenu.EntryNames[i].Value;
+            if (ptr == null)
+            {
+                continue;
+            }
+
+            var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
+            if (text.Contains("Place items in the armoire", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Place", StringComparison.OrdinalIgnoreCase))
+            {
+                var args = stackalloc AtkValue[1];
+                args[0] = NativeUiHelpers.IntValue(i);
+                return NativeUiHelpers.FireCallback((AtkUnitBase*)selectAddon, true, new ReadOnlySpan<AtkValue>(args, 1));
+            }
+        }
+
+        return false;
+    }
+
     private bool TryClickGcSupplyMenuEntry()
     {
         var selectAddon = (AddonSelectString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectString");
@@ -548,9 +613,17 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         if (obj.ObjectKind == ObjectKind.EventObj)
         {
             if ((intent is MagicActionIntent.Sort or MagicActionIntent.Sell)
-                && (obj.BaseId is 2000401 or 196630 || string.Equals(name, "Summoning Bell", StringComparison.OrdinalIgnoreCase)))
+                && (obj.BaseId is 2000401 or 2000403 or 196630 || string.Equals(name, "Summoning Bell", StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.SummoningBell;
+                maxRange = EventObjectInteractRangeYalms;
+                return true;
+            }
+
+            if (intent == MagicActionIntent.Sort
+                && (obj.BaseId == 2001407 || string.Equals(name, "Armoire", StringComparison.OrdinalIgnoreCase)))
+            {
+                kind = StationKind.Armoire;
                 maxRange = EventObjectInteractRangeYalms;
                 return true;
             }

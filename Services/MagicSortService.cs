@@ -42,6 +42,7 @@ public sealed unsafe class MagicSortService : IDisposable
     private readonly MateriaExtractPlanner materiaPlanner;
     private readonly UseItemsPlanner usePlanner;
     private readonly InventorySortPlanner inventorySortPlanner;
+    private readonly ArmoireStorePlanner armoirePlanner;
 
     private bool wasQueueBusy;
     private bool isOwnBatchActive;
@@ -73,6 +74,12 @@ public sealed unsafe class MagicSortService : IDisposable
 
     private DateTime lastInvSortButtonUtc = DateTime.MinValue;
     private MagicSortButtonState cachedInvSortButton = new(true, true, "Magic Sort", "Hover to preview destinations.");
+
+    private DateTime lastArmoireButtonUtc = DateTime.MinValue;
+    private MagicSortButtonState cachedArmoireButton = HiddenSortButton;
+
+    private DateTime lastGlamourButtonUtc = DateTime.MinValue;
+    private MagicSortButtonState cachedGlamourButton = HiddenSortButton;
 
     public MagicSortService(
         IDalamudPluginInterface pluginInterface,
@@ -107,6 +114,7 @@ public sealed unsafe class MagicSortService : IDisposable
         materiaPlanner = new MateriaExtractPlanner(dataManager, gameGui, condition, transactionQueue, InvalidateButtonCache);
         usePlanner = new UseItemsPlanner(dataManager, condition, chatGui, transactionQueue, safety);
         inventorySortPlanner = new InventorySortPlanner(dataManager, condition, transactionQueue, safety);
+        armoirePlanner = new ArmoireStorePlanner(dataManager, gameGui, safety);
     }
 
     public int ManifestItemCount => GetLatestManifest().Count;
@@ -125,6 +133,8 @@ public sealed unsafe class MagicSortService : IDisposable
         lastMateriaButtonUtc = DateTime.MinValue;
         lastUseButtonUtc = DateTime.MinValue;
         lastInvSortButtonUtc = DateTime.MinValue;
+        lastArmoireButtonUtc = DateTime.MinValue;
+        lastGlamourButtonUtc = DateTime.MinValue;
     }
 
     public bool IsItemOverwritten(uint rawItemId)
@@ -868,6 +878,34 @@ public sealed unsafe class MagicSortService : IDisposable
                 {
                     slots.Add((p.Container, p.Slot));
                 }
+            }
+
+            return slots;
+        }
+
+        if (string.Equals(hoveredSellAddon, "Cabinet", StringComparison.Ordinal)
+            && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
+        {
+            foreach (var p in armoirePlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, entries, out _, out _))
+            {
+                slots.Add((p.Container, p.Slot));
+            }
+
+            return slots;
+        }
+
+        if (string.Equals(hoveredSellAddon, "MiragePrismPrismBoxCrystallize", StringComparison.Ordinal)
+            && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
+        {
+            GetSlotsMatchingRouteFilter("Glamour", out var glamBags, out _, out var glamArmoury);
+            foreach (var s in glamBags)
+            {
+                slots.Add(s);
+            }
+
+            foreach (var s in glamArmoury)
+            {
+                slots.Add(s);
             }
 
             return slots;
@@ -1688,6 +1726,133 @@ public sealed unsafe class MagicSortService : IDisposable
 
             return (materiaPlanner.BuildExtractionSteps(plans), hasMore);
         });
+    }
+
+    public MagicSortButtonState GetArmoireStoreButtonState()
+    {
+        if (TryGetBusyButtonState(out var busyState))
+        {
+            return busyState;
+        }
+
+        var now = DateTime.UtcNow;
+        if ((now - lastArmoireButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        {
+            return cachedArmoireButton;
+        }
+
+        lastArmoireButtonUtc = now;
+        var plans = armoirePlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, GetLatestManifest(), out var needsRepair, out var meldedSkipped);
+        if (plans.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"Store {plans.Count} item(s) in your Armoire:");
+            var shown = Math.Min(10, plans.Count);
+            for (var i = 0; i < shown; i++)
+            {
+                sb.Append($"\n  - {plans[i].Name}");
+            }
+
+            if (plans.Count > shown)
+            {
+                sb.Append($"\n  ... and {plans.Count - shown} more");
+            }
+
+            if (needsRepair > 0)
+            {
+                sb.Append($"\n({needsRepair} skipped — repair to 100% first)");
+            }
+
+            cachedArmoireButton = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
+        }
+        else if (needsRepair > 0)
+        {
+            cachedArmoireButton = new MagicSortButtonState(
+                true,
+                false,
+                "Repair First",
+                $"{needsRepair} Armoire item(s) below 100% condition — repair before storing.");
+        }
+        else if (meldedSkipped > 0)
+        {
+            cachedArmoireButton = new MagicSortButtonState(
+                true,
+                false,
+                "Unmeld First",
+                $"{meldedSkipped} Armoire item(s) have Materia melded.");
+        }
+        else
+        {
+            cachedArmoireButton = HiddenSortButton;
+        }
+
+        return cachedArmoireButton;
+    }
+
+    public void ExecuteArmoireStore()
+    {
+        TryExecuteOrCancel(() =>
+        {
+            var plans = armoirePlanner.PlanStores(SafeTransactionQueue.MaxBatchSize + 1, GetLatestManifest(), out var needsRepair, out _);
+            var hasMore = plans.Count > SafeTransactionQueue.MaxBatchSize;
+            if (hasMore)
+            {
+                plans.RemoveRange(SafeTransactionQueue.MaxBatchSize, plans.Count - SafeTransactionQueue.MaxBatchSize);
+            }
+
+            if (plans.Count == 0 && needsRepair > 0)
+            {
+                chatGui.Print($"Magic Inventory: {needsRepair} Armoire item(s) need to be repaired to 100% first.");
+            }
+
+            return (armoirePlanner.BuildStoreSteps(plans, InvalidateButtonCache), hasMore);
+        });
+    }
+
+    public MagicSortButtonState GetGlamourDresserButtonState()
+    {
+        var now = DateTime.UtcNow;
+        if ((now - lastGlamourButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        {
+            return cachedGlamourButton;
+        }
+
+        lastGlamourButtonUtc = now;
+        GetSlotsMatchingRouteFilter("Glamour", out var bagSlots, out _, out var armSlots);
+        var total = bagSlots.Count + armSlots.Count;
+        if (total <= 0)
+        {
+            cachedGlamourButton = HiddenSortButton;
+            return cachedGlamourButton;
+        }
+
+        var prismCount = 0;
+        var mgr = InventoryManager.Instance();
+        if (mgr != null)
+        {
+            prismCount = mgr->GetInventoryItemCount(21800, isHq: false, checkEquipped: false, checkArmory: false);
+        }
+
+        var usedText = string.Empty;
+        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismPrismBox.Instance();
+        if (agent != null && agent->Data != null)
+        {
+            usedText = $"\nDresser space: {agent->Data->UsedSlots}/800 | Glamour Prisms: {prismCount}";
+        }
+
+        cachedGlamourButton = new MagicSortButtonState(
+            true,
+            true,
+            $"Glamour ({total})",
+            $"Hover to highlight {total} Glamour Dresser item(s) across Bags & Armoury.{usedText}");
+        return cachedGlamourButton;
+    }
+
+    public void ExecuteGlamourDresserNotice()
+    {
+        GetSlotsMatchingRouteFilter("Glamour", out var bagSlots, out _, out var armSlots);
+        var total = bagSlots.Count + armSlots.Count;
+        chatGui.Print($"Magic Inventory: {total} item(s) tagged for Glamour Dresser (highlighted on hover). Auto-store needs live callback verification first.");
     }
 
     public Func<bool>? IsOrchestratorActive { get; set; }
