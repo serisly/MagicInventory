@@ -156,9 +156,9 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         {
             chatGui.Print(intent switch
             {
-                MagicActionIntent.Sort => "Stand next to a Summoning Bell (or open Materia Extraction) to run /magic sort.",
-                MagicActionIntent.Sell => "Stand next to a Summoning Bell, Vendor, or Grand Company Personnel Officer to run /magic sell.",
-                MagicActionIntent.Buy => "Stand next to a Market Board to run /magic buy.",
+                MagicActionIntent.Sort => "Stand next to a Summoning Bell to run /m sort.",
+                MagicActionIntent.Sell => "Stand next to a Summoning Bell, Vendor, or Grand Company Personnel Officer to run /m sell.",
+                MagicActionIntent.Buy => "Stand next to a Market Board to run /m buy.",
                 _ => "No compatible station in range.",
             });
             return;
@@ -195,12 +195,6 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                     || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"))
                 {
                     magicSort.ExecuteRetainerSort();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Materialize"))
-                {
-                    magicSort.ExecuteMateriaExtractSort();
                     return true;
                 }
 

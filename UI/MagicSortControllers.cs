@@ -18,7 +18,6 @@ public sealed unsafe class MagicSortControllers : IDisposable
     private readonly MagicSortAddonBinding<AtkUnitBase> retainerSellListController;
     private readonly MagicSortAddonBinding<AddonShop> shopController;
     private readonly MagicSortAddonBinding<AddonGrandCompanySupplyList> grandCompanyController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> materializeController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionUseController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeUseController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalUseController;
@@ -85,13 +84,6 @@ public sealed unsafe class MagicSortControllers : IDisposable
             ResolveGrandCompanyPosition,
             hovered => highlightController.SetHoveredSellAddon("GrandCompanySupplyList", hovered));
 
-        materializeController = new MagicSortAddonBinding<AtkUnitBase>(
-            "Materialize",
-            magicSort.GetMateriaExtractButtonState,
-            magicSort.ExecuteMateriaExtractSort,
-            addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false));
-
         inventoryExpansionUseController = new MagicSortAddonBinding<AtkUnitBase>(
             "InventoryExpansion",
             magicSort.GetUseAllButtonState,
@@ -124,7 +116,6 @@ public sealed unsafe class MagicSortControllers : IDisposable
         retainerSellListController.Enable();
         shopController.Enable();
         grandCompanyController.Enable();
-        materializeController.Enable();
         inventoryExpansionUseController.Enable();
         inventoryLargeUseController.Enable();
         inventoryNormalUseController.Enable();
@@ -137,7 +128,6 @@ public sealed unsafe class MagicSortControllers : IDisposable
         retainerSellListController.Dispose();
         shopController.Dispose();
         grandCompanyController.Dispose();
-        materializeController.Dispose();
         inventoryExpansionUseController.Dispose();
         inventoryLargeUseController.Dispose();
         inventoryNormalUseController.Dispose();

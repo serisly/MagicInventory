@@ -207,7 +207,6 @@ public sealed unsafe class RetainerSortPlanner
                 var rawId = slot->ItemId;
                 var baseId = HoldingsService.NormalizeBaseItemId(rawId);
                 if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                    || safety.IsItemLocked(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {
@@ -346,7 +345,6 @@ public sealed unsafe class RetainerSortPlanner
                 var rawId = slot->ItemId;
                 var baseId = HoldingsService.NormalizeBaseItemId(rawId);
                 if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                    || safety.IsItemLocked(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {
@@ -384,7 +382,9 @@ public sealed unsafe class RetainerSortPlanner
                     case "Market":
                     case "Vendor":
                     case "GrandCompany":
+                    case "Use":
                     case "Armoire":
+                    case "Glamour":
                         shouldWithdraw = true;
                         break;
                     case "Retainer":
@@ -453,7 +453,6 @@ public sealed unsafe class RetainerSortPlanner
                     var rawId = slot->ItemId;
                     var baseId = HoldingsService.NormalizeBaseItemId(rawId);
                     if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                        || safety.IsItemLocked(baseId)
                         || gearsetIds.Contains(baseId)
                         || safety.IsItemTracked(baseId))
                     {
@@ -472,7 +471,7 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                    if (effRoute is not ("Market" or "Armoire"))
+                    if (effRoute is not ("Market" or "Armoire" or "Glamour"))
                     {
                         continue;
                     }

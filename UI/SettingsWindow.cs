@@ -48,15 +48,14 @@ public sealed class SettingsWindow : Window
         "All Owned",
         "All Game Items",
         "Market",
-        "Retainer",
+        "Retainers",
         "Vendor",
-        "Grand Company",
+        "GC Seals",
         "Use",
         "Armoire",
         "Glamour Dresser",
         "Keep",
         "Custom Rules",
-        "Locked",
     ];
 
     private static readonly Vector4 ColorMuted = new(0.68f, 0.70f, 0.74f, 1f);
@@ -243,10 +242,10 @@ public sealed class SettingsWindow : Window
             ImGui.TableSetupColumn("What Happens", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableHeadersRow();
 
-            DrawSummaryRow("Retainer", counts.GetValueOrDefault("Retainer"), "Stored in your retainers with /m sort");
+            DrawSummaryRow("Retainers", counts.GetValueOrDefault("Retainer"), "Stored in your retainers with /m sort");
             DrawSummaryRow("Market", counts.GetValueOrDefault("Market"), "Listed on the Market Board with /m sell");
             DrawSummaryRow("Vendor", counts.GetValueOrDefault("Vendor"), "Sold to any Gil vendor with /m sell");
-            DrawSummaryRow("Grand Company", counts.GetValueOrDefault("GrandCompany"), "Turned in for GC Seals with /m sell");
+            DrawSummaryRow("GC Seals", counts.GetValueOrDefault("GrandCompany"), "Turned in for GC Seals with /m sell");
             DrawSummaryRow("Use", counts.GetValueOrDefault("Use"), "Stays in bags — use all at once with Use All");
             DrawSummaryRow("Armoire", counts.GetValueOrDefault("Armoire"), "Can be stored in your Inn Armoire");
             DrawSummaryRow("Glamour Dresser", counts.GetValueOrDefault("Glamour"), "Lv. 1 glamour gear for your Inn Glamour Dresser");
@@ -266,12 +265,12 @@ public sealed class SettingsWindow : Window
 
         ImGui.TextUnformatted("Commands");
         ImGui.BulletText("/m  or  /magic          - Open or close this window");
-        ImGui.BulletText("/m sort                 - Sort items at a Summoning Bell, or extract Materia");
+        ImGui.BulletText("/m sort                 - Sort items between bags and retainers at a Summoning Bell");
         ImGui.BulletText("/m sell                 - Sell at a Vendor, Grand Company, or Summoning Bell");
         ImGui.BulletText("/m buy                  - Buy tracked recipe mats at a Market Board");
         ImGui.BulletText("/m track <recipe> [qty] - Track a crafting recipe (e.g. /m track fish soup 5)");
         ImGui.BulletText("/m use                  - Use unlockables & coffers in your bags");
-        ImGui.BulletText("/m stop                 - Stop immediately");
+        ImGui.BulletText("/m stop                 - Cancel any running sort, sell, buy, or use action");
         ImGui.BulletText("/m scan                 - Refresh Market Board prices");
     }
 
@@ -357,7 +356,7 @@ public sealed class SettingsWindow : Window
             | ImGuiTableFlags.ScrollY
             | ImGuiTableFlags.Resizable
             | ImGuiTableFlags.Sortable;
-        if (!ImGui.BeginTable("ItemSearchTable", 7, tableFlags, new Vector2(0, -1)))
+        if (!ImGui.BeginTable("ItemSearchTable", 6, tableFlags, new Vector2(0, -1)))
         {
             return;
         }
@@ -365,11 +364,10 @@ public sealed class SettingsWindow : Window
         ImGui.TableSetupScrollFreeze(0, 1);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort, 1.25f, 0);
         ImGui.TableSetupColumn("Where", ImGuiTableColumnFlags.WidthFixed, 115f, 1);
-        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 100f, 2);
+        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 105f, 2);
         ImGui.TableSetupColumn("Market", ImGuiTableColumnFlags.WidthFixed, 100f, 3);
-        ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch, 1.35f, 4);
-        ImGui.TableSetupColumn("Lock", ImGuiTableColumnFlags.WidthFixed, 42f, 5);
-        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 120f, 6);
+        ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch, 1.45f, 4);
+        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 130f, 5);
         ImGui.TableHeadersRow();
 
         var sortSpecs = ImGui.TableGetSortSpecs();
@@ -437,13 +435,6 @@ public sealed class SettingsWindow : Window
             }
 
             ImGui.TableSetColumnIndex(5);
-            var locked = magicSort.IsItemLocked(entry.ItemId);
-            if (ImGui.Checkbox("##lock", ref locked))
-            {
-                magicSort.ToggleItemLock(entry.ItemId, out _);
-            }
-
-            ImGui.TableSetColumnIndex(6);
             DrawOverrideCombo(entry.ItemId, retainers);
 
             ImGui.PopID();
@@ -480,10 +471,9 @@ public sealed class SettingsWindow : Window
                 2 => string.Compare(FormatDestinationLabel(a), FormatDestinationLabel(b), StringComparison.OrdinalIgnoreCase),
                 3 => GetSortableMarketPrice(a, world).CompareTo(GetSortableMarketPrice(b, world)),
                 4 => string.Compare(a.Reason, b.Reason, StringComparison.OrdinalIgnoreCase),
-                5 => magicSort.IsItemLocked(a.ItemId).CompareTo(magicSort.IsItemLocked(b.ItemId)),
-                6 => string.Compare(
-                    FormatOverrideLabel(config.ManualRouteOverrides.GetValueOrDefault(a.ItemId, string.Empty), retainers),
-                    FormatOverrideLabel(config.ManualRouteOverrides.GetValueOrDefault(b.ItemId, string.Empty), retainers),
+                5 => string.Compare(
+                    FormatOverrideLabel(a.ItemId, config.ManualRouteOverrides.GetValueOrDefault(a.ItemId, string.Empty), retainers),
+                    FormatOverrideLabel(b.ItemId, config.ManualRouteOverrides.GetValueOrDefault(b.ItemId, string.Empty), retainers),
                     StringComparison.OrdinalIgnoreCase),
                 _ => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase),
             };
@@ -578,10 +568,10 @@ public sealed class SettingsWindow : Window
         return filter switch
         {
             "All Owned" => true,
-            "Grand Company" => string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase),
+            "Retainers" => string.Equals(entry.Route, "Retainer", StringComparison.OrdinalIgnoreCase),
+            "GC Seals" => string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase),
             "Glamour Dresser" => string.Equals(entry.Route, "Glamour", StringComparison.OrdinalIgnoreCase),
             "Custom Rules" => config.ManualRouteOverrides.ContainsKey(entry.ItemId),
-            "Locked" => magicSort.IsItemLocked(entry.ItemId),
             _ => string.Equals(entry.Route, filter, StringComparison.OrdinalIgnoreCase),
         };
     }
@@ -589,7 +579,8 @@ public sealed class SettingsWindow : Window
     private void DrawOverrideCombo(uint itemId, IReadOnlyList<KnownRetainerInfo> retainers)
     {
         var currentVal = config.ManualRouteOverrides.GetValueOrDefault(itemId, string.Empty);
-        var currentLabel = FormatOverrideLabel(currentVal, retainers);
+        var currentPrio = config.MarketListingPriorities.GetValueOrDefault(itemId, 0);
+        var currentLabel = FormatOverrideLabel(itemId, currentVal, retainers);
 
         ImGui.SetNextItemWidth(-1);
         if (!ImGui.BeginCombo("##ov", currentLabel))
@@ -598,68 +589,60 @@ public sealed class SettingsWindow : Window
         }
 
         var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(itemId);
-        DrawOverrideOption(itemId, string.Empty, "Auto", currentVal);
-        DrawOverrideOption(itemId, "Keep", "Keep", currentVal);
+        DrawOverrideOption(itemId, string.Empty, null, "Auto", currentVal, currentPrio);
+        DrawOverrideOption(itemId, "Keep", null, "Keep", currentVal, currentPrio);
 
         if (itemRow is { ItemAction.RowId: > 0 })
         {
-            DrawOverrideOption(itemId, "Use", "Use", currentVal);
+            DrawOverrideOption(itemId, "Use", null, "Use", currentVal, currentPrio);
         }
 
         if (itemRow is null || !itemRow.Value.IsUntradable)
         {
-            DrawOverrideOption(itemId, "Market", "Market", currentVal);
+            DrawOverrideOption(itemId, "Market", 1, "Market (High)", currentVal, currentPrio);
+            DrawOverrideOption(itemId, "Market", 0, "Market", currentVal, currentPrio);
+            DrawOverrideOption(itemId, "Market", -1, "Market (Low)", currentVal, currentPrio);
         }
 
         if (itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique))
         {
-            DrawOverrideOption(itemId, "Vendor", "Vendor", currentVal);
+            DrawOverrideOption(itemId, "Vendor", null, "Vendor", currentVal, currentPrio);
         }
 
         if (itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15)
         {
-            DrawOverrideOption(itemId, "GrandCompany", "GC Seals", currentVal);
+            DrawOverrideOption(itemId, "GrandCompany", null, "GC Seals", currentVal, currentPrio);
         }
 
         if (itemRow is { EquipSlotCategory.RowId: > 0 })
         {
-            DrawOverrideOption(itemId, "Glamour", "Glamour Dresser", currentVal);
+            DrawOverrideOption(itemId, "Glamour", null, "Glamour Dresser", currentVal, currentPrio);
         }
 
         if (triageEngine.IsCabinetItem(itemId))
         {
-            DrawOverrideOption(itemId, "Armoire", "Armoire", currentVal);
+            DrawOverrideOption(itemId, "Armoire", null, "Armoire", currentVal, currentPrio);
         }
 
         foreach (var ret in retainers)
         {
-            DrawOverrideOption(itemId, $"Retainer:{ret.RetainerId}", ret.Name, currentVal);
+            DrawOverrideOption(itemId, $"Retainer:{ret.RetainerId}", null, ret.Name, currentVal, currentPrio);
         }
 
         ImGui.EndCombo();
     }
 
-    private void DrawOverrideOption(uint itemId, string value, string label, string currentVal)
+    private void DrawOverrideOption(uint itemId, string value, int? marketPriority, string label, string currentVal, int currentPrio)
     {
-        var selected = string.Equals(value, currentVal, StringComparison.OrdinalIgnoreCase);
+        var selected = string.Equals(value, currentVal, StringComparison.OrdinalIgnoreCase)
+            && (!marketPriority.HasValue || marketPriority.Value == currentPrio);
         if (ImGui.Selectable(label, selected))
         {
-            if (string.IsNullOrEmpty(value))
-            {
-                config.ManualRouteOverrides.Remove(itemId);
-            }
-            else
-            {
-                config.ManualRouteOverrides[itemId] = value;
-            }
-
-            config.Save(pluginInterface);
-            triageEngine.Invalidate();
-            magicSort.InvalidateButtonCache();
+            magicSort.SetItemOverride(itemId, value, marketPriority);
         }
     }
 
-    private static string FormatOverrideLabel(string value, IReadOnlyList<KnownRetainerInfo> retainers)
+    private string FormatOverrideLabel(uint itemId, string value, IReadOnlyList<KnownRetainerInfo> retainers)
     {
         if (string.IsNullOrEmpty(value))
         {
@@ -671,6 +654,12 @@ public sealed class SettingsWindow : Window
         {
             var match = retainers.FirstOrDefault(r => r.RetainerId == rid);
             return match != null ? match.Name : "Retainer";
+        }
+
+        if (string.Equals(value, "Market", StringComparison.OrdinalIgnoreCase))
+        {
+            var prio = config.MarketListingPriorities.GetValueOrDefault(itemId, 0);
+            return prio > 0 ? "Market (High)" : (prio < 0 ? "Market (Low)" : "Market");
         }
 
         return value switch
@@ -839,7 +828,7 @@ public sealed class SettingsWindow : Window
 
         ImGui.TextColored(ColorMuted, "    Liquidates cheap city-vendor mats and abundant low-price Market items to free bag & retainer slots.");
         ImGui.Spacing();
-        ImGui.TextColored(ColorGood, "Always kept safe in every mode: locked items, tracked mats, gearsets, food, potions, glamour, housing, relics, and rare (0-listed) items.");
+        ImGui.TextColored(ColorGood, "Always kept safe in every mode: tracked mats, gearsets, food, potions, glamour, housing, relics, and rare (0-listed) items.");
 
         ImGui.Spacing();
         ImGui.Separator();
@@ -891,7 +880,7 @@ public sealed class SettingsWindow : Window
 
         ImGui.TextUnformatted("Display");
         var hoverHighlights = config.EnableHoverHighlights;
-        if (ImGui.Checkbox("Highlight items in bags when hovering Magic Sort / Magic Sell", ref hoverHighlights))
+        if (ImGui.Checkbox("Highlight matching items when hovering buttons or right-click options", ref hoverHighlights))
         {
             config.EnableHoverHighlights = hoverHighlights;
             changed = true;

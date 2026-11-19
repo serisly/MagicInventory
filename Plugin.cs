@@ -249,7 +249,7 @@ public sealed class Plugin : IDalamudPlugin
                     : string.Empty;
                 chatGui.Print(
                     $"Magic Inventory ({(string.IsNullOrEmpty(world) ? "offline" : world)}): " +
-                    $"{MagicSort.ManifestItemCount} items, {MagicSort.LockedItemCount} locked, " +
+                    $"{MagicSort.ManifestItemCount} items, {MagicSort.CustomRuleCount} custom rules, " +
                     $"{MaterialTracker.TrackedItemCount} tracked{scanNote}.");
                 break;
             }
@@ -304,7 +304,6 @@ public sealed class Plugin : IDalamudPlugin
     private unsafe void OnContextMenuOpened(IMenuOpenedArgs args)
     {
         uint baseItemId = 0;
-        var fromArmoury = string.Equals(args.AddonName, "ArmouryBoard", StringComparison.Ordinal);
 
         if (args.Target is MenuTargetInventory invTarget && invTarget.TargetItem is { } invItem)
         {
@@ -337,11 +336,11 @@ public sealed class Plugin : IDalamudPlugin
             Name = "Magic Inventory",
             UseDefaultPrefix = true,
             IsSubmenu = true,
-            OnClicked = clickedArgs => OpenItemRuleSubmenu(clickedArgs, capturedId, itemName, fromArmoury),
+            OnClicked = clickedArgs => OpenItemRuleSubmenu(clickedArgs, capturedId, itemName),
         });
     }
 
-    private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName, bool fromArmoury)
+    private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
     {
         var items = new List<IMenuItem>();
         var routeFilters = new List<string?>();
@@ -358,7 +357,7 @@ public sealed class Plugin : IDalamudPlugin
                 : currentEntry;
 
             var currentRoute = currentEntry?.Route ?? "Keep";
-            var autoLabel = FormatAutoPredictedLabel(autoEntry, fromArmoury, out var autoRouteFilter);
+            var autoLabel = FormatAutoPredictedLabel(autoEntry, out var autoRouteFilter);
 
             items.Add(new MenuItem
             {
@@ -374,8 +373,8 @@ public sealed class Plugin : IDalamudPlugin
             var isKeepActive = isManual && string.Equals(currentRoute, "Keep", StringComparison.OrdinalIgnoreCase);
             items.Add(new MenuItem
             {
-                Name = isKeepActive ? "• Keep in Bag" : "Keep in Bag",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Keep", null, "Keep in Bag"),
+                Name = isKeepActive ? "• Keep" : "Keep",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Keep", null, "Keep"),
             });
             routeFilters.Add("Keep");
 
@@ -451,23 +450,6 @@ public sealed class Plugin : IDalamudPlugin
             OnClicked = subArgs => OpenTrackSubmenu(subArgs, baseItemId, itemName),
         });
         routeFilters.Add(null);
-
-        if (canTag)
-        {
-            var isLocked = MagicSort.IsItemLocked(baseItemId);
-            items.Add(new MenuItem
-            {
-                Name = isLocked ? "Unlock Item" : "Lock Item",
-                OnClicked = _ =>
-                {
-                    if (MagicSort.ToggleItemLock(baseItemId, out var locked))
-                    {
-                        chatGui.Print(locked ? $"Locked {itemName}." : $"Unlocked {itemName}.");
-                    }
-                },
-            });
-            routeFilters.Add(null);
-        }
 
         inventoryHighlightController.SetActiveContextSubmenuRoutes("Magic Inventory", routeFilters);
         clickedArgs.OpenSubmenu("Magic Inventory", items);
@@ -596,12 +578,12 @@ public sealed class Plugin : IDalamudPlugin
         clickedArgs.OpenSubmenu("Track", items);
     }
 
-    private static string FormatAutoPredictedLabel(MagicSortEntry? autoEntry, bool fromArmoury, out string routeFilter)
+    private static string FormatAutoPredictedLabel(MagicSortEntry? autoEntry, out string routeFilter)
     {
         if (autoEntry == null || string.Equals(autoEntry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
         {
             routeFilter = "Keep";
-            return fromArmoury ? "Armoury" : "Bag";
+            return "Keep";
         }
 
         if (string.Equals(autoEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase))

@@ -804,7 +804,10 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         if (IsUnlockableOrCoffer(itemRow, name, uiCat))
         {
-            return KeepEntry(baseId, name, priceLow, untradable, string.IsNullOrEmpty(uiCat) ? "Unlockable" : uiCat);
+            var reason = string.Equals(uiCat, "Triple Triad Card", StringComparison.OrdinalIgnoreCase)
+                ? "Duplicate card — trade for MGP at Gold Saucer"
+                : (string.IsNullOrEmpty(uiCat) ? "Unlockable" : uiCat);
+            return KeepEntry(baseId, name, priceLow, untradable, reason);
         }
 
         if (IsActiveUtilityConsumable(name))

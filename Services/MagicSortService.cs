@@ -39,7 +39,6 @@ public sealed unsafe class MagicSortService : IDisposable
     private readonly MarketListingPlanner marketPlanner;
     private readonly VendorSellPlanner vendorPlanner;
     private readonly GrandCompanyPlanner grandCompanyPlanner;
-    private readonly MateriaExtractPlanner materiaPlanner;
     private readonly UseItemsPlanner usePlanner;
 
     private bool wasQueueBusy;
@@ -63,9 +62,6 @@ public sealed unsafe class MagicSortService : IDisposable
     private int lastGcSelectedTab = -1;
     private int lastGcSelectedFilter = -1;
     private MagicSortButtonState cachedGcButton = HiddenSortButton;
-
-    private DateTime lastMateriaButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedMateriaButton = HiddenSortButton;
 
     private DateTime lastUseButtonUtc = DateTime.MinValue;
     private MagicSortButtonState cachedUseButton = HiddenSortButton;
@@ -100,45 +96,15 @@ public sealed unsafe class MagicSortService : IDisposable
         marketPlanner = new MarketListingPlanner(dataManager, gameGui, transactionQueue, safety);
         vendorPlanner = new VendorSellPlanner(dataManager, gameGui, transactionQueue, safety);
         grandCompanyPlanner = new GrandCompanyPlanner(dataManager, gameGui, transactionQueue, safety);
-        materiaPlanner = new MateriaExtractPlanner(dataManager, gameGui, condition, transactionQueue, safety, InvalidateButtonCache);
         usePlanner = new UseItemsPlanner(dataManager, condition, chatGui, transactionQueue, safety);
     }
 
     public int ManifestItemCount => GetLatestManifest().Count;
 
-    public int LockedItemCount => configuration.GetOrCreateCharacter(InventorySafetyEvaluator.GetCurrentContentId()).LockedItemIds.Count;
-
-    public bool IsItemLocked(uint rawItemId) => safety.IsItemLocked(rawItemId);
+    public int CustomRuleCount => configuration.ManualRouteOverrides.Count;
 
     public static bool CanLockOrTagBaseId(uint baseItemId)
         => InventorySafetyEvaluator.CanLockOrTagBaseId(baseItemId);
-
-    public bool ToggleItemLock(uint rawItemId, out bool isNowLocked)
-    {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-        if (!CanLockOrTagBaseId(baseId))
-        {
-            isNowLocked = false;
-            return false;
-        }
-
-        var profile = configuration.GetOrCreateCharacter(InventorySafetyEvaluator.GetCurrentContentId());
-        if (profile.LockedItemIds.Contains(baseId))
-        {
-            profile.LockedItemIds.Remove(baseId);
-            isNowLocked = false;
-        }
-        else
-        {
-            profile.LockedItemIds.Add(baseId);
-            isNowLocked = true;
-        }
-
-        configuration.Save(pluginInterface);
-        triageEngine.Invalidate();
-        InvalidateButtonCache();
-        return true;
-    }
 
     public void InvalidateButtonCache()
     {
@@ -146,7 +112,6 @@ public sealed unsafe class MagicSortService : IDisposable
         lastMarketButtonUtc = DateTime.MinValue;
         lastVendorButtonUtc = DateTime.MinValue;
         lastGcButtonUtc = DateTime.MinValue;
-        lastMateriaButtonUtc = DateTime.MinValue;
         lastUseButtonUtc = DateTime.MinValue;
     }
 
@@ -268,14 +233,7 @@ public sealed unsafe class MagicSortService : IDisposable
 
         if (container is InventoryType.EquippedItems or InventoryType.RetainerEquippedItems)
         {
-            var eqBaseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-            var eqRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(eqBaseId);
-            if (eqRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(eqRow.Value, liveItem))
-            {
-                return "Magic Sort: Extract Materia";
-            }
-
-            return "Magic Sort: Equipped";
+            return "Magic Sort: Keep";
         }
 
         var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
@@ -295,32 +253,20 @@ public sealed unsafe class MagicSortService : IDisposable
         var inArmoury = container.HasValue && InventorySafetyEvaluator.IsArmouryContainer(container.Value);
         var activeRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
 
-        if (safety.IsItemLocked(baseId))
-        {
-            return inRetainer
-                ? $"Magic Sort: {activeRetLabel} (Locked)"
-                : (inArmoury ? "Magic Sort: Armoury (Locked)" : "Magic Sort: Bag (Locked)");
-        }
-
         if (safety.IsItemTracked(baseId))
         {
-            return "Magic Sort: Bag";
-        }
-
-        if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, liveItem))
-        {
-            return "Magic Sort: Extract Materia";
+            return "Magic Sort: Keep";
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
         if (gearsetIds.Contains(baseId))
         {
-            return inArmoury ? "Magic Sort: Armoury" : "Magic Sort: Bag";
+            return "Magic Sort: Keep";
         }
 
         if (itemRow.Value.ItemUICategory.RowId == 62 || itemRow.Value.Rarity >= 4)
         {
-            return FormatHomeHoverLabel(inRetainer, inArmoury, activeRetLabel, itemRow.Value);
+            return "Magic Sort: Keep";
         }
 
         var entries = GetLatestManifest();
@@ -335,7 +281,7 @@ public sealed unsafe class MagicSortService : IDisposable
                 return $"Magic Sort: {activeRetLabel}";
             }
 
-            return FormatHomeHoverLabel(inRetainer, inArmoury, activeRetLabel, itemRow.Value);
+            return "Magic Sort: Keep";
         }
 
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
@@ -351,19 +297,18 @@ public sealed unsafe class MagicSortService : IDisposable
                 return "Magic Sort: Visit retainers at Bell";
             }
 
-            return FormatHomeHoverLabel(inRetainer, inArmoury, activeRetLabel, itemRow.Value);
+            return "Magic Sort: Keep";
         }
 
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, liveItem, entries, gearsetIds, unlockedTop);
         if (effectiveRoute == null)
         {
-            return FormatHomeHoverLabel(inRetainer, inArmoury, activeRetLabel, itemRow.Value);
+            return "Magic Sort: Keep";
         }
 
         var isHq = rawItemId >= 1_000_000
             || (liveItem != null && liveItem->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality));
-        var stackSize = (int)Math.Max(1, itemRow.Value.StackSize);
 
         switch (effectiveRoute)
         {
@@ -383,8 +328,7 @@ public sealed unsafe class MagicSortService : IDisposable
                     : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
                 var prio = safety.GetMarketPriority(baseId);
                 var prioTag = prio > 0 ? " [High]" : (prio < 0 ? " [Low]" : string.Empty);
-                var baseLabel = price > 0 ? $"Magic Sort: Market (~{price:N0}g){prioTag}" : $"Magic Sort: Market{prioTag}";
-                return inArmoury ? $"{baseLabel} [Move to Bag]" : baseLabel;
+                return price > 0 ? $"Magic Sort: Market (~{price:N0}g){prioTag}" : $"Magic Sort: Market{prioTag}";
             }
 
             case "Vendor":
@@ -405,7 +349,7 @@ public sealed unsafe class MagicSortService : IDisposable
                 return "Magic Sort: Glamour Dresser";
 
             default:
-                return FormatHomeHoverLabel(inRetainer, inArmoury, activeRetLabel, itemRow.Value);
+                return "Magic Sort: Keep";
         }
     }
 
@@ -940,7 +884,7 @@ public sealed unsafe class MagicSortService : IDisposable
 
                 string effective;
                 ulong targetRetId = 0;
-                if (safety.IsItemLocked(baseId) || safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
+                if (safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
                 {
                     effective = "Keep";
                 }
@@ -1118,7 +1062,6 @@ public sealed unsafe class MagicSortService : IDisposable
 
                 var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
                 if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                    || safety.IsItemLocked(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {
@@ -1251,7 +1194,6 @@ public sealed unsafe class MagicSortService : IDisposable
         {
             if (qty <= 0
                 || !InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                || safety.IsItemLocked(baseId)
                 || gearsetIds.Contains(baseId)
                 || safety.IsItemTracked(baseId))
             {
@@ -1589,60 +1531,6 @@ public sealed unsafe class MagicSortService : IDisposable
         });
     }
 
-    public MagicSortButtonState GetMateriaExtractButtonState()
-    {
-        if (TryGetBusyButtonState(out var busyState))
-        {
-            return busyState;
-        }
-
-        var now = DateTime.UtcNow;
-        if ((now - lastMateriaButtonUtc).TotalMilliseconds < ButtonStatePollMs)
-        {
-            return cachedMateriaButton;
-        }
-
-        var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize, out var blockedByFullBag);
-        if (plans.Count > 0)
-        {
-            cachedMateriaButton = new MagicSortButtonState(
-                true,
-                true,
-                $"Magic Sort ({plans.Count})",
-                $"Extract Materia from {plans.Count} gear item(s) at 100% Spiritbond.");
-        }
-        else if (blockedByFullBag > 0)
-        {
-            cachedMateriaButton = new MagicSortButtonState(
-                true,
-                false,
-                "Bag Full",
-                "Your inventory is full (140/140). Free bag space before extracting Materia.");
-        }
-        else
-        {
-            cachedMateriaButton = HiddenSortButton;
-        }
-
-        lastMateriaButtonUtc = now;
-        return cachedMateriaButton;
-    }
-
-    public void ExecuteMateriaExtractSort()
-    {
-        TryExecuteOrCancel(() =>
-        {
-            var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize + 1, out _);
-            var hasMore = plans.Count > SafeTransactionQueue.MaxBatchSize;
-            if (hasMore)
-            {
-                plans.RemoveRange(SafeTransactionQueue.MaxBatchSize, plans.Count - SafeTransactionQueue.MaxBatchSize);
-            }
-
-            return (materiaPlanner.BuildExtractionSteps(plans), hasMore);
-        });
-    }
-
     public Func<bool>? IsOrchestratorActive { get; set; }
 
     public System.Action? OnUserStopRequested { get; set; }
@@ -1753,13 +1641,4 @@ public sealed unsafe class MagicSortService : IDisposable
         triageEngine.TriageUpdated -= InvalidateButtonCache;
     }
 
-    private static string FormatHomeHoverLabel(bool inRetainer, bool inArmoury, string activeRetainerName, Item itemRow)
-    {
-        if (inRetainer)
-        {
-            return $"Magic Sort: {activeRetainerName}";
-        }
-
-        return inArmoury ? "Magic Sort: Armoury" : "Magic Sort: Bag";
-    }
 }

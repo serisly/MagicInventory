@@ -260,6 +260,11 @@ public sealed unsafe class InventoryHighlightController : IDisposable
                 {
                     desiredNodes[key] = DepositOrSellTint;
                 }
+
+                foreach (var key in ResolveArmouryVisualHighlightNodes(physicalTargets))
+                {
+                    desiredNodes[key] = DepositOrSellTint;
+                }
             }
         }
 

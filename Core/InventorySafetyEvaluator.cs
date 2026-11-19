@@ -582,7 +582,7 @@ public sealed unsafe class InventorySafetyEvaluator
         }
 
         var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-        if (!CanLockOrTagBaseId(baseId) || IsItemLocked(baseId) || IsItemTracked(baseId))
+        if (!CanLockOrTagBaseId(baseId) || IsItemTracked(baseId))
         {
             return false;
         }
