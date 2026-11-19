@@ -635,19 +635,25 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return KeepEntry(baseId, name, priceLow, untradable, "Job Stone");
         }
 
-        if (isEquip && IsUnlockedCrafterGathererTool(itemRow))
-        {
-            return KeepEntry(baseId, name, priceLow, untradable, "Crafter / Gatherer tool");
-        }
-
-        if (isEquip && IsUnlockedJobBisOrUpgrade(itemRow, unlockedJobTopIlvl))
-        {
-            return KeepEntry(baseId, name, priceLow, untradable, "Gear upgrade / leveling gear");
-        }
-
         if (itemRow.Rarity >= 4)
         {
             return KeepEntry(baseId, name, priceLow, untradable, "Relic gear");
+        }
+
+        // 3. Armoire-eligible gear not yet stored in Armoire (checked BEFORE upgrade rules)
+        if (isCabinet && !alreadyInArmoire)
+        {
+            return new MagicSortEntry(
+                baseId, name, "Armoire", 0, string.Empty, 0, 0, priceLow, untradable,
+                "Can be stored in your Inn Armoire");
+        }
+
+        // 4. Lv 1 glamour & racial starter outfits -> Glamour Dresser (checked BEFORE upgrade rules & priceLow == 0)
+        if (InventorySafetyEvaluator.IsLv1GlamourOrStarterGear(itemRow))
+        {
+            return new MagicSortEntry(
+                baseId, name, "Glamour", 0, string.Empty, 0, 0, priceLow, untradable,
+                "Lv. 1 glamour gear (Glamour Dresser)");
         }
 
         if (isEquip && obs.AnyMelded)
@@ -660,25 +666,19 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return KeepEntry(baseId, name, priceLow, untradable, "Glamoured or dyed gear");
         }
 
+        if (isEquip && IsUnlockedCrafterGathererTool(itemRow, unlockedJobTopIlvl))
+        {
+            return KeepEntry(baseId, name, priceLow, untradable, "Crafter / Gatherer tool");
+        }
+
+        if (isEquip && IsUnlockedJobBisOrUpgrade(itemRow, unlockedJobTopIlvl))
+        {
+            return KeepEntry(baseId, name, priceLow, untradable, "Gear upgrade / leveling gear");
+        }
+
         if (isEquip && priceLow == 0 && !isCabinet)
         {
             return KeepEntry(baseId, name, priceLow, untradable, "Special / starter gear");
-        }
-
-        // 3. Armoire-eligible gear not yet stored in Armoire
-        if (isCabinet && !alreadyInArmoire)
-        {
-            return new MagicSortEntry(
-                baseId, name, "Armoire", 0, string.Empty, 0, 0, priceLow, untradable,
-                "Can be stored in your Inn Armoire");
-        }
-
-        // 4. Lv 1 glamour gear -> Glamour Dresser (inherits from Bag; never sold or dumped into retainers)
-        if (InventorySafetyEvaluator.IsLv1GlamourOrStarterGear(itemRow))
-        {
-            return new MagicSortEntry(
-                baseId, name, "Glamour", 0, string.Empty, 0, 0, priceLow, untradable,
-                "Lv. 1 glamour gear (Glamour Dresser)");
         }
 
         // 5. Unlockables, Coffers, Food/Potions/Tinctures, Utility Consumables, Quest/Relic/Key Items
@@ -1122,7 +1122,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         return raw > 0 ? raw : med;
     }
 
-    private bool IsUnlockedCrafterGathererTool(Item itemRow)
+    private bool IsUnlockedCrafterGathererTool(Item itemRow, Dictionary<uint, int> unlockedJobTopIlvl)
     {
         if (itemRow.EquipSlotCategory.RowId is not (1 or 2 or 13 or 14))
         {
@@ -1137,43 +1137,10 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         }
 
         var category = itemRow.ClassJobCategory.Value;
-        foreach (var jobId in CrafterGathererJobIds)
-        {
-            var job = classJobSheet.GetRowOrDefault(jobId);
-            if (job is null || job.Value.ExpArrayIndex < 0 || job.Value.ExpArrayIndex >= ps->ClassJobLevels.Length)
-            {
-                continue;
-            }
-
-            if (ps->ClassJobLevels[job.Value.ExpArrayIndex] <= 0)
-            {
-                continue;
-            }
-
-            var abbr = job.Value.Abbreviation.ExtractText();
-            if (InventorySafetyEvaluator.CanJobUseCategory(category, abbr))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private bool IsUnlockedJobBisOrUpgrade(Item itemRow, Dictionary<uint, int> unlockedJobTopIlvl)
-    {
-        var ps = PlayerState.Instance();
-        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
-        if (ps == null || classJobSheet == null)
-        {
-            return false;
-        }
-
-        var category = itemRow.ClassJobCategory.Value;
         var itemIlvl = (int)itemRow.LevelItem.RowId;
         var equipLevel = itemRow.LevelEquip;
 
-        foreach (var (jobId, topIlvl) in unlockedJobTopIlvl)
+        foreach (var jobId in CrafterGathererJobIds)
         {
             var job = classJobSheet.GetRowOrDefault(jobId);
             if (job is null || job.Value.ExpArrayIndex < 0 || job.Value.ExpArrayIndex >= ps->ClassJobLevels.Length)
@@ -1193,14 +1160,99 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 continue;
             }
 
-            // Protect BOTH future gear saved to level into (equipLevel > jobLevel) AND current upgrades/BiS!
-            if (equipLevel > jobLevel || itemIlvl >= topIlvl - 5)
+            var topIlvl = unlockedJobTopIlvl.GetValueOrDefault(jobId, 0);
+            // Keep top/current tools and near-future tools (<= jobLevel + 4), not obsolete low-level spares
+            if ((equipLevel > jobLevel && equipLevel <= jobLevel + 4) || topIlvl == 0 || itemIlvl >= topIlvl - 10)
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    private bool IsUnlockedJobBisOrUpgrade(Item itemRow, Dictionary<uint, int> unlockedJobTopIlvl)
+    {
+        var ps = PlayerState.Instance();
+        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
+        if (ps == null || classJobSheet == null)
+        {
+            return false;
+        }
+
+        var gearsetJobs = BuildSavedGearsetJobIds();
+        var currentJobId = (uint)ps->CurrentClassJobId;
+        var category = itemRow.ClassJobCategory.Value;
+        var itemIlvl = (int)itemRow.LevelItem.RowId;
+        var equipLevel = itemRow.LevelEquip;
+
+        foreach (var (jobId, topIlvl) in unlockedJobTopIlvl)
+        {
+            var job = classJobSheet.GetRowOrDefault(jobId);
+            if (job is null || job.Value.ExpArrayIndex < 0 || job.Value.ExpArrayIndex >= ps->ClassJobLevels.Length)
+            {
+                continue;
+            }
+
+            var jobLevel = ps->ClassJobLevels[job.Value.ExpArrayIndex];
+            if (jobLevel <= 0)
+            {
+                continue;
+            }
+
+            var isDoHOrDoL = CrafterGathererJobIds.Contains(jobId);
+            var isActiveJob = jobId == currentJobId || gearsetJobs.Contains(jobId);
+            var jobExp = job.Value.ExpArrayIndex < ps->ClassJobExperience.Length
+                ? ps->ClassJobExperience[job.Value.ExpArrayIndex]
+                : 0;
+
+            // Ignore untouched Lv 1 unlocks (e.g. ROG Lv 1 with 0 XP and no gearset) and untouched 0-XP expansion unlocks
+            if (!isActiveJob && !isDoHOrDoL && (jobLevel <= 1 || (jobExp == 0 && jobLevel is 30 or 50 or 60 or 70 or 80)))
+            {
+                continue;
+            }
+
+            var abbr = job.Value.Abbreviation.ExtractText();
+            if (!InventorySafetyEvaluator.CanJobUseCategory(category, abbr))
+            {
+                continue;
+            }
+
+            // Near-future leveling gear (up to +4 levels ahead of an active/leveled job)
+            if (equipLevel > jobLevel && equipLevel <= jobLevel + 4)
+            {
+                return true;
+            }
+
+            // Current BiS / upgrade: must be usable now and within 5 iLvl of this job's best gear (and non-zero topIlvl)
+            if (equipLevel <= jobLevel && topIlvl > 0 && itemIlvl >= topIlvl - 5)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static HashSet<uint> BuildSavedGearsetJobIds()
+    {
+        var set = new HashSet<uint>();
+        var gm = FFXIVClientStructs.FFXIV.Client.UI.Misc.RaptureGearsetModule.Instance();
+        if (gm == null)
+        {
+            return set;
+        }
+
+        for (var i = 0; i < 100; i++)
+        {
+            var entry = gm->GetGearset(i);
+            if (entry != null && entry->Flags.HasFlag(FFXIVClientStructs.FFXIV.Client.UI.Misc.RaptureGearsetModule.GearsetFlag.Exists))
+            {
+                set.Add(entry->ClassJob);
+            }
+        }
+
+        return set;
     }
 
     private bool IsConfirmedOutgearedByUnlockedJob(Item itemRow, Dictionary<uint, int> unlockedJobTopIlvl)
