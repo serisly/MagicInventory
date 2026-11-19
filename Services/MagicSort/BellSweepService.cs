@@ -637,6 +637,16 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
+        // One listing per click: stop after the first listing pass so every listing is a separate user click.
+        if (magicSort.IsMarketOnePerClick)
+        {
+            magicSort.InvalidateButtonCache();
+            Stop(magicSort.HasMoreMarketSellWork()
+                ? "Listed 1 item. Click Magic Sell again for the next one."
+                : "Listed 1 item.");
+            return;
+        }
+
         // Re-check if remaining live slots/items exist after the 8-item pass
         triggeredBatch = false;
         magicSort.InvalidateButtonCache();

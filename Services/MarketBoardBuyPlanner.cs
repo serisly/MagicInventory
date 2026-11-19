@@ -244,6 +244,12 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             return;
         }
 
+        if (configuration.GetRemainingMarketActionsToday() <= 0)
+        {
+            chatGui.Print($"Magic Buy: daily limit reached ({configuration.MarketDailyActionLimit} Market Board actions). Buy the rest manually or raise the limit in Settings.");
+            return;
+        }
+
         var now = DateTime.UtcNow;
         tracker.MarkDirty();
         PruneExpiredSkips(now);
@@ -750,6 +756,8 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             var boughtQty = activeCandidate.Quantity;
             var boughtCost = activeCandidate.TotalCost;
             purchasedCount++;
+            configuration.RecordMarketAction();
+            configuration.Save(pluginInterface);
             tracker.MarkDirty();
             activeCandidate = null;
 

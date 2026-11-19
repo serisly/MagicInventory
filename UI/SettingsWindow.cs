@@ -877,6 +877,25 @@ public sealed class SettingsWindow : Window
             changed = true;
         }
 
+        var onePerClick = config.MarketOneListingPerClick;
+        if (ImGui.Checkbox("Magic Sell lists one item per click", ref onePerClick))
+        {
+            config.MarketOneListingPerClick = onePerClick;
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, "    Keeps every Market Board listing tied to a click. Magic Buy is always one purchase per click.");
+
+        ImGui.SetNextItemWidth(160f);
+        var dailyLimit = config.MarketDailyActionLimit;
+        if (ImGui.InputInt("Daily Market Board limit (Magic Buy + Magic Sell)", ref dailyLimit, 5, 10))
+        {
+            config.MarketDailyActionLimit = Math.Clamp(dailyLimit, 0, 200);
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, $"    Used today: {config.MarketDailyActionLimit - config.GetRemainingMarketActionsToday()}/{config.MarketDailyActionLimit}. Anything past the limit is up to you to do manually.");
+
         var hasLifestream = pluginInterface.InstalledPlugins.Any(p =>
             string.Equals(p.InternalName, "Lifestream", StringComparison.OrdinalIgnoreCase) && p.IsLoaded);
         var lifestreamOptIn = config.EnableLifestreamWorldHopPrompt;

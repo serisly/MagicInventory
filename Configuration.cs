@@ -95,6 +95,34 @@ public sealed class Configuration : IPluginConfiguration
     public bool EnableLifestreamWorldHopPrompt { get; set; } = false;
     public int WorldHopMinSavingsGil { get; set; } = 5_000;
 
+    // Market Board automation limits (lower automation footprint)
+    public bool MarketOneListingPerClick { get; set; } = true;
+    public int MarketDailyActionLimit { get; set; } = 20;
+    public string MarketActionsDay { get; set; } = string.Empty;
+    public int MarketActionsToday { get; set; }
+
+    public int GetRemainingMarketActionsToday()
+    {
+        RollMarketDayIfNeeded();
+        return Math.Max(0, MarketDailyActionLimit - MarketActionsToday);
+    }
+
+    public void RecordMarketAction()
+    {
+        RollMarketDayIfNeeded();
+        MarketActionsToday++;
+    }
+
+    private void RollMarketDayIfNeeded()
+    {
+        var today = DateTime.Now.ToString("yyyy-MM-dd");
+        if (!string.Equals(MarketActionsDay, today, StringComparison.Ordinal))
+        {
+            MarketActionsDay = today;
+            MarketActionsToday = 0;
+        }
+    }
+
     /// <summary>
     /// Manual per-item route overrides ("Keep", "Use", "Market", "Vendor", "GrandCompany", or "Retainer:&lt;id&gt;").
     /// Absence means automatic rules. Never cleared by automatic settings reset.

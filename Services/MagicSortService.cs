@@ -1501,6 +1501,8 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public void ExecuteMarketSort() => ExecuteMarketSortInternal(fromOrchestrator: false);
 
+    public bool IsMarketOnePerClick => configuration.MarketOneListingPerClick;
+
     public void ExecuteMarketSortFromOrchestrator() => ExecuteMarketSortInternal(fromOrchestrator: true);
 
     private void ExecuteMarketSortInternal(bool fromOrchestrator)
@@ -1522,7 +1524,15 @@ public sealed unsafe class MagicSortService : IDisposable
                 return (Array.Empty<TransactionStep>(), false);
             }
 
-            var batchLimit = Math.Min(MaxThreeStepBatchItems, availableSlots);
+            var remainingToday = configuration.GetRemainingMarketActionsToday();
+            if (remainingToday <= 0)
+            {
+                chatGui.Print($"Magic Sell: daily limit reached ({configuration.MarketDailyActionLimit} Market Board actions). List the rest manually or raise the limit in Settings.");
+                return (Array.Empty<TransactionStep>(), false);
+            }
+
+            var perClick = configuration.MarketOneListingPerClick ? 1 : MaxThreeStepBatchItems;
+            var batchLimit = Math.Min(Math.Min(perClick, availableSlots), remainingToday);
             var probeLimit = Math.Min(batchLimit + 1, availableSlots);
             var plans = marketPlanner.PlanListings(probeLimit, GetLatestManifest());
             var hasMore = plans.Count > batchLimit;
@@ -1531,7 +1541,30 @@ public sealed unsafe class MagicSortService : IDisposable
                 plans.RemoveRange(batchLimit, plans.Count - batchLimit);
             }
 
-            return (marketPlanner.BuildListingSteps(plans, GetLatestManifest), hasMore);
+            var steps = marketPlanner.BuildListingSteps(plans, GetLatestManifest);
+            var counted = new List<TransactionStep>(steps.Count);
+            foreach (var step in steps)
+            {
+                var original = step.HasServerAck;
+                var recorded = false;
+                counted.Add(step with
+                {
+                    HasServerAck = () =>
+                    {
+                        var acked = original();
+                        if (acked && !recorded)
+                        {
+                            recorded = true;
+                            configuration.RecordMarketAction();
+                            configuration.Save(pluginInterface);
+                        }
+
+                        return acked;
+                    },
+                });
+            }
+
+            return (counted, hasMore);
         }, fromOrchestrator: fromOrchestrator);
     }
 
