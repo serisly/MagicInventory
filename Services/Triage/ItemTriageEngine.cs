@@ -201,6 +201,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
     public int PendingPriceCount { get; private set; }
     public string ActiveWorldName => ResolveHomeWorldName();
     public string ActiveDataCenterName => ResolveDataCenterName();
+    public bool IsCabinetItem(uint baseItemId) => cabinetRowByItemId.ContainsKey(HoldingsService.NormalizeBaseItemId(baseItemId));
 
     public void Invalidate()
     {

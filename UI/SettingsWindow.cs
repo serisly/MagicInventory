@@ -518,9 +518,19 @@ public sealed class SettingsWindow : Window
             DrawOverrideOption(itemId, "Vendor", "Vendor", currentVal);
         }
 
-        if (itemRow is { EquipSlotCategory.RowId: > 0, IsUntradable: true, Rarity: 2 or 3 or 7 })
+        if (itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15)
         {
-            DrawOverrideOption(itemId, "GrandCompany", "Grand Company", currentVal);
+            DrawOverrideOption(itemId, "GrandCompany", "GC Seals", currentVal);
+        }
+
+        if (itemRow is { EquipSlotCategory.RowId: > 0 })
+        {
+            DrawOverrideOption(itemId, "Glamour", "Glamour Dresser", currentVal);
+        }
+
+        if (triageEngine.IsCabinetItem(itemId))
+        {
+            DrawOverrideOption(itemId, "Armoire", "Armoire", currentVal);
         }
 
         foreach (var ret in retainers)
@@ -565,9 +575,12 @@ public sealed class SettingsWindow : Window
             return match != null ? match.Name : "Retainer";
         }
 
-        return string.Equals(value, "GrandCompany", StringComparison.OrdinalIgnoreCase)
-            ? "Grand Company"
-            : value;
+        return value switch
+        {
+            "GrandCompany" => "GC Seals",
+            "Glamour" => "Glamour Dresser",
+            _ => value,
+        };
     }
 
     private static Vector4 GetRouteColor(string route)

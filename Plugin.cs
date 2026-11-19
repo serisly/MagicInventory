@@ -144,7 +144,7 @@ public sealed class Plugin : IDalamudPlugin
         itemTooltipController = new ItemTooltipController(gameInteropProvider, gameGui, log, MagicSort);
         itemTooltipController.Enable();
 
-        inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, MagicSort);
+        inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, Holdings, MagicSort);
 
         settingsWindow = new SettingsWindow(
             pluginInterface,
@@ -342,6 +342,8 @@ public sealed class Plugin : IDalamudPlugin
 
     private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
     {
+        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
+
         var items = new List<IMenuItem>();
         var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId);
         var canTag = MagicSortService.CanLockOrTagBaseId(baseItemId);
@@ -354,7 +356,9 @@ public sealed class Plugin : IDalamudPlugin
                 ? "Keep"
                 : (entry.Route == "Retainer" && !string.IsNullOrEmpty(entry.TargetRetainerName)
                     ? entry.TargetRetainerName
-                    : (entry.Route == "GrandCompany" ? "Grand Company" : entry.Route));
+                    : (entry.Route == "GrandCompany"
+                        ? "GC Seals"
+                        : (entry.Route == "Glamour" ? "Glamour Dresser" : entry.Route)));
             if (entry != null && string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
             {
                 var prio = Safety.GetMarketPriority(baseItemId);
@@ -384,59 +388,63 @@ public sealed class Plugin : IDalamudPlugin
             {
                 items.Add(new MenuItem
                 {
-                    Name = "Use (Use All)",
+                    Name = "Use",
                     OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Use", null, "Use"),
                 });
             }
 
-            if (itemRow is null || !itemRow.Value.IsUntradable)
+            var retainers = Holdings.GetKnownRetainersForCurrentCharacter();
+            if (retainers.Count > 0)
             {
                 items.Add(new MenuItem
                 {
-                    Name = "Sell on Market (High Priority)",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 1, "Market (High Priority)"),
-                });
-                items.Add(new MenuItem
-                {
-                    Name = "Sell on Market",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 0, "Market"),
-                });
-                items.Add(new MenuItem
-                {
-                    Name = "Sell on Market (Low Priority)",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", -1, "Market (Low Priority)"),
+                    Name = "Store",
+                    IsSubmenu = true,
+                    OnClicked = subArgs => OpenStoreSubmenu(subArgs, baseItemId, itemName),
                 });
             }
 
-            if (itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique))
+            var canMarket = itemRow is null || !itemRow.Value.IsUntradable;
+            var canVendor = itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique);
+            var canGc = itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15;
+            if (canMarket || canVendor || canGc)
             {
                 items.Add(new MenuItem
                 {
-                    Name = "Sell to Vendor",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Vendor", null, "Vendor"),
+                    Name = "Sell",
+                    IsSubmenu = true,
+                    OnClicked = subArgs => OpenSellSubmenu(subArgs, baseItemId, itemName, canMarket, canVendor, canGc),
                 });
             }
 
-            if (itemRow is { EquipSlotCategory.RowId: > 0, IsUntradable: true, Rarity: 2 or 3 or 7 })
+            if (itemRow is { EquipSlotCategory.RowId: > 0 })
             {
                 items.Add(new MenuItem
                 {
-                    Name = "Grand Company Seals",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GrandCompany", null, "Grand Company"),
+                    Name = "Glamour Dresser",
+                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Glamour", null, "Glamour Dresser"),
                 });
             }
 
-            foreach (var ret in Holdings.GetKnownRetainersForCurrentCharacter())
+            if (TriageEngine.IsCabinetItem(baseItemId))
             {
-                var retId = ret.RetainerId;
-                var retName = ret.Name;
                 items.Add(new MenuItem
                 {
-                    Name = $"Store: {retName}",
-                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, $"Retainer:{retId}", null, retName),
+                    Name = "Armoire",
+                    OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Armoire", null, "Armoire"),
                 });
             }
+        }
 
+        items.Add(new MenuItem
+        {
+            Name = "Track",
+            IsSubmenu = true,
+            OnClicked = subArgs => OpenTrackSubmenu(subArgs, baseItemId, itemName),
+        });
+
+        if (canTag)
+        {
             var isLocked = MagicSort.IsItemLocked(baseItemId);
             items.Add(new MenuItem
             {
@@ -464,14 +472,105 @@ public sealed class Plugin : IDalamudPlugin
             }
         }
 
-        var isTracked = MaterialTracker.IsItemTracked(baseItemId);
+        clickedArgs.OpenSubmenu("Magic Inventory", items);
+    }
+
+    private void OpenStoreSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
+    {
+        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
+
+        var items = new List<IMenuItem>();
+        foreach (var ret in Holdings.GetKnownRetainersForCurrentCharacter())
+        {
+            var retId = ret.RetainerId;
+            var retName = ret.Name;
+            items.Add(new MenuItem
+            {
+                Name = retName,
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, $"Retainer:{retId}", null, retName),
+            });
+        }
+
+        clickedArgs.OpenSubmenu("Store", items);
+    }
+
+    private void OpenSellSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName, bool canMarket, bool canVendor, bool canGc)
+    {
+        inventoryHighlightController.NotifyMagicContextSubmenuOpened();
+
+        var items = new List<IMenuItem>();
+        if (canMarket)
+        {
+            items.Add(new MenuItem
+            {
+                Name = "Market (High Priority)",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 1, "Market (High Priority)"),
+            });
+            items.Add(new MenuItem
+            {
+                Name = "Market",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 0, "Market"),
+            });
+            items.Add(new MenuItem
+            {
+                Name = "Market (Low Priority)",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", -1, "Market (Low Priority)"),
+            });
+        }
+
+        if (canVendor)
+        {
+            items.Add(new MenuItem
+            {
+                Name = "Vendor",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Vendor", null, "Vendor"),
+            });
+        }
+
+        if (canGc)
+        {
+            items.Add(new MenuItem
+            {
+                Name = "GC Seals",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GrandCompany", null, "GC Seals"),
+            });
+        }
+
+        clickedArgs.OpenSubmenu("Sell", items);
+    }
+
+    private void OpenTrackSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
+    {
+        var items = new List<IMenuItem>();
+        var isItemTracked = MaterialTracker.IsItemTracked(baseItemId);
+
         items.Add(new MenuItem
         {
-            Name = isTracked ? "Untrack Item" : "Track Item",
-            OnClicked = _ => MaterialTracker.ToggleSingleItem(baseItemId),
+            Name = isItemTracked ? "Untrack Item" : "Item",
+            OnClicked = _ =>
+            {
+                MaterialTracker.ToggleSingleItem(baseItemId);
+                chatGui.Print(isItemTracked ? $"Stopped tracking {itemName}." : $"Tracking item: {itemName}.");
+            },
         });
 
-        clickedArgs.OpenSubmenu("Magic Inventory", items);
+        if (MaterialTracker.HasRecipeForItem(baseItemId))
+        {
+            items.Add(new MenuItem
+            {
+                Name = "Recipe",
+                OnClicked = _ =>
+                {
+                    MaterialTracker.TrackRecipeForResultItem(baseItemId, out var msg);
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        chatGui.Print(msg);
+                    }
+                },
+            });
+        }
+
+        clickedArgs.OpenSubmenu("Track", items);
     }
 
     private void ApplyContextOverride(uint baseItemId, string itemName, string routeSpec, int? marketPriority, string displayLabel)

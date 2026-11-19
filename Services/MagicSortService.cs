@@ -869,6 +869,126 @@ public sealed unsafe class MagicSortService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Collects all live player-bag and open-retainer slots matching a route filter
+    /// ("Keep", "Use", "Market", "Vendor", "GrandCompany", "Armoire", "Glamour", "Retainer", or "Retainer:&lt;id&gt;")
+    /// for live sibling highlighting when hovering context-menu override options.
+    /// </summary>
+    public void GetSlotsMatchingRouteFilter(
+        string routeFilter,
+        out HashSet<(InventoryType Container, int Slot)> playerSlots,
+        out HashSet<(InventoryType Container, int Slot)> retainerSlots)
+    {
+        playerSlots = new HashSet<(InventoryType Container, int Slot)>();
+        retainerSlots = new HashSet<(InventoryType Container, int Slot)>();
+
+        if (string.IsNullOrWhiteSpace(routeFilter))
+        {
+            return;
+        }
+
+        var manager = InventoryManager.Instance();
+        var itemSheet = dataManager.GetExcelSheet<Item>();
+        var entries = GetLatestManifest();
+        if (manager == null || itemSheet == null || entries.Count == 0)
+        {
+            return;
+        }
+
+        var filterRetainerId = 0UL;
+        var matchRoute = routeFilter;
+        if (routeFilter.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
+            && ulong.TryParse(routeFilter["Retainer:".Length..], out var parsedRetId))
+        {
+            matchRoute = "Retainer";
+            filterRetainerId = parsedRetId;
+        }
+
+        var gearsetIds = safety.BuildGearsetItemIds();
+        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+
+        void ScanContainer(InventoryType containerType, HashSet<(InventoryType, int)> targetSet)
+        {
+            var container = manager->GetInventoryContainer(containerType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                return;
+            }
+
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                {
+                    continue;
+                }
+
+                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
+                if (!CanLockOrTagBaseId(baseId))
+                {
+                    continue;
+                }
+
+                var itemRow = itemSheet.GetRowOrDefault(baseId);
+                if (itemRow is null)
+                {
+                    continue;
+                }
+
+                string effective;
+                ulong targetRetId = 0;
+                if (safety.IsItemLocked(baseId) || safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
+                {
+                    effective = "Keep";
+                }
+                else if (!entries.TryGetValue(baseId, out var entry))
+                {
+                    effective = "Keep";
+                }
+                else if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                {
+                    effective = "Keep";
+                }
+                else
+                {
+                    effective = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, entries, gearsetIds, unlockedTop) ?? "Keep";
+                    targetRetId = entry.TargetRetainerId;
+                }
+
+                if (!string.Equals(effective, matchRoute, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (filterRetainerId != 0 && targetRetId != filterRetainerId)
+                {
+                    continue;
+                }
+
+                targetSet.Add((containerType, i));
+            }
+        }
+
+        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
+        {
+            if (bag != InventoryType.Crystals)
+            {
+                ScanContainer(bag, playerSlots);
+            }
+        }
+
+        if (HoldingsService.GetActiveRetainerId() != 0)
+        {
+            foreach (var rBag in InventorySafetyEvaluator.RetainerBagContainers)
+            {
+                if (rBag != InventoryType.RetainerCrystals)
+                {
+                    ScanContainer(rBag, retainerSlots);
+                }
+            }
+        }
+    }
+
     public bool HasPendingBagMarketItems()
     {
         var entries = GetLatestManifest();

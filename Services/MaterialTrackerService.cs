@@ -329,6 +329,110 @@ public sealed unsafe class MaterialTrackerService
         dirty = true;
     }
 
+    public bool HasRecipeForItem(uint rawItemId)
+    {
+        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        if (baseId == 0)
+        {
+            return false;
+        }
+
+        var recipeSheet = dataManager.GetExcelSheet<Recipe>();
+        if (recipeSheet == null)
+        {
+            return false;
+        }
+
+        foreach (var row in recipeSheet)
+        {
+            if (row.ItemResult.RowId == baseId && row.CraftType.RowId < CraftTypeToClassJobId.Length)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public bool TrackRecipeForResultItem(uint rawItemId, out string statusMessage)
+    {
+        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var recipeSheet = dataManager.GetExcelSheet<Recipe>();
+        var itemSheet = dataManager.GetExcelSheet<Item>();
+        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
+        if (baseId == 0 || recipeSheet == null || itemSheet == null)
+        {
+            statusMessage = "Recipe data is not available.";
+            return false;
+        }
+
+        var ps = PlayerState.Instance();
+        var currentJobId = ps != null ? (uint)ps->CurrentClassJobId : 0u;
+        Recipe? chosen = null;
+
+        foreach (var row in recipeSheet)
+        {
+            if (row.ItemResult.RowId != baseId || row.CraftType.RowId >= CraftTypeToClassJobId.Length)
+            {
+                continue;
+            }
+
+            if (chosen == null || CraftTypeToClassJobId[row.CraftType.RowId] == currentJobId)
+            {
+                chosen = row;
+                if (CraftTypeToClassJobId[row.CraftType.RowId] == currentJobId)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (chosen is null)
+        {
+            statusMessage = "No crafting recipe found for this item.";
+            return false;
+        }
+
+        var recipe = chosen.Value;
+        var profile = ActiveProfile;
+        profile.TrackedItems.Clear();
+
+        var ingCount = Math.Min(6, Math.Min(recipe.Ingredient.Count, recipe.AmountIngredient.Count));
+        for (var i = 0; i < ingCount; i++)
+        {
+            var ingId = recipe.Ingredient[i].RowId;
+            var amt = recipe.AmountIngredient[i];
+            if (ingId == 0 || amt == 0)
+            {
+                continue;
+            }
+
+            profile.TrackedItems[ingId] = profile.TrackedItems.GetValueOrDefault(ingId) + amt;
+        }
+
+        if (profile.TrackedItems.Count == 0)
+        {
+            statusMessage = "This recipe has no trackable ingredients.";
+            return false;
+        }
+
+        var recipeName = itemSheet.TryGetRow(baseId, out var resItem) ? resItem.Name.ExtractText() : $"Recipe #{recipe.RowId}";
+        profile.TrackedRecipeId = recipe.RowId;
+        profile.TrackedTitle = recipeName;
+        profile.TrackedCraftCount = 1;
+        profile.TrackWithdrawAllStacks = false;
+        config.Save(pluginInterface);
+        dirty = true;
+
+        var reqJobId = CraftTypeToClassJobId[recipe.CraftType.RowId];
+        var jobAbbr = classJobSheet != null && classJobSheet.TryGetRow(reqJobId, out var jobRow)
+            ? jobRow.Abbreviation.ExtractText()
+            : "DoH";
+        var reqLv = recipe.RecipeLevelTable.ValueNullable?.ClassJobLevel ?? 1;
+        statusMessage = $"Tracking recipe: {recipeName} x1 ({jobAbbr} Lv. {reqLv}).";
+        return true;
+    }
+
     public void ToggleSingleItem(uint rawItemId)
     {
         var baseItemId = HoldingsService.NormalizeBaseItemId(rawItemId);

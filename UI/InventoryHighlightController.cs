@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using Dalamud.Memory;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
@@ -12,13 +13,14 @@ namespace MagicInventory.UI;
 /// <summary>
 /// Hover-only slot highlighter across native InventoryGrid* and RetainerGrid* addons:
 /// - Magic Sell (RetainerSellList, Shop, GrandCompanySupplyList): highlights bag items to be sold/listed (gold).
+/// - Inventory Use All (InventoryExpansion / InventoryLarge / Inventory): highlights usable bag items (gold).
 /// - Retainer Magic Sort (InventoryRetainerLarge, InventoryRetainer): highlights player bag deposits (gold)
 ///   AND retainer bag withdrawals (teal) simultaneously on hover.
-/// Uses ItemOrderModule sorters so highlights match visual /isort order 1:1 and restores hidden grids cleanly.
+/// - Context Menu Override Hover: highlights all sibling items matching the hovered override destination.
 /// </summary>
 public sealed unsafe class InventoryHighlightController : IDisposable
 {
-    private const double PollIntervalMs = 200.0;
+    private const double PollIntervalMs = 100.0;
 
     // Warm gold for items leaving player bags (sell / list / deposit into retainer)
     private static readonly (short R, short G, short B) DepositOrSellTint = (72, 46, -24);
@@ -69,6 +71,7 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private readonly IFramework framework;
     private readonly IGameGui gameGui;
     private readonly Configuration configuration;
+    private readonly HoldingsService holdings;
     private readonly MagicSortService magicSort;
 
     private readonly Dictionary<(string AddonName, uint NodeId), (short R, short G, short B)> activeTints = new();
@@ -76,18 +79,26 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private bool clearedOrphansOnStartup;
     private string? hoveredSellAddon;
     private string? hoveredRetainerSortAddon;
+    private bool contextMenuTrackingActive;
 
     public InventoryHighlightController(
         IFramework framework,
         IGameGui gameGui,
         Configuration configuration,
+        HoldingsService holdings,
         MagicSortService magicSort)
     {
         this.framework = framework;
         this.gameGui = gameGui;
         this.configuration = configuration;
+        this.holdings = holdings;
         this.magicSort = magicSort;
         this.framework.Update += OnFrameworkUpdate;
+    }
+
+    public void NotifyMagicContextSubmenuOpened()
+    {
+        contextMenuTrackingActive = true;
     }
 
     public void SetHoveredSellAddon(string addonName, bool isHovered)
@@ -161,7 +172,26 @@ public sealed unsafe class InventoryHighlightController : IDisposable
 
         var desiredNodes = new Dictionary<(string AddonName, uint NodeId), (short R, short G, short B)>();
 
-        if (hoveredRetainerSortAddon != null)
+        if (TryResolveHoveredContextMenuRouteFilter(out var contextRouteFilter))
+        {
+            magicSort.GetSlotsMatchingRouteFilter(contextRouteFilter, out var ctxPlayerSlots, out var ctxRetainerSlots);
+            if (ctxPlayerSlots.Count > 0)
+            {
+                foreach (var key in ResolvePlayerVisualHighlightNodes(ctxPlayerSlots))
+                {
+                    desiredNodes[key] = DepositOrSellTint;
+                }
+            }
+
+            if (ctxRetainerSlots.Count > 0)
+            {
+                foreach (var key in ResolveRetainerVisualHighlightNodes(ctxRetainerSlots))
+                {
+                    desiredNodes[key] = RetainerWithdrawTint;
+                }
+            }
+        }
+        else if (hoveredRetainerSortAddon != null)
         {
             magicSort.GetActiveRetainerSortHighlightSlots(
                 hoveredRetainerSortAddon,
@@ -250,6 +280,117 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             node->AddGreen = tint.G;
             node->AddBlue = tint.B;
         }
+    }
+
+    private bool TryResolveHoveredContextMenuRouteFilter(out string routeFilter)
+    {
+        routeFilter = string.Empty;
+        if (!contextMenuTrackingActive)
+        {
+            return false;
+        }
+
+        var menu = NativeUiHelpers.GetReadyAddon(gameGui, "ContextMenu");
+        if (menu == null || !menu->IsVisible)
+        {
+            contextMenuTrackingActive = false;
+            return false;
+        }
+
+        var listNode = menu->GetNodeById(2);
+        var list = listNode != null ? listNode->GetAsAtkComponentList() : null;
+        if (list == null || list->ItemRendererList == null || list->ListLength <= 0)
+        {
+            return false;
+        }
+
+        var hoveredIdx = list->HoveredItemIndex;
+        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        {
+            hoveredIdx = list->SelectedItemIndex;
+        }
+
+        if (hoveredIdx < 0 || hoveredIdx >= list->ListLength)
+        {
+            return false;
+        }
+
+        var renderer = list->ItemRendererList[hoveredIdx].AtkComponentListItemRenderer;
+        if (renderer == null)
+        {
+            return false;
+        }
+
+        var textNode = renderer->AtkComponentButton.ButtonTextNode;
+        if (textNode == null)
+        {
+            return false;
+        }
+
+        var label = textNode->NodeText.ToString().Trim();
+        if (string.IsNullOrEmpty(label))
+        {
+            return false;
+        }
+
+        if (string.Equals(label, "Keep in Bag", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Keep";
+            return true;
+        }
+
+        if (string.Equals(label, "Use", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Use";
+            return true;
+        }
+
+        if (string.Equals(label, "Glamour Dresser", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Glamour";
+            return true;
+        }
+
+        if (string.Equals(label, "Armoire", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Armoire";
+            return true;
+        }
+
+        if (string.Equals(label, "Vendor", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Vendor";
+            return true;
+        }
+
+        if (string.Equals(label, "GC Seals", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "GrandCompany";
+            return true;
+        }
+
+        if (label.StartsWith("Market", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Market";
+            return true;
+        }
+
+        if (string.Equals(label, "Store", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Retainer";
+            return true;
+        }
+
+        foreach (var ret in holdings.GetKnownRetainersForCurrentCharacter())
+        {
+            if (string.Equals(label, ret.Name, StringComparison.OrdinalIgnoreCase))
+            {
+                routeFilter = $"Retainer:{ret.RetainerId}";
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private HashSet<(string AddonName, uint NodeId)> ResolvePlayerVisualHighlightNodes(
