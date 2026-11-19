@@ -360,7 +360,10 @@ public sealed unsafe class MagicSortService : IDisposable
                 return "Magic Sort: Extract Materia";
             }
 
-            return "Magic Sort: Keep";
+            var eqRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
+            return container == InventoryType.RetainerEquippedItems
+                ? $"Magic Sort: {eqRetLabel}"
+                : "Magic Sort: Keep";
         }
 
         var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
@@ -379,6 +382,9 @@ public sealed unsafe class MagicSortService : IDisposable
         var inRetainer = InventorySafetyEvaluator.IsRetainerContainer(container);
         var inArmoury = container.HasValue && InventorySafetyEvaluator.IsArmouryContainer(container.Value);
         var activeRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
+        string KeepHereLabel() => inRetainer
+            ? $"Magic Sort: {activeRetLabel}"
+            : "Magic Sort: Keep";
 
         if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, liveItem))
         {
@@ -387,18 +393,18 @@ public sealed unsafe class MagicSortService : IDisposable
 
         if (safety.IsItemTracked(baseId))
         {
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
         if (gearsetIds.Contains(baseId))
         {
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         if (itemRow.Value.ItemUICategory.RowId == 62 || itemRow.Value.Rarity >= 4)
         {
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         var entries = GetLatestManifest();
@@ -413,7 +419,7 @@ public sealed unsafe class MagicSortService : IDisposable
                 return $"Magic Sort: {activeRetLabel}";
             }
 
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
@@ -429,14 +435,14 @@ public sealed unsafe class MagicSortService : IDisposable
                 return "Magic Sort: Visit retainers at Bell";
             }
 
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, liveItem, entries, gearsetIds, unlockedTop);
         if (effectiveRoute == null)
         {
-            return "Magic Sort: Keep";
+            return KeepHereLabel();
         }
 
         var isHq = rawItemId >= 1_000_000
