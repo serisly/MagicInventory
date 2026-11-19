@@ -965,13 +965,13 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     }
                 }
 
-                // Dead-market junk check
+                // Dead-market junk check — same rules whether the item is in Bags or inside a Retainer
                 var isDeadMarketPrice = unitPrice > 0
                     && unitPrice <= Math.Max(priceLow * 2L, 30L)
                     && stackVal < configuration.VendorMaxStackValue
                     && velocity < configuration.VendorMaxVelocity;
 
-                if (isDeadMarketPrice && totalRetainerQty == 0)
+                if (isDeadMarketPrice)
                 {
                     // Safe mode requires either easy city vendor OR active MB supply (3+ listings) with zero recipe use
                     var safeAllowed = isEasyCityShop || (listingCount >= 3 && !isAnyRecipeIngredient);
@@ -990,8 +990,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
             // 10b. High-value tradable surplus -> Market
             //      Never auto-list Materia, Dyes, Catalysts, or Fishing Tackle (store on retainer unless manually overridden).
-            var isCraftingStaple = sellMode != SellMode.Purge
-                && (totalRetainerQty > 0 || isUpcomingCraft)
+            //      Safe mode keeps retainer crafting staples; Balanced/Purge only protect upcoming craft ingredients.
+            var isCraftingStaple = (isUpcomingCraft || (sellMode == SellMode.Safe && totalRetainerQty > 0))
                 && CraftingStapleCategories.Contains(uiCat)
                 && unitPrice < 1500;
 

@@ -152,75 +152,7 @@ public sealed unsafe class InventorySortPlanner
             }
         }
 
-        // 2. Armoury Chest -> Bags for non-Keep, non-Materia gear (Market, Vendor, GC Seals, Glamour, Armoire, Retainer)
-        foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
-        {
-            if (moves.Count >= maxMoves || bagFreeSlots <= 0)
-            {
-                break;
-            }
-
-            var container = manager->GetInventoryContainer(armType);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < container->Size && moves.Count < maxMoves && bagFreeSlots > 0; i++)
-            {
-                var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                    || gearsetIds.Contains(baseId)
-                    || safety.IsItemTracked(baseId))
-                {
-                    continue;
-                }
-
-                var row = itemSheet.GetRowOrDefault(baseId);
-                if (row is null || row.Value.Rarity >= 4)
-                {
-                    continue;
-                }
-
-                if (InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
-                {
-                    continue;
-                }
-
-                if (!manifestEntries.TryGetValue(baseId, out var entry))
-                {
-                    continue;
-                }
-
-                var effRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                if (effRoute is null or "Keep" or "Materia")
-                {
-                    continue;
-                }
-
-                moves.Add(new InventorySortMove(
-                    InventorySortMoveKind.ArmouryToBag,
-                    armType,
-                    i,
-                    InventoryType.Inventory1, // Actual live empty bag slot is resolved at dispatch time
-                    -1,
-                    rawId,
-                    baseId,
-                    row.Value.Name.ExtractText()));
-                usedSrc.Add((armType, i));
-                bagFreeSlots--;
-                armouryFreeByType[armType] = armouryFreeByType.GetValueOrDefault(armType) + 1;
-            }
-        }
-
-        // 3. Bags -> Armoury Chest for Keep gear when target Armoury tab has free space
+        // 2. Bags -> Armoury Chest FIRST for Keep gear when target Armoury tab has free space
         foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
         {
             if (moves.Count >= maxMoves)
@@ -293,6 +225,76 @@ public sealed unsafe class InventorySortPlanner
                     baseId,
                     row.Value.Name.ExtractText()));
                 armouryFreeByType[targetArmoury.Value] = armouryFreeByType.GetValueOrDefault(targetArmoury.Value) - 1;
+                bagFreeSlots++;
+            }
+        }
+
+        // 3. Armoury Chest -> Bags ONLY for Market, Vendor, and Retainer gear
+        //    (GC Seals turns in straight from Armoury Chest; Glamour/Armoire stay in Armoury until you visit an Inn)
+        foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
+        {
+            if (moves.Count >= maxMoves || bagFreeSlots <= 0)
+            {
+                break;
+            }
+
+            var container = manager->GetInventoryContainer(armType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            for (var i = 0; i < container->Size && moves.Count < maxMoves && bagFreeSlots > 0; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                {
+                    continue;
+                }
+
+                var rawId = slot->ItemId;
+                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
+                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                    || gearsetIds.Contains(baseId)
+                    || safety.IsItemTracked(baseId))
+                {
+                    continue;
+                }
+
+                var row = itemSheet.GetRowOrDefault(baseId);
+                if (row is null || row.Value.Rarity >= 4)
+                {
+                    continue;
+                }
+
+                if (InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
+                {
+                    continue;
+                }
+
+                if (!manifestEntries.TryGetValue(baseId, out var entry))
+                {
+                    continue;
+                }
+
+                var effRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedTop);
+                if (effRoute is not ("Market" or "Vendor" or "Retainer"))
+                {
+                    continue;
+                }
+
+                moves.Add(new InventorySortMove(
+                    InventorySortMoveKind.ArmouryToBag,
+                    armType,
+                    i,
+                    InventoryType.Inventory1, // Actual live empty bag slot is resolved at dispatch time
+                    -1,
+                    rawId,
+                    baseId,
+                    row.Value.Name.ExtractText()));
+                usedSrc.Add((armType, i));
+                bagFreeSlots--;
+                armouryFreeByType[armType] = armouryFreeByType.GetValueOrDefault(armType) + 1;
             }
         }
 

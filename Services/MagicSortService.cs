@@ -223,11 +223,12 @@ public sealed unsafe class MagicSortService : IDisposable
         }
 
         lastInvSortButtonUtc = now;
-        var moves = inventorySortPlanner.PlanMoves(20, GetLatestManifest());
+        var moves = inventorySortPlanner.PlanMoves(200, GetLatestManifest());
         if (moves.Count > 0)
         {
             var sb = new System.Text.StringBuilder();
-            sb.Append($"Sort {moves.Count} item(s) between Bags & Armoury Chest:");
+            var batchNote = moves.Count > 20 ? " (moves 20 per click)" : string.Empty;
+            sb.Append($"Sort {moves.Count} item(s) between Bags & Armoury Chest{batchNote}:");
             var shown = Math.Min(8, moves.Count);
             for (var i = 0; i < shown; i++)
             {
