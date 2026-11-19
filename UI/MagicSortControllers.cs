@@ -109,10 +109,14 @@ public sealed unsafe class MagicSortControllers : IDisposable
         glamourDresserController = new MagicSortAddonBinding<AtkUnitBase>(
             "MiragePrismPrismBoxCrystallize",
             magicSort.GetGlamourDresserButtonState,
-            magicSort.ExecuteGlamourDresserNotice,
+            magicSort.ExecuteGlamourDresserStore,
             addon => addon->RootNode,
             addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 126f, 26f, preferRightSide: false),
-            hovered => highlightController.SetHoveredSellAddon("MiragePrismPrismBoxCrystallize", hovered));
+            hovered =>
+            {
+                highlightController.SetHoveredSellAddon("MiragePrismPrismBoxCrystallize", hovered);
+                routeOverlay.SetGlamourListHover(hovered);
+            });
 
         inventoryExpansionSortController = new MagicSortAddonBinding<AtkUnitBase>(
             "InventoryExpansion",

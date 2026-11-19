@@ -72,6 +72,155 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
     private DateTime lastCacheUtc = DateTime.MinValue;
     private readonly Dictionary<(string AddonName, uint NodeId), SlotBadge> cachedBadges = new();
 
+    private bool glamourListHovered;
+    private DateTime lastGlamourNamesUtc = DateTime.MinValue;
+    private IReadOnlyList<string> cachedGlamourNames = Array.Empty<string>();
+
+    public void SetGlamourListHover(bool isHovered)
+    {
+        glamourListHovered = isHovered;
+        lastGlamourNamesUtc = DateTime.MinValue;
+    }
+
+    /// <summary>
+    /// Soft-highlights rows in the Glamour Creation list (MiragePrismPrismBoxCrystallize, TreeList node 11)
+    /// whose item name matches an item Magic Store will put into the Glamour Dresser.
+    /// </summary>
+    private void DrawGlamourListHighlights()
+    {
+        if (!glamourListHovered || !configuration.EnableHoverHighlights)
+        {
+            return;
+        }
+
+        var addon = NativeUiHelpers.GetReadyAddon(gameGui, "MiragePrismPrismBoxCrystallize");
+        if (addon == null)
+        {
+            glamourListHovered = false;
+            return;
+        }
+
+        var now = DateTime.UtcNow;
+        if ((now - lastGlamourNamesUtc).TotalMilliseconds >= 300.0)
+        {
+            lastGlamourNamesUtc = now;
+            cachedGlamourNames = magicSort.GetGlamourStoreItemNames();
+        }
+
+        if (cachedGlamourNames.Count == 0)
+        {
+            return;
+        }
+
+        var listNode = addon->GetNodeById(11);
+        var compNode = listNode != null ? listNode->GetAsAtkComponentNode() : null;
+        var list = compNode != null ? (AtkComponentList*)compNode->Component : null;
+        if (list == null || list->ItemRendererList == null || list->ListLength <= 0)
+        {
+            return;
+        }
+
+        var dl = ImGui.GetForegroundDrawList();
+        var vpPos = ImGui.GetMainViewport().Pos;
+        var addonScale = addon->Scale > 0.01f ? addon->Scale : 1f;
+        var listRect = GetNodeScreenRect(addon, listNode, vpPos, addonScale);
+        var wash = ImGui.ColorConvertFloat4ToU32(new Vector4(ColorGlamour.X, ColorGlamour.Y, ColorGlamour.Z, 0.22f));
+        var border = ImGui.ColorConvertFloat4ToU32(new Vector4(ColorGlamour.X, ColorGlamour.Y, ColorGlamour.Z, 0.75f));
+
+        for (var i = 0; i < list->ListLength; i++)
+        {
+            var renderer = list->ItemRendererList[i].AtkComponentListItemRenderer;
+            if (renderer == null || renderer->OwnerNode == null)
+            {
+                continue;
+            }
+
+            var owner = (AtkResNode*)renderer->OwnerNode;
+            if (!owner->IsVisible())
+            {
+                continue;
+            }
+
+            var rowText = ReadFirstText(&renderer->AtkComponentButton.AtkComponentBase.UldManager);
+            if (string.IsNullOrEmpty(rowText))
+            {
+                continue;
+            }
+
+            var matched = false;
+            foreach (var name in cachedGlamourNames)
+            {
+                if (rowText.Contains(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+            {
+                continue;
+            }
+
+            var (min, max) = GetNodeScreenRect(addon, owner, vpPos, addonScale);
+            if (max.Y < listRect.Min.Y || min.Y > listRect.Max.Y)
+            {
+                continue;
+            }
+
+            min = new Vector2(min.X, MathF.Max(min.Y, listRect.Min.Y));
+            max = new Vector2(max.X, MathF.Min(max.Y, listRect.Max.Y));
+            dl.AddRectFilled(min, max, wash, 3f);
+            dl.AddRect(min, max, border, 3f, ImDrawFlags.None, 1.2f);
+        }
+    }
+
+    private static (Vector2 Min, Vector2 Max) GetNodeScreenRect(AtkUnitBase* addon, AtkResNode* node, Vector2 vpPos, float addonScale)
+    {
+        var rx = 0f;
+        var ry = 0f;
+        var sx = 1f;
+        var sy = 1f;
+        var cur = node;
+        while (cur != null && cur->ParentNode != null)
+        {
+            rx = rx * cur->ScaleX + cur->X;
+            ry = ry * cur->ScaleY + cur->Y;
+            sx *= cur->ScaleX;
+            sy *= cur->ScaleY;
+            cur = cur->ParentNode;
+        }
+
+        var left = vpPos.X + addon->X + rx * addonScale;
+        var top = vpPos.Y + addon->Y + ry * addonScale;
+        return (new Vector2(left, top), new Vector2(left + node->Width * sx * addonScale, top + node->Height * sy * addonScale));
+    }
+
+    private static string ReadFirstText(AtkUldManager* uld)
+    {
+        if (uld == null || uld->NodeList == null)
+        {
+            return string.Empty;
+        }
+
+        for (var n = 0; n < uld->NodeListCount; n++)
+        {
+            var node = uld->NodeList[n];
+            if (node == null || node->Type != NodeType.Text)
+            {
+                continue;
+            }
+
+            var text = ((AtkTextNode*)node)->NodeText.ToString();
+            if (!string.IsNullOrWhiteSpace(text) && text.Length > 2)
+            {
+                return text;
+            }
+        }
+
+        return string.Empty;
+    }
+
     public InventoryRouteOverlay(
         IGameGui gameGui,
         IDataManager dataManager,
@@ -102,6 +251,8 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
 
     public void Draw()
     {
+        DrawGlamourListHighlights();
+
         if (hoveredInventoryAddon == null || !configuration.EnableHoverHighlights)
         {
             return;

@@ -43,6 +43,7 @@ public sealed unsafe class MagicSortService : IDisposable
     private readonly UseItemsPlanner usePlanner;
     private readonly InventorySortPlanner inventorySortPlanner;
     private readonly ArmoireStorePlanner armoirePlanner;
+    private readonly GlamourStorePlanner glamourPlanner;
 
     private bool wasQueueBusy;
     private bool isOwnBatchActive;
@@ -115,6 +116,7 @@ public sealed unsafe class MagicSortService : IDisposable
         usePlanner = new UseItemsPlanner(dataManager, condition, chatGui, transactionQueue, safety);
         inventorySortPlanner = new InventorySortPlanner(dataManager, condition, transactionQueue, safety);
         armoirePlanner = new ArmoireStorePlanner(dataManager, gameGui, transactionQueue, safety);
+        glamourPlanner = new GlamourStorePlanner(dataManager, gameGui, transactionQueue, safety);
 
         // One-time migration: the old "Lock Item" feature was removed. Preserve the user's intent by
         // converting any previously locked items into a "Keep" rule so they stay protected.
@@ -1870,6 +1872,11 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public MagicSortButtonState GetGlamourDresserButtonState()
     {
+        if (TryGetBusyButtonState(out var busyState))
+        {
+            return busyState;
+        }
+
         var now = DateTime.UtcNow;
         if ((now - lastGlamourButtonUtc).TotalMilliseconds < ButtonStatePollMs)
         {
@@ -1877,41 +1884,65 @@ public sealed unsafe class MagicSortService : IDisposable
         }
 
         lastGlamourButtonUtc = now;
-        GetSlotsMatchingRouteFilter("Glamour", out var bagSlots, out _, out var armSlots);
-        var total = bagSlots.Count + armSlots.Count;
-        if (total <= 0)
+        var plans = glamourPlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, GetLatestManifest(), out var blockReason);
+        if (plans.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"Store {plans.Count} item(s) in your Glamour Dresser (1 Glamour Prism each):");
+            var shown = Math.Min(10, plans.Count);
+            for (var i = 0; i < shown; i++)
+            {
+                sb.Append($"\n  - {plans[i].Name}");
+            }
+
+            if (plans.Count > shown)
+            {
+                sb.Append($"\n  ... and {plans.Count - shown} more");
+            }
+
+            cachedGlamourButton = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
+        }
+        else if (!string.IsNullOrEmpty(blockReason))
+        {
+            cachedGlamourButton = new MagicSortButtonState(true, false, "Magic Store", blockReason);
+        }
+        else
         {
             cachedGlamourButton = HiddenSortButton;
-            return cachedGlamourButton;
         }
 
-        var prismCount = 0;
-        var mgr = InventoryManager.Instance();
-        if (mgr != null)
-        {
-            prismCount = mgr->GetInventoryItemCount(21800, isHq: false, checkEquipped: false, checkArmory: false);
-        }
-
-        var usedText = string.Empty;
-        var agent = FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentMiragePrismPrismBox.Instance();
-        if (agent != null && agent->Data != null)
-        {
-            usedText = $"\nDresser space: {agent->Data->UsedSlots}/800 | Glamour Prisms: {prismCount}";
-        }
-
-        cachedGlamourButton = new MagicSortButtonState(
-            true,
-            true,
-            $"Glamour ({total})",
-            $"Hover to highlight {total} Glamour Dresser item(s) across Bags & Armoury.{usedText}");
         return cachedGlamourButton;
     }
 
-    public void ExecuteGlamourDresserNotice()
+    public void ExecuteGlamourDresserStore()
     {
-        GetSlotsMatchingRouteFilter("Glamour", out var bagSlots, out _, out var armSlots);
-        var total = bagSlots.Count + armSlots.Count;
-        chatGui.Print($"Magic Inventory: {total} item(s) tagged for Glamour Dresser (highlighted on hover). Auto-store needs live callback verification first.");
+        TryExecuteOrCancel(() =>
+        {
+            var plans = glamourPlanner.PlanStores(SafeTransactionQueue.MaxBatchSize + 1, GetLatestManifest(), out var blockReason);
+            var hasMore = plans.Count > SafeTransactionQueue.MaxBatchSize;
+            if (hasMore)
+            {
+                plans.RemoveRange(SafeTransactionQueue.MaxBatchSize, plans.Count - SafeTransactionQueue.MaxBatchSize);
+            }
+
+            if (plans.Count == 0 && !string.IsNullOrEmpty(blockReason))
+            {
+                chatGui.Print($"Magic Inventory: {blockReason}");
+            }
+
+            return (glamourPlanner.BuildStoreSteps(plans, InvalidateButtonCache), hasMore);
+        });
+    }
+
+    public IReadOnlyList<string> GetGlamourStoreItemNames()
+    {
+        var names = new List<string>();
+        foreach (var p in glamourPlanner.PlanStores(200, GetLatestManifest(), out _))
+        {
+            names.Add(p.Name);
+        }
+
+        return names;
     }
 
     public Func<bool>? IsOrchestratorActive { get; set; }
