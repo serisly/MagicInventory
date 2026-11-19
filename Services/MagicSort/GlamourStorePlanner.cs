@@ -198,7 +198,7 @@ public sealed unsafe class GlamourStorePlanner
                         var yesNo = (AddonSelectYesno*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectYesno");
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
-                            var prompt = yesNo->PromptText != null ? yesNo->PromptText->NodeText.ToString() : string.Empty;
+                            var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
                             if (!prompt.Contains(captured.Name, StringComparison.OrdinalIgnoreCase))
                             {
                                 if (yesNo->NoButton != null)
@@ -206,7 +206,7 @@ public sealed unsafe class GlamourStorePlanner
                                     NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
                                 }
 
-                                transactionQueue.Cancel("Stopped: Glamour Dresser confirmation did not match the item.", QueueBatchOutcome.AbortedOnError);
+                                transactionQueue.Cancel($"Stopped: Glamour Dresser confirmation did not match '{captured.Name}' (saw: '{prompt}').", QueueBatchOutcome.AbortedOnError);
                                 return false;
                             }
 
