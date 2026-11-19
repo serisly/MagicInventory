@@ -18,6 +18,10 @@ public sealed unsafe class MagicSortControllers : IDisposable
     private readonly MagicSortAddonBinding<AtkUnitBase> retainerSellListController;
     private readonly MagicSortAddonBinding<AddonShop> shopController;
     private readonly MagicSortAddonBinding<AddonGrandCompanySupplyList> grandCompanyController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> materializeController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionSortController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeSortController;
+    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalSortController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionUseController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeUseController;
     private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalUseController;
@@ -25,7 +29,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
     public MagicSortControllers(
         MagicSortService magicSort,
         BellSweepService bellSweep,
-        InventoryHighlightController highlightController)
+        InventoryHighlightController highlightController,
+        InventoryRouteOverlay routeOverlay)
     {
         retainerListSortController = new MagicSortAddonBinding<AtkUnitBase>(
             "RetainerList",
@@ -84,12 +89,43 @@ public sealed unsafe class MagicSortControllers : IDisposable
             ResolveGrandCompanyPosition,
             hovered => highlightController.SetHoveredSellAddon("GrandCompanySupplyList", hovered));
 
+        materializeController = new MagicSortAddonBinding<AtkUnitBase>(
+            "Materialize",
+            magicSort.GetMateriaExtractButtonState,
+            magicSort.ExecuteMateriaExtractSort,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false));
+
+        inventoryExpansionSortController = new MagicSortAddonBinding<AtkUnitBase>(
+            "InventoryExpansion",
+            magicSort.GetInventorySortButtonState,
+            magicSort.ExecuteInventorySort,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryExpansion", hovered));
+
+        inventoryLargeSortController = new MagicSortAddonBinding<AtkUnitBase>(
+            "InventoryLarge",
+            magicSort.GetInventorySortButtonState,
+            magicSort.ExecuteInventorySort,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryLarge", hovered));
+
+        inventoryNormalSortController = new MagicSortAddonBinding<AtkUnitBase>(
+            "Inventory",
+            magicSort.GetInventorySortButtonState,
+            magicSort.ExecuteInventorySort,
+            addon => addon->RootNode,
+            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            hovered => routeOverlay.SetHoveredInventorySortAddon("Inventory", hovered));
+
         inventoryExpansionUseController = new MagicSortAddonBinding<AtkUnitBase>(
             "InventoryExpansion",
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 110f, 26f, preferRightSide: false),
+            addon => ResolveInventoryUsePosition(addon),
             hovered => highlightController.SetHoveredSellAddon("InventoryExpansion", hovered));
 
         inventoryLargeUseController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -97,7 +133,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 110f, 26f, preferRightSide: false),
+            addon => ResolveInventoryUsePosition(addon),
             hovered => highlightController.SetHoveredSellAddon("InventoryLarge", hovered));
 
         inventoryNormalUseController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -105,8 +141,14 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 110f, 26f, preferRightSide: false),
+            addon => ResolveInventoryUsePosition(addon),
             hovered => highlightController.SetHoveredSellAddon("Inventory", hovered));
+    }
+
+    private static (Vector2 Position, Vector2 Size) ResolveInventoryUsePosition(AtkUnitBase* addon)
+    {
+        var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false);
+        return (new Vector2(basePos.X + 120f, basePos.Y), new Vector2(104f, 26f));
     }
 
     public void Enable()
@@ -116,6 +158,10 @@ public sealed unsafe class MagicSortControllers : IDisposable
         retainerSellListController.Enable();
         shopController.Enable();
         grandCompanyController.Enable();
+        materializeController.Enable();
+        inventoryExpansionSortController.Enable();
+        inventoryLargeSortController.Enable();
+        inventoryNormalSortController.Enable();
         inventoryExpansionUseController.Enable();
         inventoryLargeUseController.Enable();
         inventoryNormalUseController.Enable();
@@ -128,6 +174,10 @@ public sealed unsafe class MagicSortControllers : IDisposable
         retainerSellListController.Dispose();
         shopController.Dispose();
         grandCompanyController.Dispose();
+        materializeController.Dispose();
+        inventoryExpansionSortController.Dispose();
+        inventoryLargeSortController.Dispose();
+        inventoryNormalSortController.Dispose();
         inventoryExpansionUseController.Dispose();
         inventoryLargeUseController.Dispose();
         inventoryNormalUseController.Dispose();

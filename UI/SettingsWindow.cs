@@ -51,6 +51,8 @@ public sealed class SettingsWindow : Window
         "Retainers",
         "Vendor",
         "GC Seals",
+        "Gold Saucer",
+        "Extract Materia",
         "Use",
         "Armoire",
         "Glamour Dresser",
@@ -246,6 +248,8 @@ public sealed class SettingsWindow : Window
             DrawSummaryRow("Market", counts.GetValueOrDefault("Market"), "Listed on the Market Board with /m sell");
             DrawSummaryRow("Vendor", counts.GetValueOrDefault("Vendor"), "Sold to any Gil vendor with /m sell");
             DrawSummaryRow("GC Seals", counts.GetValueOrDefault("GrandCompany"), "Turned in for GC Seals with /m sell");
+            DrawSummaryRow("Gold Saucer", counts.GetValueOrDefault("GoldSaucer"), "Duplicate Triple Triad cards to trade for MGP at Gold Saucer");
+            DrawSummaryRow("Extract Materia", counts.GetValueOrDefault("Materia"), "100% Spiritbond gear — extract free materia in Materialize");
             DrawSummaryRow("Use", counts.GetValueOrDefault("Use"), "Stays in bags — use all at once with Use All");
             DrawSummaryRow("Armoire", counts.GetValueOrDefault("Armoire"), "Can be stored in your Inn Armoire");
             DrawSummaryRow("Glamour Dresser", counts.GetValueOrDefault("Glamour"), "Lv. 1 glamour gear for your Inn Glamour Dresser");
@@ -265,7 +269,7 @@ public sealed class SettingsWindow : Window
 
         ImGui.TextUnformatted("Commands");
         ImGui.BulletText("/m  or  /magic          - Open or close this window");
-        ImGui.BulletText("/m sort                 - Sort items between bags and retainers at a Summoning Bell");
+        ImGui.BulletText("/m sort                 - Sort Bags <-> Armoury, or sort Retainers at a Summoning Bell");
         ImGui.BulletText("/m sell                 - Sell at a Vendor, Grand Company, or Summoning Bell");
         ImGui.BulletText("/m buy                  - Buy tracked recipe mats at a Market Board");
         ImGui.BulletText("/m track <recipe> [qty] - Track a crafting recipe (e.g. /m track fish soup 5)");
@@ -453,6 +457,8 @@ public sealed class SettingsWindow : Window
         return entry.Route switch
         {
             "GrandCompany" => "GC Seals",
+            "GoldSaucer" => "Gold Saucer",
+            "Materia" => "Extract Materia",
             "Glamour" => "Glamour Dresser",
             _ => entry.Route,
         };
@@ -570,6 +576,8 @@ public sealed class SettingsWindow : Window
             "All Owned" => true,
             "Retainers" => string.Equals(entry.Route, "Retainer", StringComparison.OrdinalIgnoreCase),
             "GC Seals" => string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase),
+            "Gold Saucer" => string.Equals(entry.Route, "GoldSaucer", StringComparison.OrdinalIgnoreCase),
+            "Extract Materia" => string.Equals(entry.Route, "Materia", StringComparison.OrdinalIgnoreCase),
             "Glamour Dresser" => string.Equals(entry.Route, "Glamour", StringComparison.OrdinalIgnoreCase),
             "Custom Rules" => config.ManualRouteOverrides.ContainsKey(entry.ItemId),
             _ => string.Equals(entry.Route, filter, StringComparison.OrdinalIgnoreCase),
@@ -612,6 +620,12 @@ public sealed class SettingsWindow : Window
         if (itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15)
         {
             DrawOverrideOption(itemId, "GrandCompany", null, "GC Seals", currentVal, currentPrio);
+        }
+
+        if (itemRow is not null
+            && string.Equals(itemRow.Value.ItemUICategory.ValueNullable?.Name.ExtractText(), "Triple Triad Card", StringComparison.OrdinalIgnoreCase))
+        {
+            DrawOverrideOption(itemId, "GoldSaucer", null, "Gold Saucer", currentVal, currentPrio);
         }
 
         if (itemRow is { EquipSlotCategory.RowId: > 0 })
@@ -665,6 +679,8 @@ public sealed class SettingsWindow : Window
         return value switch
         {
             "GrandCompany" => "GC Seals",
+            "GoldSaucer" => "Gold Saucer",
+            "Materia" => "Extract Materia",
             "Glamour" => "Glamour Dresser",
             _ => value,
         };
@@ -678,6 +694,8 @@ public sealed class SettingsWindow : Window
             "Retainer" => new Vector4(0.58f, 0.80f, 0.96f, 1f),
             "Vendor" => ColorWarn,
             "GrandCompany" => ColorGood,
+            "GoldSaucer" => new Vector4(0.98f, 0.74f, 0.30f, 1f),
+            "Materia" => new Vector4(0.96f, 0.62f, 0.96f, 1f),
             "Use" => new Vector4(0.55f, 0.92f, 0.88f, 1f),
             "Armoire" => new Vector4(0.78f, 0.72f, 0.95f, 1f),
             "Glamour" => new Vector4(0.92f, 0.68f, 0.90f, 1f),

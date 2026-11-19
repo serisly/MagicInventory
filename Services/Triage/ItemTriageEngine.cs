@@ -327,13 +327,15 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var hasHq = false;
         var anyMelded = false;
         var anyGlamoured = false;
+        var anyExtractableMateria = false;
         var equipCount = 0;
         var soulboundCount = 0;
 
+        var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(normalizedBaseId);
         var manager = InventoryManager.Instance();
         if (manager != null)
         {
-            void Scan(InventoryType type, bool isArmoury)
+            void Scan(InventoryType type, bool isEquipped)
             {
                 var container = manager->GetInventoryContainer(type);
                 if (!InventorySafetyEvaluator.IsContainerReadable(container))
@@ -375,25 +377,35 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         anyGlamoured = true;
                     }
 
-                    equipCount++;
-                    if (slot->SpiritbondOrCollectability > 0)
+                    if (itemRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot))
                     {
-                        soulboundCount++;
+                        anyExtractableMateria = true;
+                    }
+
+                    if (!isEquipped)
+                    {
+                        equipCount++;
+                        if (slot->SpiritbondOrCollectability > 0)
+                        {
+                            soulboundCount++;
+                        }
                     }
                 }
             }
 
+            Scan(InventoryType.EquippedItems, isEquipped: true);
+
             foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
             {
-                Scan(bag, isArmoury: false);
+                Scan(bag, isEquipped: false);
             }
 
             foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
             {
-                Scan(arm, isArmoury: true);
+                Scan(arm, isEquipped: false);
             }
 
-            Scan(InventoryType.ArmorySoulCrystal, isArmoury: true);
+            Scan(InventoryType.ArmorySoulCrystal, isEquipped: false);
         }
 
         foreach (var ret in retainers)
@@ -413,7 +425,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 HasHq: false,
                 AnyMelded: false,
                 AnyGlamoured: false,
-                AllEquipSoulbound: false);
+                AllEquipSoulbound: false,
+                AnyExtractableMateria: false);
         }
 
         return new ItemObservation(
@@ -422,7 +435,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             HasHq: hasHq,
             AnyMelded: anyMelded,
             AnyGlamoured: anyGlamoured,
-            AllEquipSoulbound: equipCount > 0 && soulboundCount == equipCount);
+            AllEquipSoulbound: equipCount > 0 && soulboundCount == equipCount,
+            AnyExtractableMateria: anyExtractableMateria);
     }
 
     private void OnExternalDataUpdated()
@@ -504,7 +518,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         bool HasHq,
         bool AnyMelded,
         bool AnyGlamoured,
-        bool AllEquipSoulbound);
+        bool AllEquipSoulbound,
+        bool AnyExtractableMateria);
 
     private Dictionary<uint, ItemObservation> BuildItemObservations(IReadOnlyList<KnownRetainerInfo> retainers)
     {
@@ -513,9 +528,11 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var hasHq = new HashSet<uint>();
         var anyMelded = new HashSet<uint>();
         var anyGlamoured = new HashSet<uint>();
+        var anyExtractableMateria = new HashSet<uint>();
         var equipCount = new Dictionary<uint, int>();
         var soulboundCount = new Dictionary<uint, int>();
 
+        var itemSheet = dataManager.GetExcelSheet<Item>();
         var manager = InventoryManager.Instance();
         if (manager != null)
         {
@@ -580,6 +597,15 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         anyGlamoured.Add(baseId);
                     }
 
+                    if (slot->SpiritbondOrCollectability >= 10000 && itemSheet != null)
+                    {
+                        var sbRow = itemSheet.GetRowOrDefault(baseId);
+                        if (sbRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(sbRow.Value, slot))
+                        {
+                            anyExtractableMateria.Add(baseId);
+                        }
+                    }
+
                     if (cType != InventoryType.EquippedItems)
                     {
                         equipCount[baseId] = equipCount.GetValueOrDefault(baseId) + 1;
@@ -618,7 +644,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 hasHq.Contains(id),
                 anyMelded.Contains(id),
                 anyGlamoured.Contains(id),
-                eCount > 0 && sbCount == eCount);
+                eCount > 0 && sbCount == eCount,
+                anyExtractableMateria.Contains(id));
         }
 
         return result;
@@ -700,11 +727,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             }
             else
             {
-                var overrideLabel = string.Equals(overrideSpec, "GrandCompany", StringComparison.OrdinalIgnoreCase)
-                    ? "GC Seals"
-                    : (string.Equals(overrideSpec, "Glamour", StringComparison.OrdinalIgnoreCase)
-                        ? "Glamour Dresser"
-                        : overrideSpec);
+                var overrideLabel = overrideSpec switch
+                {
+                    "GrandCompany" => "GC Seals",
+                    "Glamour" => "Glamour Dresser",
+                    "GoldSaucer" => "Gold Saucer",
+                    "Materia" => "Extract Materia",
+                    _ => overrideSpec,
+                };
                 return new MagicSortEntry(
                     baseId,
                     name,
@@ -725,10 +755,19 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return KeepEntry(baseId, name, priceLow, untradable, "Currency or crystal");
         }
 
-        // 2. Ironclad Equipment Protection
+        // 2. 100% Spiritbond Materia Extraction (checked first so you never miss free materia before sorting/selling)
         var isEquip = itemRow.EquipSlotCategory.RowId > 0;
         var isCabinet = cabinetRowByItemId.TryGetValue(baseId, out var cabinetRowId);
         var alreadyInArmoire = isCabinet && IsAlreadyStoredInCabinet(cabinetRowId);
+
+        if (isEquip && obs.AnyExtractableMateria)
+        {
+            return new MagicSortEntry(
+                baseId, name, "Materia", 0, string.Empty, 0, 0, priceLow, untradable,
+                "100% Spiritbond — extract free materia");
+        }
+
+        // 2b. Ironclad Equipment Protection
 
         if (equippedIds.Contains(baseId))
         {
@@ -804,10 +843,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         if (IsUnlockableOrCoffer(itemRow, name, uiCat))
         {
-            var reason = string.Equals(uiCat, "Triple Triad Card", StringComparison.OrdinalIgnoreCase)
-                ? "Duplicate card — trade for MGP at Gold Saucer"
-                : (string.IsNullOrEmpty(uiCat) ? "Unlockable" : uiCat);
-            return KeepEntry(baseId, name, priceLow, untradable, reason);
+            if (string.Equals(uiCat, "Triple Triad Card", StringComparison.OrdinalIgnoreCase))
+            {
+                return new MagicSortEntry(
+                    baseId, name, "GoldSaucer", 0, string.Empty, 0, 0, priceLow, untradable,
+                    "Duplicate card — trade for MGP at Gold Saucer");
+            }
+
+            return KeepEntry(baseId, name, priceLow, untradable, string.IsNullOrEmpty(uiCat) ? "Unlockable" : uiCat);
         }
 
         if (IsActiveUtilityConsumable(name))

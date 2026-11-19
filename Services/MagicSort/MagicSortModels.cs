@@ -71,4 +71,11 @@ namespace MagicInventory.Services.MagicSort
         uint BaseItemId,
         string Name,
         int SealReward);
+
+    public sealed record MateriaExtractPlanItem(
+        InventoryType Container,
+        int Slot,
+        uint RawItemId,
+        uint BaseItemId,
+        string Name);
 }

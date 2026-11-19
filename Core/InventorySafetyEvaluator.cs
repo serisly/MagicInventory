@@ -124,6 +124,29 @@ public sealed unsafe class InventorySafetyEvaluator
             or InventoryType.RetainerPage7;
     }
 
+    public static InventoryType? ResolveArmouryContainerForItem(Item itemRow)
+    {
+        if (itemRow.EquipSlotCategory.RowId == 0)
+        {
+            return null;
+        }
+
+        var cat = itemRow.EquipSlotCategory.Value;
+        if (cat.MainHand == 1) return InventoryType.ArmoryMainHand;
+        if (cat.OffHand == 1) return InventoryType.ArmoryOffHand;
+        if (cat.Head == 1) return InventoryType.ArmoryHead;
+        if (cat.Body == 1) return InventoryType.ArmoryBody;
+        if (cat.Gloves == 1) return InventoryType.ArmoryHands;
+        if (cat.Legs == 1) return InventoryType.ArmoryLegs;
+        if (cat.Feet == 1) return InventoryType.ArmoryFeets;
+        if (cat.Ears == 1) return InventoryType.ArmoryEar;
+        if (cat.Neck == 1) return InventoryType.ArmoryNeck;
+        if (cat.Wrists == 1) return InventoryType.ArmoryWrist;
+        if (cat.FingerL == 1 || cat.FingerR == 1) return InventoryType.ArmoryRings;
+        if (cat.SoulCrystal == 1) return InventoryType.ArmorySoulCrystal;
+        return null;
+    }
+
     public static bool IsArmouryContainer(InventoryType container)
     {
         return container is InventoryType.ArmoryMainHand
@@ -553,6 +576,16 @@ public sealed unsafe class InventorySafetyEvaluator
         if (entry.Route is "Glamour")
         {
             return "Glamour";
+        }
+
+        if (entry.Route is "GoldSaucer")
+        {
+            return "GoldSaucer";
+        }
+
+        if (entry.Route is "Materia")
+        {
+            return IsMateriaExtractable(itemRow, liveItem) ? "Materia" : null;
         }
 
         if (entry.Route is "Retainer")

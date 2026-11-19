@@ -382,6 +382,8 @@ public sealed unsafe class RetainerSortPlanner
                     case "Market":
                     case "Vendor":
                     case "GrandCompany":
+                    case "GoldSaucer":
+                    case "Materia":
                     case "Use":
                     case "Armoire":
                     case "Glamour":

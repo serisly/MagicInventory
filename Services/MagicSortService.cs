@@ -39,7 +39,9 @@ public sealed unsafe class MagicSortService : IDisposable
     private readonly MarketListingPlanner marketPlanner;
     private readonly VendorSellPlanner vendorPlanner;
     private readonly GrandCompanyPlanner grandCompanyPlanner;
+    private readonly MateriaExtractPlanner materiaPlanner;
     private readonly UseItemsPlanner usePlanner;
+    private readonly InventorySortPlanner inventorySortPlanner;
 
     private bool wasQueueBusy;
     private bool isOwnBatchActive;
@@ -63,8 +65,14 @@ public sealed unsafe class MagicSortService : IDisposable
     private int lastGcSelectedFilter = -1;
     private MagicSortButtonState cachedGcButton = HiddenSortButton;
 
+    private DateTime lastMateriaButtonUtc = DateTime.MinValue;
+    private MagicSortButtonState cachedMateriaButton = HiddenSortButton;
+
     private DateTime lastUseButtonUtc = DateTime.MinValue;
     private MagicSortButtonState cachedUseButton = HiddenSortButton;
+
+    private DateTime lastInvSortButtonUtc = DateTime.MinValue;
+    private MagicSortButtonState cachedInvSortButton = new(true, true, "Magic Sort", "Hover to preview destinations.");
 
     public MagicSortService(
         IDalamudPluginInterface pluginInterface,
@@ -96,7 +104,9 @@ public sealed unsafe class MagicSortService : IDisposable
         marketPlanner = new MarketListingPlanner(dataManager, gameGui, transactionQueue, safety);
         vendorPlanner = new VendorSellPlanner(dataManager, gameGui, transactionQueue, safety);
         grandCompanyPlanner = new GrandCompanyPlanner(dataManager, gameGui, transactionQueue, safety);
+        materiaPlanner = new MateriaExtractPlanner(dataManager, gameGui, condition, transactionQueue, InvalidateButtonCache);
         usePlanner = new UseItemsPlanner(dataManager, condition, chatGui, transactionQueue, safety);
+        inventorySortPlanner = new InventorySortPlanner(dataManager, condition, transactionQueue, safety);
     }
 
     public int ManifestItemCount => GetLatestManifest().Count;
@@ -112,7 +122,9 @@ public sealed unsafe class MagicSortService : IDisposable
         lastMarketButtonUtc = DateTime.MinValue;
         lastVendorButtonUtc = DateTime.MinValue;
         lastGcButtonUtc = DateTime.MinValue;
+        lastMateriaButtonUtc = DateTime.MinValue;
         lastUseButtonUtc = DateTime.MinValue;
+        lastInvSortButtonUtc = DateTime.MinValue;
     }
 
     public bool IsItemOverwritten(uint rawItemId)
@@ -197,6 +209,75 @@ public sealed unsafe class MagicSortService : IDisposable
         InvalidateButtonCache();
     }
 
+    public MagicSortButtonState GetInventorySortButtonState()
+    {
+        if (TryGetBusyButtonState(out var busyState))
+        {
+            return busyState;
+        }
+
+        var now = DateTime.UtcNow;
+        if ((now - lastInvSortButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        {
+            return cachedInvSortButton;
+        }
+
+        lastInvSortButtonUtc = now;
+        var moves = inventorySortPlanner.PlanMoves(20, GetLatestManifest());
+        if (moves.Count > 0)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"Sort {moves.Count} item(s) between Bags & Armoury Chest:");
+            var shown = Math.Min(8, moves.Count);
+            for (var i = 0; i < shown; i++)
+            {
+                var dir = moves[i].Kind switch
+                {
+                    InventorySortMoveKind.MergeStack => "merge stack",
+                    InventorySortMoveKind.BagToArmoury => "to Armoury",
+                    _ => "to Bag",
+                };
+                sb.Append($"\n  - {moves[i].Name} ({dir})");
+            }
+
+            if (moves.Count > shown)
+            {
+                sb.Append($"\n  ... and {moves.Count - shown} more");
+            }
+
+            cachedInvSortButton = new MagicSortButtonState(true, true, $"Magic Sort ({moves.Count})", sb.ToString());
+        }
+        else
+        {
+            cachedInvSortButton = new MagicSortButtonState(
+                true,
+                true,
+                "Magic Sort",
+                "Hover to preview where each item goes. Bags & Armoury are tidy.");
+        }
+
+        return cachedInvSortButton;
+    }
+
+    public void ExecuteInventorySort()
+    {
+        if (transactionQueue.IsBusy)
+        {
+            transactionQueue.Cancel("Stopped.", QueueBatchOutcome.CancelledByUser);
+            InvalidateButtonCache();
+            return;
+        }
+
+        if (!inventorySortPlanner.Execute(GetLatestManifest(), out var msg) && !string.IsNullOrWhiteSpace(msg))
+        {
+            chatGui.Print(msg);
+        }
+
+        InvalidateButtonCache();
+    }
+
+    public int CountInventorySortMoves() => inventorySortPlanner.CountPlannedMoves(GetLatestManifest());
+
     public string GetItemDisplayName(uint rawItemId)
     {
         var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
@@ -233,6 +314,13 @@ public sealed unsafe class MagicSortService : IDisposable
 
         if (container is InventoryType.EquippedItems or InventoryType.RetainerEquippedItems)
         {
+            var eqBaseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+            var eqRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(eqBaseId);
+            if (eqRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(eqRow.Value, liveItem))
+            {
+                return "Magic Sort: Extract Materia";
+            }
+
             return "Magic Sort: Keep";
         }
 
@@ -252,6 +340,11 @@ public sealed unsafe class MagicSortService : IDisposable
         var inRetainer = InventorySafetyEvaluator.IsRetainerContainer(container);
         var inArmoury = container.HasValue && InventorySafetyEvaluator.IsArmouryContainer(container.Value);
         var activeRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
+
+        if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, liveItem))
+        {
+            return "Magic Sort: Extract Materia";
+        }
 
         if (safety.IsItemTracked(baseId))
         {
@@ -341,6 +434,12 @@ public sealed unsafe class MagicSortService : IDisposable
 
             case "GrandCompany":
                 return "Magic Sort: GC Seals";
+
+            case "GoldSaucer":
+                return "Magic Sort: Gold Saucer";
+
+            case "Materia":
+                return "Magic Sort: Extract Materia";
 
             case "Armoire":
                 return "Magic Sort: Armoire";
@@ -884,7 +983,11 @@ public sealed unsafe class MagicSortService : IDisposable
 
                 string effective;
                 ulong targetRetId = 0;
-                if (safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
+                if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot))
+                {
+                    effective = "Materia";
+                }
+                else if (safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
                 {
                     effective = "Keep";
                 }
@@ -906,7 +1009,8 @@ public sealed unsafe class MagicSortService : IDisposable
                 {
                     if (!string.Equals(effective, "Market", StringComparison.OrdinalIgnoreCase)
                         && !string.Equals(effective, "Vendor", StringComparison.OrdinalIgnoreCase)
-                        && !string.Equals(effective, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+                        && !string.Equals(effective, "GrandCompany", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(effective, "GoldSaucer", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -1531,6 +1635,60 @@ public sealed unsafe class MagicSortService : IDisposable
         });
     }
 
+    public MagicSortButtonState GetMateriaExtractButtonState()
+    {
+        if (TryGetBusyButtonState(out var busyState))
+        {
+            return busyState;
+        }
+
+        var now = DateTime.UtcNow;
+        if ((now - lastMateriaButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        {
+            return cachedMateriaButton;
+        }
+
+        var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize, out var blockedByFullBag);
+        if (plans.Count > 0)
+        {
+            cachedMateriaButton = new MagicSortButtonState(
+                true,
+                true,
+                $"Extract All ({plans.Count})",
+                $"Extract Materia from {plans.Count} gear item(s) at 100% Spiritbond.");
+        }
+        else if (blockedByFullBag > 0)
+        {
+            cachedMateriaButton = new MagicSortButtonState(
+                true,
+                false,
+                "Bag Full",
+                "Your inventory is full (140/140). Free bag space before extracting Materia.");
+        }
+        else
+        {
+            cachedMateriaButton = HiddenSortButton;
+        }
+
+        lastMateriaButtonUtc = now;
+        return cachedMateriaButton;
+    }
+
+    public void ExecuteMateriaExtractSort()
+    {
+        TryExecuteOrCancel(() =>
+        {
+            var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize + 1, out _);
+            var hasMore = plans.Count > SafeTransactionQueue.MaxBatchSize;
+            if (hasMore)
+            {
+                plans.RemoveRange(SafeTransactionQueue.MaxBatchSize, plans.Count - SafeTransactionQueue.MaxBatchSize);
+            }
+
+            return (materiaPlanner.BuildExtractionSteps(plans), hasMore);
+        });
+    }
+
     public Func<bool>? IsOrchestratorActive { get; set; }
 
     public System.Action? OnUserStopRequested { get; set; }
@@ -1633,7 +1791,7 @@ public sealed unsafe class MagicSortService : IDisposable
         return true;
     }
 
-    private IReadOnlyDictionary<uint, MagicSortEntry> GetLatestManifest()
+    public IReadOnlyDictionary<uint, MagicSortEntry> GetLatestManifest()
         => triageEngine.GetCurrentEntries();
 
     public void Dispose()

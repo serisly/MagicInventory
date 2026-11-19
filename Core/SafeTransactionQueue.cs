@@ -23,6 +23,7 @@ public enum PacingProfile
     VendorOrTurnIn,
     MarketListing,
     MarketFormEntry,
+    MateriaExtraction,
 }
 
 public sealed record TransactionStep(
@@ -425,6 +426,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         {
             PacingProfile.GearsetSwitch => (700, 1150),
             PacingProfile.VendorOrTurnIn => (750, 1350),
+            PacingProfile.MateriaExtraction => (850, 1400),
             PacingProfile.MarketQuery => (2200, 3000),
             PacingProfile.MarketListing => (1650, 2650),
             PacingProfile.MarketFormEntry => (380, 620),

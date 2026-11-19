@@ -31,6 +31,7 @@ public sealed class Plugin : IDalamudPlugin
     private readonly WorldHopPromptWindow worldHopPromptWindow;
     private readonly ItemTooltipController itemTooltipController;
     private readonly InventoryHighlightController inventoryHighlightController;
+    private readonly InventoryRouteOverlay inventoryRouteOverlay;
     private RecipeNoteController? recipeNoteController;
     private RetainerController? retainerController;
     private MarketBoardController? marketBoardController;
@@ -145,6 +146,7 @@ public sealed class Plugin : IDalamudPlugin
         itemTooltipController.Enable();
 
         inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, MagicSort);
+        inventoryRouteOverlay = new InventoryRouteOverlay(gameGui, dataManager, Configuration, Safety, MagicSort);
 
         settingsWindow = new SettingsWindow(
             pluginInterface,
@@ -204,7 +206,7 @@ public sealed class Plugin : IDalamudPlugin
                 marketBoardController = new MarketBoardController(MaterialTracker, MarketBoardBuy);
                 marketBoardController.Enable();
 
-                magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryHighlightController);
+                magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryHighlightController, inventoryRouteOverlay);
                 magicSortControllers.Enable();
 
                 trackerOverlay = new MaterialTrackerOverlay(
@@ -222,7 +224,11 @@ public sealed class Plugin : IDalamudPlugin
         }
     }
 
-    private void DrawUi() => windowSystem.Draw();
+    private void DrawUi()
+    {
+        windowSystem.Draw();
+        inventoryRouteOverlay.Draw();
+    }
 
     private void ToggleSettingsWindow() => settingsWindow.IsOpen = !settingsWindow.IsOpen;
 
@@ -405,17 +411,20 @@ public sealed class Plugin : IDalamudPlugin
             var canMarket = itemRow is null || !itemRow.Value.IsUntradable;
             var canVendor = itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique);
             var canGc = itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15;
-            if (canMarket || canVendor || canGc)
+            var canGoldSaucer = itemRow is not null
+                && string.Equals(itemRow.Value.ItemUICategory.ValueNullable?.Name.ExtractText(), "Triple Triad Card", StringComparison.OrdinalIgnoreCase);
+            if (canMarket || canVendor || canGc || canGoldSaucer)
             {
                 var isSellActive = isManual
                     && (string.Equals(currentRoute, "Market", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(currentRoute, "Vendor", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(currentRoute, "GrandCompany", StringComparison.OrdinalIgnoreCase));
+                        || string.Equals(currentRoute, "GrandCompany", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(currentRoute, "GoldSaucer", StringComparison.OrdinalIgnoreCase));
                 items.Add(new MenuItem
                 {
                     Name = isSellActive ? "• Sell" : "Sell",
                     IsSubmenu = true,
-                    OnClicked = subArgs => OpenSellSubmenu(subArgs, baseItemId, itemName, isManual, currentRoute, canMarket, canVendor, canGc),
+                    OnClicked = subArgs => OpenSellSubmenu(subArgs, baseItemId, itemName, isManual, currentRoute, canMarket, canVendor, canGc, canGoldSaucer),
                 });
                 routeFilters.Add("Sell");
             }
@@ -485,7 +494,8 @@ public sealed class Plugin : IDalamudPlugin
         string currentRoute,
         bool canMarket,
         bool canVendor,
-        bool canGc)
+        bool canGc,
+        bool canGoldSaucer)
     {
         var items = new List<IMenuItem>();
         var routeFilters = new List<string?>();
@@ -537,6 +547,17 @@ public sealed class Plugin : IDalamudPlugin
                 OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GrandCompany", null, "GC Seals"),
             });
             routeFilters.Add("GrandCompany");
+        }
+
+        if (canGoldSaucer)
+        {
+            var isGs = isManual && string.Equals(currentRoute, "GoldSaucer", StringComparison.OrdinalIgnoreCase);
+            items.Add(new MenuItem
+            {
+                Name = isGs ? "• Gold Saucer" : "Gold Saucer",
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GoldSaucer", null, "Gold Saucer"),
+            });
+            routeFilters.Add("GoldSaucer");
         }
 
         inventoryHighlightController.SetActiveContextSubmenuRoutes("Sell", routeFilters);
@@ -600,6 +621,18 @@ public sealed class Plugin : IDalamudPlugin
             return "GC Seals";
         }
 
+        if (string.Equals(autoEntry.Route, "GoldSaucer", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "GoldSaucer";
+            return "Gold Saucer";
+        }
+
+        if (string.Equals(autoEntry.Route, "Materia", StringComparison.OrdinalIgnoreCase))
+        {
+            routeFilter = "Materia";
+            return "Extract Materia";
+        }
+
         if (string.Equals(autoEntry.Route, "Glamour", StringComparison.OrdinalIgnoreCase))
         {
             routeFilter = "Glamour";
@@ -626,6 +659,7 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(MagicCommandName);
         commandManager.RemoveHandler(MagicShortCommandName);
         contextMenu.OnMenuOpened -= OnContextMenuOpened;
+        inventoryRouteOverlay.Dispose();
         inventoryHighlightController.Dispose();
         itemTooltipController.Dispose();
         MagicActions.Dispose();

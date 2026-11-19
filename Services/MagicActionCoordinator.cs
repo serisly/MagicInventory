@@ -154,9 +154,19 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
         if (!TryFindNearestInRangeStation(player!, intent, out var targetObj, out var stationKind))
         {
+            if (intent == MagicActionIntent.Sort
+                && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryExpansion")
+                    || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryLarge")
+                    || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Inventory")
+                    || magicSort.CountInventorySortMoves() > 0))
+            {
+                magicSort.ExecuteInventorySort();
+                return;
+            }
+
             chatGui.Print(intent switch
             {
-                MagicActionIntent.Sort => "Stand next to a Summoning Bell to run /m sort.",
+                MagicActionIntent.Sort => "Stand next to a Summoning Bell (or open your Inventory) to run /m sort.",
                 MagicActionIntent.Sell => "Stand next to a Summoning Bell, Vendor, or Grand Company Personnel Officer to run /m sell.",
                 MagicActionIntent.Buy => "Stand next to a Market Board to run /m buy.",
                 _ => "No compatible station in range.",
@@ -195,6 +205,12 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                     || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"))
                 {
                     magicSort.ExecuteRetainerSort();
+                    return true;
+                }
+
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Materialize"))
+                {
+                    magicSort.ExecuteMateriaExtractSort();
                     return true;
                 }
 
