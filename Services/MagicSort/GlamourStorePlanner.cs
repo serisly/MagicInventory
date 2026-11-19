@@ -199,14 +199,14 @@ public sealed unsafe class GlamourStorePlanner
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
                             var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
-                            if (!prompt.Contains(captured.Name, StringComparison.OrdinalIgnoreCase))
+                            if (!prompt.Contains("glamour dresser", StringComparison.OrdinalIgnoreCase))
                             {
                                 if (yesNo->NoButton != null)
                                 {
                                     NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
                                 }
 
-                                transactionQueue.Cancel($"Stopped: Glamour Dresser confirmation did not match '{captured.Name}' (saw: '{prompt}').", QueueBatchOutcome.AbortedOnError);
+                                transactionQueue.Cancel($"Stopped: Unexpected confirmation dialog while storing '{captured.Name}' (saw: '{prompt}').", QueueBatchOutcome.AbortedOnError);
                                 return false;
                             }
 
