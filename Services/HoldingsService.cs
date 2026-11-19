@@ -462,6 +462,122 @@ public sealed unsafe class HoldingsService
             : $"Stored: {summary.TotalRetainerCount}";
     }
 
+    /// <summary>
+    /// Single-pass map of where every owned item currently lives (Equipped, Armoury, Bag, and/or Retainers).
+    /// </summary>
+    public Dictionary<uint, string> BuildOwnedLocationsMap()
+    {
+        var partsByItem = new Dictionary<uint, List<string>>(512);
+        var bagCounts = new Dictionary<uint, int>(140);
+        var armouryCounts = new Dictionary<uint, int>(128);
+        var equippedIds = new HashSet<uint>(16);
+
+        var mgr = InventoryManager.Instance();
+        if (mgr != null)
+        {
+            var eq = mgr->GetInventoryContainer(InventoryType.EquippedItems);
+            if (eq != null && eq->Items != null)
+            {
+                for (var i = 0; i < eq->Size; i++)
+                {
+                    var s = eq->GetInventorySlot(i);
+                    if (s != null && s->ItemId != 0 && s->Quantity > 0)
+                    {
+                        equippedIds.Add(NormalizeBaseItemId(s->ItemId));
+                    }
+                }
+            }
+
+            foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
+            {
+                var c = mgr->GetInventoryContainer(armType);
+                if (c == null || c->Items == null)
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < c->Size; i++)
+                {
+                    var s = c->GetInventorySlot(i);
+                    if (s != null && s->ItemId != 0 && s->Quantity > 0)
+                    {
+                        var id = NormalizeBaseItemId(s->ItemId);
+                        armouryCounts[id] = armouryCounts.GetValueOrDefault(id) + (int)s->Quantity;
+                    }
+                }
+            }
+
+            foreach (var bagType in PlayerBagContainers)
+            {
+                if (bagType == InventoryType.Crystals)
+                {
+                    continue;
+                }
+
+                var c = mgr->GetInventoryContainer(bagType);
+                if (c == null || c->Items == null)
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < c->Size; i++)
+                {
+                    var s = c->GetInventorySlot(i);
+                    if (s != null && s->ItemId != 0 && s->Quantity > 0)
+                    {
+                        var id = NormalizeBaseItemId(s->ItemId);
+                        bagCounts[id] = bagCounts.GetValueOrDefault(id) + (int)s->Quantity;
+                    }
+                }
+            }
+        }
+
+        void AddLoc(uint id, string label)
+        {
+            if (!partsByItem.TryGetValue(id, out var list))
+            {
+                list = new List<string>(2);
+                partsByItem[id] = list;
+            }
+
+            list.Add(label);
+        }
+
+        foreach (var id in equippedIds)
+        {
+            AddLoc(id, "Equipped");
+        }
+
+        foreach (var (id, qty) in armouryCounts)
+        {
+            AddLoc(id, qty > 1 ? $"Armoury ({qty})" : "Armoury");
+        }
+
+        foreach (var (id, qty) in bagCounts)
+        {
+            AddLoc(id, qty > 1 ? $"Bag ({qty})" : "Bag");
+        }
+
+        foreach (var ret in GetKnownRetainersForCurrentCharacter())
+        {
+            foreach (var (id, qty) in ret.Quantities)
+            {
+                if (id != 0 && qty > 0)
+                {
+                    AddLoc(id, qty > 1 ? $"{ret.Name} ({qty})" : ret.Name);
+                }
+            }
+        }
+
+        var result = new Dictionary<uint, string>(partsByItem.Count);
+        foreach (var (id, list) in partsByItem)
+        {
+            result[id] = string.Join(", ", list);
+        }
+
+        return result;
+    }
+
     public static uint NormalizeBaseItemId(uint rawItemId)
         => rawItemId >= 1_000_000 ? rawItemId - 1_000_000 : rawItemId;
 

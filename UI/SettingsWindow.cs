@@ -76,6 +76,10 @@ public sealed class SettingsWindow : Window
     private int selectedFilterIndex;
     private string lastGameSearchQuery = string.Empty;
     private List<uint> cachedGameSearchIds = new();
+    private DateTime lastLocationsMapUtc = DateTime.MinValue;
+    private Dictionary<uint, string> cachedLocationsMap = new();
+    private int sortColumnIndex;
+    private bool sortDescending;
 
     public SettingsWindow(
         IDalamudPluginInterface pluginInterface,
@@ -246,7 +250,7 @@ public sealed class SettingsWindow : Window
             DrawSummaryRow("Use", counts.GetValueOrDefault("Use"), "Stays in bags — use all at once with Use All");
             DrawSummaryRow("Armoire", counts.GetValueOrDefault("Armoire"), "Can be stored in your Inn Armoire");
             DrawSummaryRow("Glamour Dresser", counts.GetValueOrDefault("Glamour"), "Lv. 1 glamour gear for your Inn Glamour Dresser");
-            DrawSummaryRow("Keep", counts.GetValueOrDefault("Keep"), "Kept safe in your bags");
+            DrawSummaryRow("Keep", counts.GetValueOrDefault("Keep"), "Stays where it is (Bag, Armoury, or Equipped)");
 
             ImGui.EndTable();
         }
@@ -336,28 +340,53 @@ public sealed class SettingsWindow : Window
             rows.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
         }
 
+        var nowUtc = DateTime.UtcNow;
+        if ((nowUtc - lastLocationsMapUtc).TotalSeconds >= 2.0)
+        {
+            lastLocationsMapUtc = nowUtc;
+            cachedLocationsMap = holdings.BuildOwnedLocationsMap();
+        }
+
         ImGui.SameLine();
         ImGui.TextColored(ColorMuted, $"{rows.Count} shown");
 
         ImGui.Spacing();
 
-        var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable;
-        if (!ImGui.BeginTable("ItemSearchTable", 6, tableFlags, new Vector2(0, -1)))
+        var tableFlags = ImGuiTableFlags.Borders
+            | ImGuiTableFlags.RowBg
+            | ImGuiTableFlags.ScrollY
+            | ImGuiTableFlags.Resizable
+            | ImGuiTableFlags.Sortable;
+        if (!ImGui.BeginTable("ItemSearchTable", 7, tableFlags, new Vector2(0, -1)))
         {
             return;
         }
 
         ImGui.TableSetupScrollFreeze(0, 1);
-        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch, 1.3f);
-        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 105f);
-        ImGui.TableSetupColumn("Market", ImGuiTableColumnFlags.WidthFixed, 105f);
-        ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch, 1.6f);
-        ImGui.TableSetupColumn("Lock", ImGuiTableColumnFlags.WidthFixed, 42f);
-        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 125f);
+        ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort, 1.25f, 0);
+        ImGui.TableSetupColumn("Where", ImGuiTableColumnFlags.WidthFixed, 115f, 1);
+        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 100f, 2);
+        ImGui.TableSetupColumn("Market", ImGuiTableColumnFlags.WidthFixed, 100f, 3);
+        ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch, 1.35f, 4);
+        ImGui.TableSetupColumn("Lock", ImGuiTableColumnFlags.WidthFixed, 42f, 5);
+        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 120f, 6);
         ImGui.TableHeadersRow();
 
-        var maxRows = Math.Min(rows.Count, 250);
-        for (var i = 0; i < maxRows; i++)
+        var sortSpecs = ImGui.TableGetSortSpecs();
+        if (sortSpecs.SpecsCount > 0)
+        {
+            var spec = sortSpecs.Specs;
+            sortColumnIndex = spec.ColumnIndex;
+            sortDescending = spec.SortDirection == ImGuiSortDirection.Descending;
+            if (sortSpecs.SpecsDirty)
+            {
+                sortSpecs.SpecsDirty = false;
+            }
+        }
+
+        SortItemRows(rows, world, retainers);
+
+        for (var i = 0; i < rows.Count; i++)
         {
             var entry = rows[i];
             ImGui.PushID((int)entry.ItemId);
@@ -367,14 +396,18 @@ public sealed class SettingsWindow : Window
             ImGui.TextUnformatted(entry.Name);
 
             ImGui.TableSetColumnIndex(1);
-            var routeDisplay = entry.Route == "Retainer" && !string.IsNullOrEmpty(entry.TargetRetainerName)
-                ? entry.TargetRetainerName
-                : (entry.Route == "GrandCompany"
-                    ? "GC Seals"
-                    : (entry.Route == "Glamour" ? "Glamour Dresser" : entry.Route));
-            ImGui.TextColored(GetRouteColor(entry.Route), routeDisplay);
+            var whereText = cachedLocationsMap.GetValueOrDefault(entry.ItemId, "Not owned");
+            ImGui.TextColored(whereText == "Not owned" ? ColorMuted : new Vector4(0.86f, 0.88f, 0.92f, 1f), whereText);
+            if (ImGui.IsItemHovered() && whereText.Length > 14)
+            {
+                ImGui.SetTooltip(whereText);
+            }
 
             ImGui.TableSetColumnIndex(2);
+            var routeDisplay = FormatDestinationLabel(entry);
+            ImGui.TextColored(GetRouteColor(entry.Route), routeDisplay);
+
+            ImGui.TableSetColumnIndex(3);
             if (!entry.Untradable && !string.IsNullOrEmpty(world) && universalis.TryGetAnyCachedPrice(world, entry.ItemId, out var snap))
             {
                 if (snap.ListingCount == 0)
@@ -396,27 +429,92 @@ public sealed class SettingsWindow : Window
                 universalis.QueueMissing(world, [entry.ItemId], forceRefresh: true);
             }
 
-            ImGui.TableSetColumnIndex(3);
+            ImGui.TableSetColumnIndex(4);
             ImGui.TextColored(ColorMuted, entry.Reason);
             if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(entry.Reason))
             {
                 ImGui.SetTooltip(entry.Reason);
             }
 
-            ImGui.TableSetColumnIndex(4);
+            ImGui.TableSetColumnIndex(5);
             var locked = magicSort.IsItemLocked(entry.ItemId);
             if (ImGui.Checkbox("##lock", ref locked))
             {
                 magicSort.ToggleItemLock(entry.ItemId, out _);
             }
 
-            ImGui.TableSetColumnIndex(5);
+            ImGui.TableSetColumnIndex(6);
             DrawOverrideCombo(entry.ItemId, retainers);
 
             ImGui.PopID();
         }
 
         ImGui.EndTable();
+    }
+
+    private static string FormatDestinationLabel(MagicSortEntry entry)
+    {
+        if (entry.Route == "Retainer" && !string.IsNullOrEmpty(entry.TargetRetainerName))
+        {
+            return entry.TargetRetainerName;
+        }
+
+        return entry.Route switch
+        {
+            "GrandCompany" => "GC Seals",
+            "Glamour" => "Glamour Dresser",
+            _ => entry.Route,
+        };
+    }
+
+    private void SortItemRows(List<MagicSortEntry> rows, string world, IReadOnlyList<KnownRetainerInfo> retainers)
+    {
+        rows.Sort((a, b) =>
+        {
+            var cmp = sortColumnIndex switch
+            {
+                1 => string.Compare(
+                    cachedLocationsMap.GetValueOrDefault(a.ItemId, string.Empty),
+                    cachedLocationsMap.GetValueOrDefault(b.ItemId, string.Empty),
+                    StringComparison.OrdinalIgnoreCase),
+                2 => string.Compare(FormatDestinationLabel(a), FormatDestinationLabel(b), StringComparison.OrdinalIgnoreCase),
+                3 => GetSortableMarketPrice(a, world).CompareTo(GetSortableMarketPrice(b, world)),
+                4 => string.Compare(a.Reason, b.Reason, StringComparison.OrdinalIgnoreCase),
+                5 => magicSort.IsItemLocked(a.ItemId).CompareTo(magicSort.IsItemLocked(b.ItemId)),
+                6 => string.Compare(
+                    FormatOverrideLabel(config.ManualRouteOverrides.GetValueOrDefault(a.ItemId, string.Empty), retainers),
+                    FormatOverrideLabel(config.ManualRouteOverrides.GetValueOrDefault(b.ItemId, string.Empty), retainers),
+                    StringComparison.OrdinalIgnoreCase),
+                _ => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase),
+            };
+
+            if (cmp == 0)
+            {
+                cmp = string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+            }
+
+            return sortDescending ? -cmp : cmp;
+        });
+    }
+
+    private int GetSortableMarketPrice(MagicSortEntry entry, string world)
+    {
+        if (entry.Untradable)
+        {
+            return -2;
+        }
+
+        if (string.IsNullOrEmpty(world) || !universalis.TryGetAnyCachedPrice(world, entry.ItemId, out var snap))
+        {
+            return -1;
+        }
+
+        if (snap.ListingCount == 0)
+        {
+            return 0;
+        }
+
+        return snap.MinPriceNq > 0 ? snap.MinPriceNq : (snap.MinPriceHq > 0 ? snap.MinPriceHq : snap.MinPriceAny);
     }
 
     private List<MagicSortEntry> BuildAllGameItemsResults(string rawQuery)

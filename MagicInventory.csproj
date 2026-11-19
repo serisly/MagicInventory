@@ -8,6 +8,9 @@
     <InternalName>MagicInventory</InternalName>
     <Punchline>Sort retainers, sell clutter, track recipes, and buy missing mats.</Punchline>
     <Description>Automatic inventory organizer for FFXIV. Sorts items between bags and retainers, sells junk to vendors or Grand Company, lists profitable surplus on the Market Board, uses unlockables and coffers, tracks recipes, and buys missing materials. Right-click any item to set a custom rule.</Description>
+    <RepoUrl>https://github.com/serisly/MagicInventory</RepoUrl>
+    <IconUrl>https://raw.githubusercontent.com/serisly/MagicInventory/main/images/icon.png</IconUrl>
+    <Tags>inventory;retainer;market;crafting;utility</Tags>
     <ApplicableVersion>any</ApplicableVersion>
     <DalamudApiLevel>15</DalamudApiLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -18,6 +21,7 @@
 
   <ItemGroup>
     <PackageReference Include="KamiToolKit" Version="2.2.66" />
+    <None Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
