@@ -49,6 +49,11 @@ public sealed unsafe class MagicSortControllers : IDisposable
                 var x = Math.Max(16f, rootW - 18f - btnW - 8f - btnW);
                 var y = Math.Max(16f, rootH - 50f);
                 return (new Vector2(x, y), new Vector2(btnW, btnH));
+            },
+            hovered =>
+            {
+                highlightController.SetHoveredSellAddon("RetainerList:Sort", hovered);
+                routeOverlay.SetHoveredInventorySortAddon("RetainerList", hovered);
             });
 
         retainerListSellController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -65,7 +70,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
                 var x = Math.Max(16f, rootW - 18f - btnW);
                 var y = Math.Max(16f, rootH - 50f);
                 return (new Vector2(x, y), new Vector2(btnW, btnH));
-            });
+            },
+            hovered => highlightController.SetHoveredSellAddon("RetainerList:Sell", hovered));
 
         retainerSellListController = new MagicSortAddonBinding<AtkUnitBase>(
             "RetainerSellList",

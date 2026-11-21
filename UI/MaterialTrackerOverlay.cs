@@ -73,6 +73,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
         private string lastJobMeta = string.Empty;
         private string lastActionLabel = string.Empty;
         private bool actionSwitchesJob;
+        private string lastOverflowText = string.Empty;
 
         public override OverlayLayer OverlayLayer => OverlayLayer.BehindUserInterface;
         public override bool HideWithNativeUi => true;
@@ -353,12 +354,19 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 overflowNode.IsVisible = true;
                 overflowNode.Position = new Vector2(0f, y);
                 overflowNode.Size = new Vector2(PanelWidth, 16f);
-                overflowNode.String = $"+{snapshot.Lines.Count - MaxDisplayedRows} more";
+                var overflowText = $"+{snapshot.Lines.Count - MaxDisplayedRows} more";
+                if (lastOverflowText != overflowText)
+                {
+                    lastOverflowText = overflowText;
+                    overflowNode.String = overflowText;
+                }
+
                 y += 18f;
             }
             else if (overflowNode.IsVisible)
             {
                 overflowNode.IsVisible = false;
+                lastOverflowText = string.Empty;
             }
 
             // Bottom action button: Switch Job (if wrong job & gearset exists) or Craft (when ready)
@@ -446,9 +454,12 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 var delta = currentMouse - lastMousePos;
                 lastMousePos = currentMouse;
 
+                var vpSize = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
+                var maxX = Math.Max(320f, vpSize.X - PanelWidth - 8f);
+                var maxY = Math.Max(200f, vpSize.Y - 60f);
                 Position = new Vector2(
-                    Math.Clamp(Position.X + delta.X, 4f, 3600f),
-                    Math.Clamp(Position.Y + delta.Y, 4f, 2000f));
+                    Math.Clamp(Position.X + delta.X, 4f, maxX),
+                    Math.Clamp(Position.Y + delta.Y, 4f, maxY));
 
                 if (atkEvent != null)
                 {
@@ -515,6 +526,12 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
                 overflowNode.DetachNode();
                 overflowNode.Dispose();
+
+                craftActionButton.DetachNode();
+                craftActionButton.Dispose();
+
+                jobMetaNode.DetachNode();
+                jobMetaNode.Dispose();
 
                 foreach (var row in rows)
                 {

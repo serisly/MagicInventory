@@ -22,7 +22,10 @@ namespace MagicInventory.Services
         bool IsVisible,
         bool IsEnabled,
         string Label,
-        string? Tooltip = null);
+        string? Tooltip = null)
+    {
+        public static readonly MagicSortButtonState Hidden = new(false, false, string.Empty, string.Empty);
+    }
 }
 
 namespace MagicInventory.Services.MagicSort

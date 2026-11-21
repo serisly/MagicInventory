@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Dalamud.Memory;
 using Dalamud.Plugin.Services;
@@ -15,6 +16,8 @@ namespace MagicInventory.Services.MagicSort;
 
 public sealed unsafe class GrandCompanyPlanner
 {
+    private const double PostDeliverListSettleMs = 150.0;
+
     private readonly IDataManager dataManager;
     private readonly IGameGui gameGui;
     private readonly SafeTransactionQueue transactionQueue;
@@ -61,7 +64,7 @@ public sealed unsafe class GrandCompanyPlanner
                     continue;
                 }
 
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
                     || !string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
                 {
@@ -119,7 +122,7 @@ public sealed unsafe class GrandCompanyPlanner
         var gearsetIds = safety.BuildGearsetItemIds();
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var unsafeDuplicateBaseIds = FindUnsafeDuplicateBaseIds(agent, manager, itemSheet, manifestEntries, gearsetIds, unlockedTop);
-        var orderedIndices = BuildCandidateExpertDeliveryIndices(agent, supplyAddon, gearsetIds);
+        var orderedIndices = BuildCandidateExpertDeliveryIndices(agent, supplyAddon, manager, gearsetIds);
 
         foreach (var idx in orderedIndices)
         {
@@ -129,7 +132,7 @@ public sealed unsafe class GrandCompanyPlanner
             }
 
             var gcItem = agent->ItemArray + idx;
-            var baseId = HoldingsService.NormalizeBaseItemId(gcItem->ItemId);
+            var baseId = ItemIdentity.NormalizeBaseItemId(gcItem->ItemId);
             if (unsafeDuplicateBaseIds.Contains(baseId)
                 || !manifestEntries.TryGetValue(baseId, out var entry)
                 || !string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
@@ -139,7 +142,7 @@ public sealed unsafe class GrandCompanyPlanner
 
             var slot = InventorySafetyEvaluator.GetSlot(manager, gcItem->Inventory, gcItem->Slot);
             var itemRow = itemSheet.GetRowOrDefault(baseId);
-            if (slot == null || itemRow is null || HoldingsService.NormalizeBaseItemId(slot->ItemId) != baseId)
+            if (slot == null || slot->Quantity <= 0 || itemRow is null || ItemIdentity.NormalizeBaseItemId(slot->ItemId) != baseId)
             {
                 continue;
             }
@@ -154,10 +157,11 @@ public sealed unsafe class GrandCompanyPlanner
                 continue;
             }
 
+            // Continue scanning smaller-reward items instead of breaking on the first item that overflows cap
             if (projectedSeals + gcItem->SealReward > maxSeals)
             {
                 blockedBySealCap = true;
-                break;
+                continue;
             }
 
             projectedSeals += gcItem->SealReward;
@@ -182,7 +186,7 @@ public sealed unsafe class GrandCompanyPlanner
         foreach (var plan in plans)
         {
             var captured = plan;
-            uint preSeals = 0;
+            var slotClearedAtUtc = DateTime.MinValue;
 
             steps.Add(new TransactionStep(
                 $"Select {captured.Name}",
@@ -196,6 +200,13 @@ public sealed unsafe class GrandCompanyPlanner
                         return false;
                     }
 
+                    // Ensure no leftover reward modal or confirmation dialog is open before selecting
+                    if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyReward")
+                        || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectYesno"))
+                    {
+                        return false;
+                    }
+
                     var currentSeals = manager->GetCompanySeals(grandCompany);
                     var maxSeals = manager->GetMaxCompanySeals(grandCompany);
                     if (currentSeals + (uint)Math.Max(0, captured.SealReward) > maxSeals)
@@ -204,12 +215,21 @@ public sealed unsafe class GrandCompanyPlanner
                         return false;
                     }
 
+                    // Verify item still lives in the exact slot before looking up its current UI row
+                    var liveSlot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
+                    if (liveSlot == null || liveSlot->Quantity <= 0 || liveSlot->ItemId != captured.RawItemId)
+                    {
+                        return false;
+                    }
+
                     var visibleRow = ResolveExpertDeliveryRowIndex(
                         listAddon,
+                        manager,
                         captured.Container,
                         captured.Slot,
                         captured.RawItemId,
-                        captured.Name);
+                        captured.Name,
+                        captured.SealReward);
                     if (visibleRow < 0)
                     {
                         return false;
@@ -219,17 +239,19 @@ public sealed unsafe class GrandCompanyPlanner
                     args[0] = NativeUiHelpers.IntValue(1);
                     args[1] = NativeUiHelpers.IntValue(visibleRow);
                     args[2] = NativeUiHelpers.IntValue(0);
-                    return NativeUiHelpers.FireCallback((AtkUnitBase*)listAddon, false, new ReadOnlySpan<AtkValue>(args, 3));
+                    return NativeUiHelpers.FireCallback((AtkUnitBase*)listAddon, true, new ReadOnlySpan<AtkValue>(args, 3));
                 },
                 HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyReward"),
                 PacingProfile.StandardSlot,
-                SecondaryRequiredAddon: "GrandCompanySupplyReward"));
+                SecondaryRequiredAddon: "GrandCompanySupplyReward",
+                SkipOnFailureCount: 1));
 
             steps.Add(new TransactionStep(
                 $"Deliver {captured.Name}",
                 "GrandCompanySupplyReward",
                 Dispatch: () =>
                 {
+                    slotClearedAtUtc = DateTime.MinValue;
                     var manager = InventoryManager.Instance();
                     var rewardAddon = (AddonGrandCompanySupplyReward*)NativeUiHelpers.GetReadyAddon(gameGui, "GrandCompanySupplyReward");
                     if (manager == null || rewardAddon == null)
@@ -241,14 +263,16 @@ public sealed unsafe class GrandCompanyPlanner
                     var maxSeals = manager->GetMaxCompanySeals(grandCompany);
                     if (currentSeals + (uint)Math.Max(0, captured.SealReward) > maxSeals)
                     {
+                        CloseRewardModal(rewardAddon);
                         transactionQueue.Cancel("Stopped before Grand Company seal cap.");
                         return false;
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
                     var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(captured.BaseItemId);
-                    if (slot == null || itemRow is null || slot->ItemId != captured.RawItemId)
+                    if (slot == null || slot->Quantity <= 0 || itemRow is null || slot->ItemId != captured.RawItemId)
                     {
+                        CloseRewardModal(rewardAddon);
                         return false;
                     }
 
@@ -256,17 +280,20 @@ public sealed unsafe class GrandCompanyPlanner
                     var unlockedTop = safety.BuildUnlockedJobTopIlvl();
                     if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", getManifest(), gearsetIds, unlockedTop))
                     {
+                        CloseRewardModal(rewardAddon);
                         transactionQueue.Cancel("Item no longer satisfies safety checks.");
                         return false;
                     }
 
-                    if (!DoesRewardAddonMatchItem(rewardAddon, captured.Name))
+                    if (!DoesRewardAddonMatchItem(rewardAddon, captured.Name, out var actualDisplayed))
                     {
-                        transactionQueue.Cancel($"Selection changed in Grand Company turn-in window (expected '{captured.Name}').");
+                        CloseRewardModal(rewardAddon);
+                        transactionQueue.Cancel(
+                            $"Selection mismatch in Grand Company turn-in (expected '{captured.Name}', saw '{actualDisplayed}').",
+                            QueueBatchOutcome.AbortedOnError);
                         return false;
                     }
 
-                    preSeals = currentSeals;
                     var deliverButton = rewardAddon->DeliverButton != null
                         ? rewardAddon->DeliverButton
                         : rewardAddon->AtkUnitBase.GetComponentButtonById(38);
@@ -274,6 +301,24 @@ public sealed unsafe class GrandCompanyPlanner
                 },
                 HasServerAck: () =>
                 {
+                    // Fail closed if an unexpected confirmation dialog opens (e.g. seal cap overflow / HQ / materia warning)
+                    var yesNo = (AddonSelectYesno*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectYesno");
+                    if (yesNo != null)
+                    {
+                        if (yesNo->NoButton != null)
+                        {
+                            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
+                        }
+
+                        var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
+                        transactionQueue.Cancel(
+                            string.IsNullOrWhiteSpace(prompt)
+                                ? "Stopped: Unexpected Grand Company confirmation prompt."
+                                : $"Stopped: Grand Company warning ({prompt}).",
+                            QueueBatchOutcome.AbortedOnError);
+                        return false;
+                    }
+
                     if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyReward"))
                     {
                         return false;
@@ -286,13 +331,48 @@ public sealed unsafe class GrandCompanyPlanner
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
-                    return slot == null || slot->ItemId != captured.RawItemId || slot->Quantity <= 0;
+                    var slotGone = slot == null || slot->ItemId != captured.RawItemId || slot->Quantity <= 0;
+                    if (!slotGone)
+                    {
+                        return false;
+                    }
+
+                    // Wait for GrandCompanySupplyList to return and settle its ExpertDeliveryList rows before advancing
+                    if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyList"))
+                    {
+                        return false;
+                    }
+
+                    var now = DateTime.UtcNow;
+                    if (slotClearedAtUtc == DateTime.MinValue)
+                    {
+                        slotClearedAtUtc = now;
+                        return false;
+                    }
+
+                    return (now - slotClearedAtUtc).TotalMilliseconds >= PostDeliverListSettleMs;
                 },
                 PacingProfile.VendorOrTurnIn,
                 SecondaryRequiredAddon: "GrandCompanySupplyList"));
         }
 
         return steps;
+    }
+
+    private static void CloseRewardModal(AddonGrandCompanySupplyReward* rewardAddon)
+    {
+        if (rewardAddon == null)
+        {
+            return;
+        }
+
+        var cancelBtn = rewardAddon->CancelButton != null
+            ? rewardAddon->CancelButton
+            : rewardAddon->AtkUnitBase.GetComponentButtonById(39);
+        if (cancelBtn != null)
+        {
+            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)rewardAddon, cancelBtn);
+        }
     }
 
     private HashSet<uint> FindUnsafeDuplicateBaseIds(
@@ -312,7 +392,7 @@ public sealed unsafe class GrandCompanyPlanner
         for (var idx = 11; idx < agent->NumItems; idx++)
         {
             var gcItem = agent->ItemArray + idx;
-            if (gcItem->TurnInAvailable == 0 || gcItem->ItemId == 0 || gcItem->SealReward <= 0)
+            if (gcItem->ItemId == 0 || gcItem->SealReward <= 0)
             {
                 continue;
             }
@@ -322,18 +402,15 @@ public sealed unsafe class GrandCompanyPlanner
                 continue;
             }
 
-            var baseId = HoldingsService.NormalizeBaseItemId(gcItem->ItemId);
-            if (!manifestEntries.TryGetValue(baseId, out var entry)
-                || !string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+            var baseId = ItemIdentity.NormalizeBaseItemId(gcItem->ItemId);
+            var slot = InventorySafetyEvaluator.GetSlot(manager, gcItem->Inventory, gcItem->Slot);
+            var itemRow = itemSheet.GetRowOrDefault(baseId);
+            if (slot == null || slot->Quantity <= 0 || itemRow is null || ItemIdentity.NormalizeBaseItemId(slot->ItemId) != baseId)
             {
                 continue;
             }
 
-            var slot = InventorySafetyEvaluator.GetSlot(manager, gcItem->Inventory, gcItem->Slot);
-            var itemRow = itemSheet.GetRowOrDefault(baseId);
-            if (slot == null
-                || itemRow is null
-                || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", manifestEntries, gearsetIds, unlockedTop))
+            if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", manifestEntries, gearsetIds, unlockedTop))
             {
                 unsafeIds.Add(baseId);
             }
@@ -344,10 +421,12 @@ public sealed unsafe class GrandCompanyPlanner
 
     private int ResolveExpertDeliveryRowIndex(
         AddonGrandCompanySupplyList* supplyAddon,
+        InventoryManager* manager,
         InventoryType targetContainer,
         int targetSlot,
         uint targetRawItemId,
-        string expectedName)
+        string expectedName,
+        int expectedSealReward)
     {
         var agent = AgentGrandCompanySupply.Instance();
         if (agent == null || agent->ItemArray == null || supplyAddon == null || supplyAddon->ExpertDeliveryList == null)
@@ -357,10 +436,13 @@ public sealed unsafe class GrandCompanyPlanner
 
         var list = supplyAddon->ExpertDeliveryList;
         var cleanExpected = NativeUiHelpers.NormalizeItemLabel(expectedName);
+        var sealText = expectedSealReward.ToString(CultureInfo.InvariantCulture);
+        var sealTextFormatted = expectedSealReward.ToString("N0", CultureInfo.InvariantCulture);
 
-        // 1. Primary: Read rendered AtkComponentListItemRenderer rows directly via typed ListItemIndex & text nodes
+        // 1. Primary: Read currently visible AtkComponentListItemRenderer rows (elision-safe + seal-verified)
         if (list->ItemRendererList != null && list->AllocatedItemRendererListLength > 0 && !string.IsNullOrEmpty(cleanExpected))
         {
+            var nameOnlyMatch = -1;
             for (var r = 0; r < list->AllocatedItemRendererListLength; r++)
             {
                 var renderer = list->ItemRendererList[r].AtkComponentListItemRenderer;
@@ -373,29 +455,45 @@ public sealed unsafe class GrandCompanyPlanner
                     continue;
                 }
 
-                if (DoesRendererContainText(renderer, cleanExpected))
+                if (!DoesRendererMatchItemName(renderer, cleanExpected))
+                {
+                    continue;
+                }
+
+                if (DoesRendererContainExactText(renderer, sealText) || DoesRendererContainExactText(renderer, sealTextFormatted))
                 {
                     return renderer->ListItemIndex;
                 }
+
+                if (nameOnlyMatch < 0)
+                {
+                    nameOnlyMatch = renderer->ListItemIndex;
+                }
+            }
+
+            if (nameOnlyMatch >= 0)
+            {
+                return nameOnlyMatch;
             }
         }
 
-        // 2. Fallback: Only when SelectedSortBy is one of the two known iLvl sorts (0 = Desc, 1 = Asc)
+        // 2. Fallback: Only when SelectedSortBy is one of the two known iLvl sorts (0 = Desc, 1 = Asc),
+        //    and strictly filtered against live InventoryManager slots so delivered items never shift rows.
         if (supplyAddon->SelectedSortBy is not (0 or 1))
         {
             return -1;
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var orderedIndices = BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, gearsetIds);
-        var targetBaseId = HoldingsService.NormalizeBaseItemId(targetRawItemId);
+        var orderedIndices = BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, manager, gearsetIds);
+        var targetBaseId = ItemIdentity.NormalizeBaseItemId(targetRawItemId);
 
         for (var visibleRow = 0; visibleRow < orderedIndices.Count && visibleRow < list->ListLength; visibleRow++)
         {
             var gcItem = agent->ItemArray + orderedIndices[visibleRow];
             if (gcItem->Inventory == targetContainer
                 && gcItem->Slot == targetSlot
-                && HoldingsService.NormalizeBaseItemId(gcItem->ItemId) == targetBaseId)
+                && ItemIdentity.NormalizeBaseItemId(gcItem->ItemId) == targetBaseId)
             {
                 return visibleRow;
             }
@@ -407,13 +505,14 @@ public sealed unsafe class GrandCompanyPlanner
     private static List<int> BuildCandidateExpertDeliveryIndices(
         AgentGrandCompanySupply* agent,
         AddonGrandCompanySupplyList* supplyAddon,
+        InventoryManager* manager,
         HashSet<uint> gearsetIds)
     {
         var filter = supplyAddon->SelectedFilter;
         var visibleLabels = CollectVisibleRendererLabels(supplyAddon->ExpertDeliveryList);
         var baseIndices = supplyAddon->SelectedSortBy is 0 or 1
-            ? BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, gearsetIds)
-            : CollectFilteredExpertDeliveryAgentIndices(agent, filter, gearsetIds);
+            ? BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, manager, gearsetIds)
+            : CollectFilteredExpertDeliveryAgentIndices(agent, manager, filter, gearsetIds);
 
         if (visibleLabels.Count == 0)
         {
@@ -427,7 +526,7 @@ public sealed unsafe class GrandCompanyPlanner
         {
             var gcItem = agent->ItemArray + idx;
             var name = NativeUiHelpers.NormalizeItemLabel(gcItem->ItemName.ToString());
-            if (!string.IsNullOrEmpty(name) && visibleLabels.Contains(name))
+            if (!string.IsNullOrEmpty(name) && MatchesAnyVisibleLabel(name, visibleLabels))
             {
                 prioritized.Add(idx);
             }
@@ -441,6 +540,24 @@ public sealed unsafe class GrandCompanyPlanner
         return prioritized;
     }
 
+    private static bool MatchesAnyVisibleLabel(string fullItemName, HashSet<string> visibleLabels)
+    {
+        if (visibleLabels.Contains(fullItemName))
+        {
+            return true;
+        }
+
+        foreach (var label in visibleLabels)
+        {
+            if (IsElidedNameMatch(label, fullItemName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static HashSet<string> CollectVisibleRendererLabels(AtkComponentList* list)
     {
         var labels = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -452,7 +569,11 @@ public sealed unsafe class GrandCompanyPlanner
         for (var r = 0; r < list->AllocatedItemRendererListLength; r++)
         {
             var renderer = list->ItemRendererList[r].AtkComponentListItemRenderer;
-            if (renderer == null || renderer->ListItemIndex < 0 || renderer->ListItemIndex >= list->ListLength)
+            if (renderer == null
+                || renderer->ListItemIndex < 0
+                || renderer->ListItemIndex >= list->ListLength
+                || renderer->AtkComponentButton.AtkComponentBase.OwnerNode == null
+                || !renderer->AtkComponentButton.AtkComponentBase.OwnerNode->IsVisible())
             {
                 continue;
             }
@@ -476,7 +597,7 @@ public sealed unsafe class GrandCompanyPlanner
             for (var i = 0; i < uld.NodeListCount; i++)
             {
                 var node = uld.NodeList[i];
-                if (node == null || node->Type != NodeType.Text)
+                if (node == null || node->Type != NodeType.Text || !node->IsVisible())
                 {
                     continue;
                 }
@@ -495,6 +616,7 @@ public sealed unsafe class GrandCompanyPlanner
 
     private static List<int> CollectFilteredExpertDeliveryAgentIndices(
         AgentGrandCompanySupply* agent,
+        InventoryManager* manager,
         int filter,
         HashSet<uint> gearsetIds)
     {
@@ -502,7 +624,7 @@ public sealed unsafe class GrandCompanyPlanner
         for (var idx = 11; idx < agent->NumItems; idx++)
         {
             var gcItem = agent->ItemArray + idx;
-            if (IsVisibleExpertDeliveryItem(gcItem, filter, gearsetIds))
+            if (IsVisibleExpertDeliveryItem(gcItem, manager, filter, gearsetIds))
             {
                 indices.Add(idx);
             }
@@ -514,10 +636,11 @@ public sealed unsafe class GrandCompanyPlanner
     private static List<int> BuildOrderedExpertDeliveryAgentIndices(
         AgentGrandCompanySupply* agent,
         AddonGrandCompanySupplyList* supplyAddon,
+        InventoryManager* manager,
         HashSet<uint> gearsetIds)
     {
         var sortBy = supplyAddon->SelectedSortBy;
-        var indices = CollectFilteredExpertDeliveryAgentIndices(agent, supplyAddon->SelectedFilter, gearsetIds);
+        var indices = CollectFilteredExpertDeliveryAgentIndices(agent, manager, supplyAddon->SelectedFilter, gearsetIds);
 
         indices.Sort((a, b) =>
         {
@@ -537,13 +660,14 @@ public sealed unsafe class GrandCompanyPlanner
         return indices;
     }
 
-    private static bool DoesRendererContainText(AtkComponentListItemRenderer* renderer, string cleanExpected)
+    private static bool DoesRendererMatchItemName(AtkComponentListItemRenderer* renderer, string cleanExpected)
     {
         if (renderer->AtkComponentButton.ButtonTextNode != null)
         {
             var btnText = NativeUiHelpers.NormalizeItemLabel(
                 NativeUiHelpers.ReadTextNodeValue(renderer->AtkComponentButton.ButtonTextNode));
-            if (string.Equals(btnText, cleanExpected, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(btnText, cleanExpected, StringComparison.OrdinalIgnoreCase)
+                || IsElidedNameMatch(btnText, cleanExpected))
             {
                 return true;
             }
@@ -558,14 +682,15 @@ public sealed unsafe class GrandCompanyPlanner
         for (var i = 0; i < uld.NodeListCount; i++)
         {
             var node = uld.NodeList[i];
-            if (node == null || node->Type != NodeType.Text)
+            if (node == null || node->Type != NodeType.Text || !node->IsVisible())
             {
                 continue;
             }
 
             var nodeStr = NativeUiHelpers.NormalizeItemLabel(
                 NativeUiHelpers.ReadTextNodeValue(node->GetAsAtkTextNode()));
-            if (string.Equals(nodeStr, cleanExpected, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(nodeStr, cleanExpected, StringComparison.OrdinalIgnoreCase)
+                || IsElidedNameMatch(nodeStr, cleanExpected))
             {
                 return true;
             }
@@ -574,8 +699,62 @@ public sealed unsafe class GrandCompanyPlanner
         return false;
     }
 
+    private static bool DoesRendererContainExactText(AtkComponentListItemRenderer* renderer, string exact)
+    {
+        var uld = renderer->AtkComponentButton.AtkComponentBase.UldManager;
+        if (uld.NodeList == null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < uld.NodeListCount; i++)
+        {
+            var node = uld.NodeList[i];
+            if (node == null || node->Type != NodeType.Text || !node->IsVisible())
+            {
+                continue;
+            }
+
+            var text = NativeUiHelpers.ReadTextNodeValue(node->GetAsAtkTextNode());
+            if (string.Equals(text, exact, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Handles FFXIV UI text elision where long item names are truncated with "..." or "…".
+    /// </summary>
+    private static bool IsElidedNameMatch(string displayedText, string fullItemName)
+    {
+        if (displayedText.Length < 10 || fullItemName.Length <= displayedText.Length)
+        {
+            return false;
+        }
+
+        ReadOnlySpan<char> prefix;
+        if (displayedText.EndsWith("...", StringComparison.Ordinal))
+        {
+            prefix = displayedText.AsSpan(0, displayedText.Length - 3).TrimEnd();
+        }
+        else if (displayedText.EndsWith('\u2026'))
+        {
+            prefix = displayedText.AsSpan(0, displayedText.Length - 1).TrimEnd();
+        }
+        else
+        {
+            return false;
+        }
+
+        return prefix.Length >= 8 && fullItemName.AsSpan().StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool IsVisibleExpertDeliveryItem(
         GrandCompanyItem* item,
+        InventoryManager* manager,
         int selectedFilter,
         HashSet<uint> gearsetIds)
     {
@@ -589,7 +768,19 @@ public sealed unsafe class GrandCompanyPlanner
             return false;
         }
 
-        if (selectedFilter == 1 && gearsetIds.Contains(HoldingsService.NormalizeBaseItemId(item->ItemId)))
+        // Verify the item STILL exists in the live InventoryManager slot so delivered records
+        // lingering in AgentGrandCompanySupply->ItemArray never shift fallback row indices.
+        if (manager != null)
+        {
+            var liveSlot = InventorySafetyEvaluator.GetSlot(manager, item->Inventory, item->Slot);
+            var baseId = ItemIdentity.NormalizeBaseItemId(item->ItemId);
+            if (liveSlot == null || liveSlot->Quantity <= 0 || ItemIdentity.NormalizeBaseItemId(liveSlot->ItemId) != baseId)
+            {
+                return false;
+            }
+        }
+
+        if (selectedFilter == 1 && gearsetIds.Contains(ItemIdentity.NormalizeBaseItemId(item->ItemId)))
         {
             return false;
         }
@@ -602,8 +793,12 @@ public sealed unsafe class GrandCompanyPlanner
         return true;
     }
 
-    private static bool DoesRewardAddonMatchItem(AddonGrandCompanySupplyReward* rewardAddon, string expectedName)
+    private static bool DoesRewardAddonMatchItem(
+        AddonGrandCompanySupplyReward* rewardAddon,
+        string expectedName,
+        out string displayedName)
     {
+        displayedName = string.Empty;
         if (rewardAddon == null || rewardAddon->AtkUnitBase.AtkValuesCount <= 4 || string.IsNullOrWhiteSpace(expectedName))
         {
             return false;
@@ -615,8 +810,16 @@ public sealed unsafe class GrandCompanyPlanner
             return false;
         }
 
-        var displayedName = NativeUiHelpers.NormalizeItemLabel(
-            MemoryHelper.ReadSeStringNullTerminated((nint)val.String.Value).TextValue);
-        return string.Equals(displayedName, NativeUiHelpers.NormalizeItemLabel(expectedName), StringComparison.OrdinalIgnoreCase);
+        var rawDisplayed = MemoryHelper.ReadSeStringNullTerminated((nint)val.String.Value).TextValue.Trim();
+        // Reject HQ items explicitly (GC Expert Delivery safety guard)
+        if (rawDisplayed.Contains('\uE03C'))
+        {
+            displayedName = rawDisplayed;
+            return false;
+        }
+
+        displayedName = NativeUiHelpers.NormalizeItemLabel(rawDisplayed);
+        var cleanExpected = NativeUiHelpers.NormalizeItemLabel(expectedName);
+        return string.Equals(displayedName, cleanExpected, StringComparison.OrdinalIgnoreCase);
     }
 }

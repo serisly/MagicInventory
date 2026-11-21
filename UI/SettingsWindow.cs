@@ -77,6 +77,8 @@ public sealed class SettingsWindow : Window
     private int selectedFilterIndex;
     private string lastGameSearchQuery = string.Empty;
     private List<uint> cachedGameSearchIds = new();
+    private List<MagicSortEntry> cachedGameSearchResults = new();
+    private DateTime lastGameSearchClassifiedUtc = DateTime.MinValue;
     private DateTime lastLocationsMapUtc = DateTime.MinValue;
     private Dictionary<uint, string> cachedLocationsMap = new();
     private int sortColumnIndex;
@@ -522,7 +524,8 @@ public sealed class SettingsWindow : Window
             return results;
         }
 
-        if (!string.Equals(q, lastGameSearchQuery, StringComparison.OrdinalIgnoreCase))
+        var queryChanged = !string.Equals(q, lastGameSearchQuery, StringComparison.OrdinalIgnoreCase);
+        if (queryChanged)
         {
             lastGameSearchQuery = q;
             cachedGameSearchIds = new List<uint>(64);
@@ -532,7 +535,7 @@ public sealed class SettingsWindow : Window
                 var parsedId = uint.TryParse(q, out var exactId) ? exactId : 0u;
                 foreach (var row in sheet)
                 {
-                    if (row.RowId <= 20)
+                    if (!ItemIdentity.CanLockOrTagItem(row.RowId, row))
                     {
                         continue;
                     }
@@ -557,15 +560,23 @@ public sealed class SettingsWindow : Window
             }
         }
 
-        foreach (var id in cachedGameSearchIds)
+        // Cache classified entries for 1.5s instead of running up to 80 full-character scans every frame!
+        var now = DateTime.UtcNow;
+        if (queryChanged || (now - lastGameSearchClassifiedUtc).TotalMilliseconds >= 1500.0)
         {
-            var classified = triageEngine.ClassifySingleItemOnDemand(id, queuePriceIfMissing: false);
-            if (classified != null)
+            lastGameSearchClassifiedUtc = now;
+            cachedGameSearchResults = new List<MagicSortEntry>(cachedGameSearchIds.Count);
+            foreach (var id in cachedGameSearchIds)
             {
-                results.Add(classified);
+                var classified = triageEngine.ClassifySingleItemOnDemand(id, queuePriceIfMissing: false);
+                if (classified != null)
+                {
+                    cachedGameSearchResults.Add(classified);
+                }
             }
         }
 
+        results.AddRange(cachedGameSearchResults);
         return results;
     }
 
@@ -597,43 +608,43 @@ public sealed class SettingsWindow : Window
         }
 
         var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(itemId);
+        var eligibility = ItemRouteEligibility.Compute(itemRow, triageEngine.IsCabinetItem(itemId));
         DrawOverrideOption(itemId, string.Empty, null, "Auto", currentVal, currentPrio);
         DrawOverrideOption(itemId, "Keep", null, "Keep", currentVal, currentPrio);
 
-        if (itemRow is { ItemAction.RowId: > 0 })
+        if (eligibility.CanUse)
         {
             DrawOverrideOption(itemId, "Use", null, "Use", currentVal, currentPrio);
         }
 
-        if (itemRow is null || !itemRow.Value.IsUntradable)
+        if (eligibility.CanMarket)
         {
             DrawOverrideOption(itemId, "Market", 1, "Market (High)", currentVal, currentPrio);
             DrawOverrideOption(itemId, "Market", 0, "Market", currentVal, currentPrio);
             DrawOverrideOption(itemId, "Market", -1, "Market (Low)", currentVal, currentPrio);
         }
 
-        if (itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique))
+        if (eligibility.CanVendor)
         {
             DrawOverrideOption(itemId, "Vendor", null, "Vendor", currentVal, currentPrio);
         }
 
-        if (itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15)
+        if (eligibility.CanGrandCompany)
         {
             DrawOverrideOption(itemId, "GrandCompany", null, "GC Seals", currentVal, currentPrio);
         }
 
-        if (itemRow is not null
-            && string.Equals(itemRow.Value.ItemUICategory.ValueNullable?.Name.ExtractText(), "Triple Triad Card", StringComparison.OrdinalIgnoreCase))
+        if (eligibility.CanGoldSaucer)
         {
             DrawOverrideOption(itemId, "GoldSaucer", null, "Gold Saucer", currentVal, currentPrio);
         }
 
-        if (itemRow is { EquipSlotCategory.RowId: > 0 })
+        if (eligibility.CanGlamour)
         {
             DrawOverrideOption(itemId, "Glamour", null, "Glamour Dresser", currentVal, currentPrio);
         }
 
-        if (triageEngine.IsCabinetItem(itemId))
+        if (eligibility.CanArmoire)
         {
             DrawOverrideOption(itemId, "Armoire", null, "Armoire", currentVal, currentPrio);
         }
@@ -653,55 +664,20 @@ public sealed class SettingsWindow : Window
         if (ImGui.Selectable(label, selected))
         {
             magicSort.SetItemOverride(itemId, value, marketPriority);
+            lastGameSearchClassifiedUtc = DateTime.MinValue;
         }
     }
 
     private string FormatOverrideLabel(uint itemId, string value, IReadOnlyList<KnownRetainerInfo> retainers)
     {
-        if (string.IsNullOrEmpty(value))
-        {
-            return "Auto";
-        }
-
-        if (value.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
-            && ulong.TryParse(value["Retainer:".Length..], out var rid))
-        {
-            var match = retainers.FirstOrDefault(r => r.RetainerId == rid);
-            return match != null ? match.Name : "Retainer";
-        }
-
-        if (string.Equals(value, "Market", StringComparison.OrdinalIgnoreCase))
-        {
-            var prio = config.MarketListingPriorities.GetValueOrDefault(itemId, 0);
-            return prio > 0 ? "Market (High)" : (prio < 0 ? "Market (Low)" : "Market");
-        }
-
-        return value switch
-        {
-            "GrandCompany" => "GC Seals",
-            "GoldSaucer" => "Gold Saucer",
-            "Materia" => "Extract Materia",
-            "Glamour" => "Glamour Dresser",
-            _ => value,
-        };
+        return RoutePresentation.FormatOverrideSpec(
+            value,
+            rid => retainers.FirstOrDefault(r => r.RetainerId == rid)?.Name,
+            config.MarketListingPriorities.GetValueOrDefault(itemId, 0));
     }
 
     private static Vector4 GetRouteColor(string route)
-    {
-        return route switch
-        {
-            "Market" => ColorGold,
-            "Retainer" => new Vector4(0.58f, 0.80f, 0.96f, 1f),
-            "Vendor" => ColorWarn,
-            "GrandCompany" => ColorGood,
-            "GoldSaucer" => new Vector4(0.98f, 0.74f, 0.30f, 1f),
-            "Materia" => new Vector4(0.96f, 0.62f, 0.96f, 1f),
-            "Use" => new Vector4(0.55f, 0.92f, 0.88f, 1f),
-            "Armoire" => new Vector4(0.78f, 0.72f, 0.95f, 1f),
-            "Glamour" => new Vector4(0.92f, 0.68f, 0.90f, 1f),
-            _ => ColorMuted,
-        };
-    }
+        => RoutePresentation.GetRouteColor(route);
 
     private void DrawRetainersTab()
     {
@@ -976,6 +952,8 @@ public sealed class SettingsWindow : Window
             config.BuyOutlierMultiplier = 2.5f;
             config.EnableLifestreamWorldHopPrompt = false;
             config.EnableHoverHighlights = true;
+            config.MarketOneListingPerClick = true;
+            config.MarketDailyActionLimit = 20;
             changed = true;
         }
 

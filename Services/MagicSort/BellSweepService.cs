@@ -41,6 +41,8 @@ public sealed unsafe class BellSweepService : IDisposable
     private readonly string quitMenuText;
 
     private readonly Queue<BellRetainerTarget> pendingRetainers = new();
+    private readonly ButtonStateCache<int> bellSortButtonCache = new(250.0);
+    private readonly ButtonStateCache<int> bellSellButtonCache = new(250.0);
     private BellRetainerTarget? activeTarget;
     private SweepState state = SweepState.Idle;
     private DateTime nextActionUtc = DateTime.MinValue;
@@ -53,7 +55,7 @@ public sealed unsafe class BellSweepService : IDisposable
     private bool marketSellOnlyMode;
     private bool triggeredBatch;
 
-    private sealed record BellRetainerTarget(int SortedIndex, ulong RetainerId, string Name, bool HasFreeMarketSlots);
+    private sealed record BellRetainerTarget(int SortedIndex, ulong RetainerId, string Name, bool HasFreeMarketSlots, int EstimatedItemCount);
 
     private enum SweepState
     {
@@ -126,6 +128,12 @@ public sealed unsafe class BellSweepService : IDisposable
 
     public bool IsRunning => state != SweepState.Idle;
 
+    public void InvalidateButtonCaches()
+    {
+        bellSortButtonCache.Invalidate();
+        bellSellButtonCache.Invalidate();
+    }
+
     public MagicSortButtonState GetBellSortButtonState()
     {
         if (IsRunning)
@@ -136,7 +144,7 @@ public sealed unsafe class BellSweepService : IDisposable
                 return new MagicSortButtonState(true, true, label, "Stop the active Magic Sort pass.");
             }
 
-            return new MagicSortButtonState(false, false, "Magic Sort");
+            return MagicSortButtonState.Hidden;
         }
 
         if (transactionQueue.IsBusy)
@@ -144,19 +152,31 @@ public sealed unsafe class BellSweepService : IDisposable
             return new MagicSortButtonState(true, false, "Wait...", "Wait for the active operation to finish.");
         }
 
+        if (bellSortButtonCache.TryGet(0, out var cached))
+        {
+            return cached;
+        }
+
         var targets = BuildBellTargets(marketSellOnly: false);
         if (targets.Count == 0)
         {
-            return new MagicSortButtonState(false, false, "Magic Sort");
+            return bellSortButtonCache.Set(0, MagicSortButtonState.Hidden);
+        }
+
+        var totalItems = 0;
+        foreach (var t in targets)
+        {
+            totalItems += t.EstimatedItemCount;
         }
 
         var names = targets.ConvertAll(t => t.Name);
         var tooltip = magicSort.BuildBellSortTooltip(names);
-        return new MagicSortButtonState(
+        var displayCount = totalItems > 0 ? totalItems : targets.Count;
+        return bellSortButtonCache.Set(0, new MagicSortButtonState(
             true,
             true,
-            $"Magic Sort ({targets.Count})",
-            tooltip);
+            $"Magic Sort ({displayCount})",
+            tooltip));
     }
 
     public MagicSortButtonState GetBellSellButtonState()
@@ -169,29 +189,34 @@ public sealed unsafe class BellSweepService : IDisposable
                 return new MagicSortButtonState(true, true, label, "Stop the active Magic Sell pass.");
             }
 
-            return new MagicSortButtonState(false, false, "Magic Sell");
+            return MagicSortButtonState.Hidden;
         }
 
         if (transactionQueue.IsBusy)
         {
-            return new MagicSortButtonState(false, false, "Magic Sell");
+            return MagicSortButtonState.Hidden;
+        }
+
+        if (bellSellButtonCache.TryGet(0, out var cached))
+        {
+            return cached;
         }
 
         var targets = BuildBellTargets(marketSellOnly: true);
         if (targets.Count == 0)
         {
-            return new MagicSortButtonState(false, false, "Magic Sell");
+            return bellSellButtonCache.Set(0, MagicSortButtonState.Hidden);
         }
 
         var names = targets.ConvertAll(t => t.Name);
         var tooltip = magicSort.BuildBellSellTooltip(names);
         var pendingMarketCount = magicSort.CountPendingBagMarketItems();
         var countSuffix = pendingMarketCount > 0 ? $" ({pendingMarketCount})" : $" ({targets.Count})";
-        return new MagicSortButtonState(
+        return bellSellButtonCache.Set(0, new MagicSortButtonState(
             true,
             true,
             $"Magic Sell{countSuffix}",
-            tooltip);
+            tooltip));
     }
 
     public void ToggleBellSort() => ToggleBellSweep(marketSellOnly: false);
@@ -240,6 +265,7 @@ public sealed unsafe class BellSweepService : IDisposable
         }
 
         marketSellOnlyMode = marketSellOnly;
+        InvalidateButtonCaches();
         pendingRetainers.Clear();
         var cappedCount = Math.Min(targets.Count, MaxRetainersPerClick);
         for (var i = 0; i < cappedCount; i++)
@@ -256,6 +282,7 @@ public sealed unsafe class BellSweepService : IDisposable
     public void Stop(string? echoReason = null)
     {
         var wasRunning = IsRunning;
+        InvalidateButtonCaches();
         pendingRetainers.Clear();
         activeTarget = null;
         state = SweepState.Idle;
@@ -295,11 +322,6 @@ public sealed unsafe class BellSweepService : IDisposable
         }
 
         var count = rm->GetRetainerCount();
-        var withdrawFirst = new List<BellRetainerTarget>();
-        var regular = new List<BellRetainerTarget>();
-        var funnelDestinations = new HashSet<ulong>();
-
-        // Pre-pass: detect retainers that will withdraw misplaced items to funnel into another retainer
         var allRetainers = new List<(int SortedIndex, ulong RetainerId, string Name, bool HasFreeMarket)>();
         for (uint i = 0; i < count; i++)
         {
@@ -317,30 +339,55 @@ public sealed unsafe class BellSweepService : IDisposable
 
             var hasFreeMarket = ret->MarketItemCount < MarketListingPlanner.MaxRetainerMarketListings;
             allRetainers.Add(((int)i, ret->RetainerId, name, hasFreeMarket));
+        }
 
-            if (!marketSellOnly && magicSort.HasRetainerMisplacedWithdrawWork(ret->RetainerId, out var destIds))
+        if (marketSellOnly)
+        {
+            var pendingMarket = magicSort.CountPendingBagMarketItems();
+            if (pendingMarket <= 0)
             {
-                foreach (var destId in destIds)
+                return list;
+            }
+
+            foreach (var (sortedIdx, retId, name, hasFreeMarket) in allRetainers)
+            {
+                if (hasFreeMarket)
                 {
-                    funnelDestinations.Add(destId);
+                    list.Add(new BellRetainerTarget(sortedIdx, retId, name, true, pendingMarket));
                 }
+            }
+
+            return list;
+        }
+
+        // Unified single-pass evaluation via RetainerBellEvaluator (checks ALL 9 withdrawable routes
+        // including Market/Vendor/GC/Glamour/Armoire/Use/Materia/GoldSaucer + misplaced Retainer + Tracked + Deposits!)
+        var workByRetainer = magicSort.EvaluateAllBellWork();
+        var funnelDestinations = new HashSet<ulong>();
+        foreach (var summary in workByRetainer.Values)
+        {
+            foreach (var destId in summary.FunnelDestinationIds)
+            {
+                funnelDestinations.Add(destId);
             }
         }
 
+        var withdrawFirst = new List<BellRetainerTarget>();
+        var regular = new List<BellRetainerTarget>();
+
         foreach (var (sortedIdx, retId, name, hasFreeMarket) in allRetainers)
         {
-            var isFunnelSource = !marketSellOnly && magicSort.HasRetainerMisplacedWithdrawWork(retId, out _);
-            var isFunnelDest = !marketSellOnly && funnelDestinations.Contains(retId);
-            var hasWork = marketSellOnly
-                ? hasFreeMarket && magicSort.HasPendingBagMarketItems()
-                : isFunnelSource || isFunnelDest || magicSort.HasPotentialBellWorkForRetainer(retId, includeMarketWork: false);
-            if (!hasWork)
+            var hasSummary = workByRetainer.TryGetValue(retId, out var summary);
+            var isFunnelDest = funnelDestinations.Contains(retId);
+            var itemCount = hasSummary ? summary.TotalItemCount : 0;
+            if (!isFunnelDest && itemCount <= 0)
             {
                 continue;
             }
 
-            var target = new BellRetainerTarget(sortedIdx, retId, name, hasFreeMarket);
-            if (isFunnelSource && !isFunnelDest)
+            var target = new BellRetainerTarget(sortedIdx, retId, name, hasFreeMarket, itemCount);
+            // Visit retainers with withdrawals (especially full 175/175 retainers) FIRST to free space before deposits!
+            if (hasSummary && summary.HasWithdrawWork && !isFunnelDest)
             {
                 withdrawFirst.Add(target);
             }
@@ -437,9 +484,33 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
+        // Re-resolve live SortedIndex by RetainerId so mid-sweep list reordering can never click the wrong retainer
+        var resolvedIndex = activeTarget.SortedIndex;
+        var rm = RetainerManager.Instance();
+        if (rm != null && rm->IsReady)
+        {
+            var count = rm->GetRetainerCount();
+            resolvedIndex = -1;
+            for (uint i = 0; i < count; i++)
+            {
+                var ret = rm->GetRetainerBySortedIndex(i);
+                if (ret != null && ret->Available && ret->RetainerId == activeTarget.RetainerId)
+                {
+                    resolvedIndex = (int)i;
+                    break;
+                }
+            }
+
+            if (resolvedIndex < 0)
+            {
+                Stop($"Magic Sort stopped: {activeTarget.Name} is no longer available.");
+                return;
+            }
+        }
+
         var args = stackalloc AtkValue[4];
         args[0] = NativeUiHelpers.IntValue(2);
-        args[1] = NativeUiHelpers.IntValue(activeTarget.SortedIndex);
+        args[1] = NativeUiHelpers.IntValue(resolvedIndex);
         args[2] = NativeUiHelpers.IntValue(0);
         args[3] = NativeUiHelpers.IntValue(0);
         if (!NativeUiHelpers.FireCallback(listAddon, false, new ReadOnlySpan<AtkValue>(args, 4)))
@@ -461,6 +532,12 @@ public sealed unsafe class BellSweepService : IDisposable
 
         if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString"))
         {
+            var openedId = HoldingsService.GetActiveRetainerId();
+            if (activeTarget != null && openedId != 0 && openedId != activeTarget.RetainerId)
+            {
+                Stop($"Magic Sort stopped: expected {activeTarget.Name} but a different retainer opened.");
+                return;
+            }
             if (!didRetainerSortOnCurrent)
             {
                 TransitionTo(SweepState.OpeningRetainerInventory, now, SampleJitterMs(550, 950));

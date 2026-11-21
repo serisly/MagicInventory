@@ -61,9 +61,10 @@ public sealed unsafe class InventorySafetyEvaluator
     private readonly Configuration configuration;
     private readonly Func<uint, bool> isItemInActiveTracker;
 
-    private ulong cachedCharacterId;
+    private ulong cachedGearsetCharacterId;
     private DateTime lastGearsetCacheUtc = DateTime.MinValue;
     private HashSet<uint> cachedGearsetIds = new();
+    private ulong cachedJobIlvlCharacterId;
     private DateTime lastJobIlvlCacheUtc = DateTime.MinValue;
     private Dictionary<uint, int> cachedUnlockedJobTopIlvl = new();
 
@@ -111,7 +112,7 @@ public sealed unsafe class InventorySafetyEvaluator
         => configuration.MarketListingPriorities.GetValueOrDefault(HoldingsService.NormalizeBaseItemId(baseItemId), 0);
 
     public static bool CanLockOrTagBaseId(uint baseItemId)
-        => baseItemId != 0 && baseItemId != 1 && baseItemId is < 2 or > 19;
+        => ItemIdentity.CanLockOrTagBaseId(baseItemId);
 
     public static bool IsRetainerContainer(InventoryType? container)
     {
@@ -174,7 +175,7 @@ public sealed unsafe class InventorySafetyEvaluator
     }
 
     public static bool IsContainerReadable(InventoryContainer* container)
-        => container != null && container->Items != null && container->Size > 0;
+        => container != null && container->Items != null && container->Size > 0 && container->IsLoaded;
 
     public static InventoryItem* GetSlot(InventoryContainer* container, int slotIdx)
     {
@@ -272,9 +273,12 @@ public sealed unsafe class InventorySafetyEvaluator
 
     public static bool IsLv1GlamourOrStarterGear(Item itemRow)
     {
-        return itemRow.EquipSlotCategory.RowId > 0
+        // Only treat untradable iLvl 1 Lv-1 equippable gear (starter/event glamour) as Lv 1 glamour/starter.
+        // Never trap XP bonus rings (iLvl 30/60), tradable high-value Lv 1 crafted glamour, or BLU Soul Crystal.
+        return ItemIdentity.IsEquipment(itemRow)
             && itemRow.LevelEquip == 1
-            && (itemRow.LevelItem.RowId <= 1 || itemRow.EquipSlotCategory.RowId is not (1 or 2 or 13 or 14));
+            && itemRow.LevelItem.RowId <= 1
+            && itemRow.IsUntradable;
     }
 
     public static bool IsEligibleForLiveRetainerDuplicateDeposit(Item itemRow)
@@ -282,15 +286,17 @@ public sealed unsafe class InventorySafetyEvaluator
         return itemRow.EquipSlotCategory.RowId == 0
             && itemRow.StackSize > 1
             && !itemRow.IsUnique
-            && itemRow.FilterGroup is not (11 or 16)
-            && itemRow.ItemUICategory.RowId is not (44 or 46 or 62 or 63);
+            && !ItemIdentity.IsCurrencyOrCrystal(itemRow.RowId, itemRow)
+            && !ItemIdentity.ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId)
+            && !ItemIdentity.IsSoulCrystal(itemRow)
+            && itemRow.ItemUICategory.RowId != ItemIdentity.UiCatOther;
     }
 
     public HashSet<uint> BuildGearsetItemIds()
     {
         var now = DateTime.UtcNow;
         var cid = GetCurrentContentId();
-        if (cid == cachedCharacterId && (now - lastGearsetCacheUtc).TotalMilliseconds < CacheTtlMs)
+        if (cid == cachedGearsetCharacterId && (now - lastGearsetCacheUtc).TotalMilliseconds < CacheTtlMs)
         {
             return cachedGearsetIds;
         }
@@ -320,7 +326,7 @@ public sealed unsafe class InventorySafetyEvaluator
             }
         }
 
-        cachedCharacterId = cid;
+        cachedGearsetCharacterId = cid;
         cachedGearsetIds = ids;
         lastGearsetCacheUtc = now;
         return ids;
@@ -350,15 +356,16 @@ public sealed unsafe class InventorySafetyEvaluator
             ? ps->ClassJobExperience[job.ExpArrayIndex]
             : 0;
 
-        // Ignore untouched Lv 1 class unlocks (e.g. ROG Lv 1, 0 XP) and untouched 0-XP expansion unlocks (DRK Lv 30, etc.)
-        return jobLevel <= 1 || (jobExp == 0 && jobLevel is 30 or 50 or 60 or 70 or 80);
+        // Ignore untouched Lv 1 class unlocks and untouched 0-XP expansion unlocks (using ClassJob.StartingLevel)
+        var startLv = Math.Max(1, (int)job.StartingLevel);
+        return jobLevel <= 1 || (jobExp == 0 && jobLevel <= startLv);
     }
 
     public Dictionary<uint, int> BuildUnlockedJobTopIlvl()
     {
         var now = DateTime.UtcNow;
         var cid = GetCurrentContentId();
-        if (cid == cachedCharacterId && (now - lastJobIlvlCacheUtc).TotalMilliseconds < CacheTtlMs)
+        if (cid == cachedJobIlvlCharacterId && (now - lastJobIlvlCacheUtc).TotalMilliseconds < CacheTtlMs)
         {
             return cachedUnlockedJobTopIlvl;
         }
@@ -429,7 +436,7 @@ public sealed unsafe class InventorySafetyEvaluator
                     }
 
                     var row = itemSheet.GetRowOrDefault(HoldingsService.NormalizeBaseItemId(slot->ItemId));
-                    if (row is not null && row.Value.LevelItem.RowId > 0)
+                    if (row is not null && row.Value.LevelItem.RowId > 0 && !ItemIdentity.IsSoulCrystal(row.Value))
                     {
                         sum += (int)row.Value.LevelItem.RowId;
                         count++;
@@ -497,7 +504,7 @@ public sealed unsafe class InventorySafetyEvaluator
             }
         }
 
-        cachedCharacterId = cid;
+        cachedJobIlvlCharacterId = cid;
         cachedUnlockedJobTopIlvl = result;
         lastJobIlvlCacheUtc = now;
         return result;
@@ -630,35 +637,38 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        if (itemRow.ItemUICategory.RowId == 62 || itemRow.Rarity >= 4)
+        if (ItemIdentity.IsSoulCrystal(itemRow) || itemRow.Rarity >= 4 || ItemIdentity.IsCollectable(slot))
         {
             return false;
         }
 
-        var hasManualOverride = configuration.ManualRouteOverrides.ContainsKey(baseId);
+        // Only treat a manual override as permitting disposal when the override itself targets this disposal route
+        // (prevents another character's "Retainer:<id>" override from disabling disposal safety guards on alts).
+        var hasManualDisposalOverride = configuration.ManualRouteOverrides.TryGetValue(baseId, out var overrideSpec)
+            && string.Equals(overrideSpec, targetRoute, StringComparison.OrdinalIgnoreCase);
 
-        // Hard-protect Housing Furnishings (FilterGroup 14) from disposal/market unless explicitly overridden
-        if (!hasManualOverride && itemRow.FilterGroup == 14)
+        // Hard-protect Housing Furnishings (FilterGroup 14/34 + all housing categories) from disposal/market unless explicitly overridden
+        if (!hasManualDisposalOverride && ItemIdentity.IsHousingItem(itemRow))
         {
             return false;
         }
 
         // Hard-protect Glamoured or Dyed gear (e.g. Jet Black / Pure White dye) from disposal/market unless explicitly overridden
-        if (!hasManualOverride
+        if (!hasManualDisposalOverride
             && itemRow.EquipSlotCategory.RowId > 0
             && (slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0))
         {
             return false;
         }
 
-        if (targetRoute is "Vendor" or "GrandCompany" && IsLv1GlamourOrStarterGear(itemRow))
+        if (targetRoute is "Vendor" or "GrandCompany" && !hasManualDisposalOverride && IsLv1GlamourOrStarterGear(itemRow))
         {
             return false;
         }
 
         // Protect HQ crafted equipment from NPC vendor disposal (matching GC HQ protection)
-        var isHq = slot->ItemId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-        if (!hasManualOverride && targetRoute == "Vendor" && itemRow.EquipSlotCategory.RowId > 0 && isHq)
+        var isHq = ItemIdentity.IsHighQuality(slot);
+        if (!hasManualDisposalOverride && targetRoute == "Vendor" && itemRow.EquipSlotCategory.RowId > 0 && isHq)
         {
             return false;
         }
@@ -702,8 +712,7 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                var abbr = job.Abbreviation.ExtractText();
-                if (!CanJobUseCategory(category, abbr))
+                if (!CanJobUseCategory(category, job.RowId))
                 {
                     continue;
                 }
@@ -715,11 +724,15 @@ public sealed unsafe class InventorySafetyEvaluator
                     return false;
                 }
 
-                confirmedOutgearedForBlue = true;
+                // Only confirm outgeared for Blue raid/tome gear when a job can actually equip it AND clearly outgears it
+                if (jobLevel >= itemRow.LevelEquip && topIlvl > 0 && (int)itemRow.LevelItem.RowId < topIlvl - 5)
+                {
+                    confirmedOutgearedForBlue = true;
+                }
             }
 
             // Never auto-dispose Blue (Rarity 3) Raid/Tome/Artifact gear unless an unlocked job actually outgears it
-            if (!hasManualOverride && itemRow.Rarity == 3 && !confirmedOutgearedForBlue)
+            if (!hasManualDisposalOverride && itemRow.Rarity == 3 && !confirmedOutgearedForBlue)
             {
                 return false;
             }
@@ -727,7 +740,7 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (targetRoute == "GrandCompany")
         {
-            if (!itemRow.IsUntradable || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality))
+            if (isHq || (!hasManualDisposalOverride && !itemRow.IsUntradable))
             {
                 return false;
             }
@@ -742,7 +755,7 @@ public sealed unsafe class InventorySafetyEvaluator
             }
 
             var isVendorRoute = string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase);
-            var isBoundMarketWhiteGear = !hasManualOverride
+            var isBoundMarketWhiteGear = !hasManualDisposalOverride
                 && string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase)
                 && itemRow.EquipSlotCategory.RowId > 0
                 && itemRow.Rarity == 1
@@ -754,7 +767,7 @@ public sealed unsafe class InventorySafetyEvaluator
         }
         else if (targetRoute == "Market")
         {
-            if (itemRow.IsUntradable)
+            if (!ItemIdentity.IsMarketable(itemRow))
             {
                 return false;
             }
@@ -766,6 +779,56 @@ public sealed unsafe class InventorySafetyEvaluator
         }
 
         return true;
+    }
+
+    public static bool CanJobUseCategory(ClassJobCategory category, uint classJobRowId)
+    {
+        return classJobRowId switch
+        {
+            1 => category.GLA,
+            2 => category.PGL,
+            3 => category.MRD,
+            4 => category.LNC,
+            5 => category.ARC,
+            6 => category.CNJ,
+            7 => category.THM,
+            8 => category.CRP,
+            9 => category.BSM,
+            10 => category.ARM,
+            11 => category.GSM,
+            12 => category.LTW,
+            13 => category.WVR,
+            14 => category.ALC,
+            15 => category.CUL,
+            16 => category.MIN,
+            17 => category.BTN,
+            18 => category.FSH,
+            19 => category.PLD,
+            20 => category.MNK,
+            21 => category.WAR,
+            22 => category.DRG,
+            23 => category.BRD,
+            24 => category.WHM,
+            25 => category.BLM,
+            26 => category.ACN,
+            27 => category.SMN,
+            28 => category.SCH,
+            29 => category.ROG,
+            30 => category.NIN,
+            31 => category.MCH,
+            32 => category.DRK,
+            33 => category.AST,
+            34 => category.SAM,
+            35 => category.RDM,
+            36 => category.BLU,
+            37 => category.GNB,
+            38 => category.DNC,
+            39 => category.RPR,
+            40 => category.SGE,
+            41 => category.VPR,
+            42 => category.PCT,
+            _ => false,
+        };
     }
 
     public static bool CanJobUseCategory(ClassJobCategory category, string abbr)
@@ -864,13 +927,9 @@ public sealed unsafe class InventorySafetyEvaluator
                 var category = itemRow.Value.ClassJobCategory.Value;
                 foreach (var job in classJobSheet)
                 {
-                    if (job.RowId != 0 && job.ClassJobParent.RowId != job.RowId)
+                    if (job.RowId != 0 && job.ClassJobParent.RowId != job.RowId && CanJobUseCategory(category, job.RowId))
                     {
-                        var abbr = job.Abbreviation.ExtractText();
-                        if (CanJobUseCategory(category, abbr))
-                        {
-                            owned.Add(job.RowId);
-                        }
+                        owned.Add(job.RowId);
                     }
                 }
             }
@@ -881,8 +940,8 @@ public sealed unsafe class InventorySafetyEvaluator
 
     /// <summary>
     /// Returns the true live count of items currently listed on the active retainer's market (0..20).
-    /// RetainerManager's cached MarketItemCount stays stale until you exit back to RetainerList,
-    /// whereas InventoryType.RetainerMarket updates immediately on every server ACK.
+    /// Trusts the live RetainerMarket container whenever it is loaded (RetainerManager.MarketItemCount stays stale
+    /// after sales or cancellations until exiting back to RetainerList).
     /// </summary>
     public static int GetLiveRetainerMarketCount(InventoryManager* manager, RetainerManager.Retainer* activeRetainer)
     {
@@ -908,6 +967,6 @@ public sealed unsafe class InventorySafetyEvaluator
             }
         }
 
-        return Math.Max(cached, liveCount);
+        return liveCount;
     }
 }

@@ -35,6 +35,8 @@ public sealed unsafe class MagicSortService : IDisposable
     private readonly ItemTriageEngine triageEngine;
     private readonly Func<Dictionary<uint, int>> getMissingTrackedQuantities;
 
+    private readonly SlotRouteResolver slotResolver;
+    private readonly RetainerBellEvaluator bellEvaluator;
     private readonly RetainerSortPlanner retainerPlanner;
     private readonly MarketListingPlanner marketPlanner;
     private readonly VendorSellPlanner vendorPlanner;
@@ -48,39 +50,15 @@ public sealed unsafe class MagicSortService : IDisposable
     private bool wasQueueBusy;
     private bool isOwnBatchActive;
 
-    private DateTime lastRetainerButtonUtc = DateTime.MinValue;
-    private ulong lastRetainerButtonActiveId;
-    private bool lastRetainerArmouryOpen;
-    private MagicSortButtonState cachedRetainerButton = HiddenSortButton;
-
-    private DateTime lastMarketButtonUtc = DateTime.MinValue;
-    private ulong lastMarketButtonActiveId;
-    private int lastMarketSourceMask = -1;
-    private MagicSortButtonState cachedMarketButton = HiddenSortButton;
-
-    private DateTime lastVendorButtonUtc = DateTime.MinValue;
-    private bool lastVendorArmouryOpen;
-    private MagicSortButtonState cachedVendorButton = HiddenSortButton;
-
-    private DateTime lastGcButtonUtc = DateTime.MinValue;
-    private int lastGcSelectedTab = -1;
-    private int lastGcSelectedFilter = -1;
-    private MagicSortButtonState cachedGcButton = HiddenSortButton;
-
-    private DateTime lastMateriaButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedMateriaButton = HiddenSortButton;
-
-    private DateTime lastUseButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedUseButton = HiddenSortButton;
-
-    private DateTime lastInvSortButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedInvSortButton = new(true, true, "Magic Sort", "Hover to preview destinations.");
-
-    private DateTime lastArmoireButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedArmoireButton = HiddenSortButton;
-
-    private DateTime lastGlamourButtonUtc = DateTime.MinValue;
-    private MagicSortButtonState cachedGlamourButton = HiddenSortButton;
+    private readonly ButtonStateCache<(ulong ActiveId, bool ArmouryOpen)> retainerButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<(ulong ActiveId, int SourceMask)> marketButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<bool> vendorButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<(int Tab, int Filter, int SortBy)> gcButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<int> materiaButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<int> useButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<int> invSortButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<int> armoireButtonCache = new(ButtonStatePollMs);
+    private readonly ButtonStateCache<int> glamourButtonCache = new(ButtonStatePollMs);
 
     public MagicSortService(
         IDalamudPluginInterface pluginInterface,
@@ -108,6 +86,8 @@ public sealed unsafe class MagicSortService : IDisposable
 
         this.triageEngine.TriageUpdated += InvalidateButtonCache;
 
+        slotResolver = new SlotRouteResolver(dataManager, safety);
+        bellEvaluator = new RetainerBellEvaluator(dataManager, holdings, safety, slotResolver, getMissingTrackedQuantities);
         retainerPlanner = new RetainerSortPlanner(dataManager, gameGui, holdings, safety, getMissingTrackedQuantities, InvalidateButtonCache);
         marketPlanner = new MarketListingPlanner(dataManager, gameGui, transactionQueue, safety);
         vendorPlanner = new VendorSellPlanner(dataManager, gameGui, transactionQueue, safety);
@@ -145,24 +125,26 @@ public sealed unsafe class MagicSortService : IDisposable
         }
     }
 
+    public SlotRouteResolver SlotResolver => slotResolver;
+
     public int ManifestItemCount => GetLatestManifest().Count;
 
     public int CustomRuleCount => configuration.ManualRouteOverrides.Count;
 
     public static bool CanLockOrTagBaseId(uint baseItemId)
-        => InventorySafetyEvaluator.CanLockOrTagBaseId(baseItemId);
+        => ItemIdentity.CanLockOrTagBaseId(baseItemId);
 
     public void InvalidateButtonCache()
     {
-        lastRetainerButtonUtc = DateTime.MinValue;
-        lastMarketButtonUtc = DateTime.MinValue;
-        lastVendorButtonUtc = DateTime.MinValue;
-        lastGcButtonUtc = DateTime.MinValue;
-        lastMateriaButtonUtc = DateTime.MinValue;
-        lastUseButtonUtc = DateTime.MinValue;
-        lastInvSortButtonUtc = DateTime.MinValue;
-        lastArmoireButtonUtc = DateTime.MinValue;
-        lastGlamourButtonUtc = DateTime.MinValue;
+        retainerButtonCache.Invalidate();
+        marketButtonCache.Invalidate();
+        vendorButtonCache.Invalidate();
+        gcButtonCache.Invalidate();
+        materiaButtonCache.Invalidate();
+        useButtonCache.Invalidate();
+        invSortButtonCache.Invalidate();
+        armoireButtonCache.Invalidate();
+        glamourButtonCache.Invalidate();
     }
 
     public bool IsItemOverwritten(uint rawItemId)
@@ -216,30 +198,30 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
-        if ((now - lastUseButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (useButtonCache.TryGet(0, out var cached))
         {
-            return cachedUseButton;
+            return cached;
         }
 
-        lastUseButtonUtc = now;
         var count = usePlanner.CountPlannedUses(GetLatestManifest());
-        cachedUseButton = count > 0
+        var state = count > 0
             ? new MagicSortButtonState(true, true, $"Use All ({count})", $"Use {count} unlockable / usable item(s) from your bags.")
             : HiddenSortButton;
-        return cachedUseButton;
+        return useButtonCache.Set(0, state);
     }
 
     public void ExecuteUseAll()
     {
-        if (transactionQueue.IsBusy)
+        if (!CanStartOrToggleDirectPlanner())
         {
-            transactionQueue.Cancel("Stopped.", QueueBatchOutcome.CancelledByUser);
-            InvalidateButtonCache();
             return;
         }
 
-        if (!usePlanner.Execute(GetLatestManifest(), out var msg) && !string.IsNullOrWhiteSpace(msg))
+        if (usePlanner.Execute(GetLatestManifest(), out var msg))
+        {
+            isOwnBatchActive = true;
+        }
+        else if (!string.IsNullOrWhiteSpace(msg))
         {
             chatGui.Print(msg);
         }
@@ -254,14 +236,13 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
-        if ((now - lastInvSortButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (invSortButtonCache.TryGet(0, out var cached))
         {
-            return cachedInvSortButton;
+            return cached;
         }
 
-        lastInvSortButtonUtc = now;
         var moves = inventorySortPlanner.PlanMoves(200, GetLatestManifest());
+        MagicSortButtonState state;
         if (moves.Count > 0)
         {
             var sb = new System.Text.StringBuilder();
@@ -284,35 +265,76 @@ public sealed unsafe class MagicSortService : IDisposable
                 sb.Append($"\n  ... and {moves.Count - shown} more");
             }
 
-            cachedInvSortButton = new MagicSortButtonState(true, true, $"Magic Sort ({moves.Count})", sb.ToString());
+            state = new MagicSortButtonState(true, true, $"Magic Sort ({moves.Count})", sb.ToString());
         }
         else
         {
-            cachedInvSortButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 true,
                 "Magic Sort",
                 "Hover to preview where each item goes. Bags & Armoury are tidy.");
         }
 
-        return cachedInvSortButton;
+        return invSortButtonCache.Set(0, state);
     }
 
     public void ExecuteInventorySort()
     {
-        if (transactionQueue.IsBusy)
+        if (!CanStartOrToggleDirectPlanner())
         {
-            transactionQueue.Cancel("Stopped.", QueueBatchOutcome.CancelledByUser);
-            InvalidateButtonCache();
             return;
         }
 
-        if (!inventorySortPlanner.Execute(GetLatestManifest(), out var msg) && !string.IsNullOrWhiteSpace(msg))
+        if (inventorySortPlanner.Execute(GetLatestManifest(), out var msg))
+        {
+            isOwnBatchActive = true;
+        }
+        else if (!string.IsNullOrWhiteSpace(msg))
         {
             chatGui.Print(msg);
         }
 
         InvalidateButtonCache();
+    }
+
+    private bool CanStartOrToggleDirectPlanner()
+    {
+        InvalidateButtonCache();
+        if (!transactionQueue.IsBusy)
+        {
+            isOwnBatchActive = false;
+        }
+
+        if (IsOrchestratorActive?.Invoke() == true)
+        {
+            OnUserStopRequested?.Invoke();
+            return false;
+        }
+
+        if (transactionQueue.IgnoreToggleClick)
+        {
+            return false;
+        }
+
+        if (transactionQueue.IsBusy)
+        {
+            if (isOwnBatchActive)
+            {
+                if (OnUserStopRequested != null)
+                {
+                    OnUserStopRequested();
+                }
+                else
+                {
+                    transactionQueue.Cancel("Stopped.", QueueBatchOutcome.CancelledByUser);
+                }
+            }
+
+            return false;
+        }
+
+        return true;
     }
 
     public int CountInventorySortMoves() => inventorySortPlanner.CountPlannedMoves(GetLatestManifest());
@@ -336,165 +358,31 @@ public sealed unsafe class MagicSortService : IDisposable
         short? slot,
         InventoryItem* liveItem)
     {
-        if (rawItemId == 0)
-        {
-            return null;
-        }
-
-        if (container is InventoryType.Crystals
-            or InventoryType.Currency
-            or InventoryType.KeyItems
-            or InventoryType.RetainerCrystals
-            or InventoryType.RetainerGil
-            or InventoryType.RetainerMarket)
-        {
-            return null;
-        }
-
-        if (container is InventoryType.EquippedItems or InventoryType.RetainerEquippedItems)
-        {
-            var eqBaseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-            var eqRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(eqBaseId);
-            if (eqRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(eqRow.Value, liveItem))
-            {
-                return "Magic Sort: Extract Materia";
-            }
-
-            var eqRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
-            return container == InventoryType.RetainerEquippedItems
-                ? $"Magic Sort: {eqRetLabel}"
-                : "Magic Sort: Keep";
-        }
-
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-        if (!CanLockOrTagBaseId(baseId))
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        if (baseId == 0)
         {
             return null;
         }
 
         var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseId);
-        // FilterGroup 11 = Crystals/Shards, 16 = Currency (FilterGroup 12 is Crafting Materials/Ingredients!)
-        if (itemRow is null or { FilterGroup: 11 } or { FilterGroup: 16 })
+        if (itemRow is null)
         {
             return null;
         }
 
-        var inRetainer = InventorySafetyEvaluator.IsRetainerContainer(container);
-        var inArmoury = container.HasValue && InventorySafetyEvaluator.IsArmouryContainer(container.Value);
-        var activeRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
-        string KeepHereLabel() => inRetainer
-            ? $"Magic Sort: {activeRetLabel}"
-            : "Magic Sort: Keep";
-
-        if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, liveItem))
+        var resolved = slotResolver.ResolveSlot(
+            rawItemId,
+            container,
+            liveItem,
+            GetLatestManifest(),
+            safety.BuildGearsetItemIds(),
+            safety.BuildUnlockedJobTopIlvl());
+        if (resolved is null)
         {
-            return "Magic Sort: Extract Materia";
+            return null;
         }
 
-        if (safety.IsItemTracked(baseId))
-        {
-            return KeepHereLabel();
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        if (gearsetIds.Contains(baseId))
-        {
-            return KeepHereLabel();
-        }
-
-        if (itemRow.Value.ItemUICategory.RowId == 62 || itemRow.Value.Rarity >= 4)
-        {
-            return KeepHereLabel();
-        }
-
-        var entries = GetLatestManifest();
-        if (!entries.TryGetValue(baseId, out var entry))
-        {
-            if (!inRetainer
-                && !inArmoury
-                && InventorySafetyEvaluator.IsEligibleForLiveRetainerDuplicateDeposit(itemRow.Value)
-                && HoldingsService.GetActiveRetainerId() != 0
-                && HoldingsService.GetLiveActiveRetainerCount(baseId) > 0)
-            {
-                return $"Magic Sort: {activeRetLabel}";
-            }
-
-            return KeepHereLabel();
-        }
-
-        if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
-        {
-            if (entry.Reason.StartsWith("Checking ", StringComparison.OrdinalIgnoreCase))
-            {
-                return "Magic Sort: Checking price...";
-            }
-
-            if (entry.Reason.StartsWith("Open a Summoning Bell", StringComparison.OrdinalIgnoreCase)
-                || entry.Reason.StartsWith("Visit each retainer", StringComparison.OrdinalIgnoreCase))
-            {
-                return "Magic Sort: Visit retainers at Bell";
-            }
-
-            return KeepHereLabel();
-        }
-
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-        var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, liveItem, entries, gearsetIds, unlockedTop);
-        if (effectiveRoute == null)
-        {
-            return KeepHereLabel();
-        }
-
-        var isHq = rawItemId >= 1_000_000
-            || (liveItem != null && liveItem->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality));
-
-        switch (effectiveRoute)
-        {
-            case "Retainer":
-            {
-                var retName = string.IsNullOrWhiteSpace(entry.TargetRetainerName) ? "Retainer" : entry.TargetRetainerName;
-                return $"Magic Sort: {retName}";
-            }
-
-            case "Use":
-                return "Magic Sort: Use";
-
-            case "Market":
-            {
-                var price = isHq && entry.TargetPriceHq > 0
-                    ? entry.TargetPriceHq
-                    : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
-                var prio = safety.GetMarketPriority(baseId);
-                var prioTag = prio > 0 ? " [High]" : (prio < 0 ? " [Low]" : string.Empty);
-                return price > 0 ? $"Magic Sort: Market (~{price:N0}g){prioTag}" : $"Magic Sort: Market{prioTag}";
-            }
-
-            case "Vendor":
-            {
-                var qty = liveItem != null && liveItem->Quantity > 0 ? liveItem->Quantity : 1;
-                var npcUnit = entry.NpcSellPrice > 0 ? entry.NpcSellPrice : itemRow.Value.PriceLow;
-                var total = Math.Max(0, npcUnit) * qty;
-                return total > 0 ? $"Magic Sort: Vendor ({total:N0}g)" : "Magic Sort: Vendor";
-            }
-
-            case "GrandCompany":
-                return "Magic Sort: GC Seals";
-
-            case "GoldSaucer":
-                return "Magic Sort: Gold Saucer";
-
-            case "Materia":
-                return "Magic Sort: Extract Materia";
-
-            case "Armoire":
-                return "Magic Sort: Armoire";
-
-            case "Glamour":
-                return "Magic Sort: Glamour Dresser";
-
-            default:
-                return "Magic Sort: Keep";
-        }
+        return slotResolver.FormatHoverTooltipLabel(resolved.Value, rawItemId, container, liveItem, itemRow.Value);
     }
 
     public MagicSortButtonState GetRetainerSortButtonState()
@@ -504,17 +392,22 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
         var activeId = HoldingsService.GetActiveRetainerId();
         var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
-        if (activeId == lastRetainerButtonActiveId
-            && armouryOpen == lastRetainerArmouryOpen
-            && (now - lastRetainerButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        var key = (activeId, armouryOpen);
+        if (retainerButtonCache.TryGet(key, out var cached))
         {
-            return cachedRetainerButton;
+            return cached;
+        }
+
+        // Capture active retainer BEFORE reading manifest so the first poll after opening a retainer uses fresh data
+        if (activeId != 0)
+        {
+            holdings.CaptureActiveRetainerIfOpen(true);
         }
 
         var plan = retainerPlanner.BuildPlan(SafeTransactionQueue.MaxBatchSize, GetLatestManifest());
+        MagicSortButtonState state;
         if (plan.Steps.Count > 0)
         {
             var sb = new System.Text.StringBuilder();
@@ -547,11 +440,11 @@ public sealed unsafe class MagicSortService : IDisposable
             }
 
             var transferCount = Math.Max(1, plan.TotalTransferCount);
-            cachedRetainerButton = new MagicSortButtonState(true, true, $"Magic Sort ({transferCount})", sb.ToString());
+            state = new MagicSortButtonState(true, true, $"Magic Sort ({transferCount})", sb.ToString());
         }
         else if (plan.BlockedByFullRetainer > 0)
         {
-            cachedRetainerButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 false,
                 "Retainer Full",
@@ -559,7 +452,7 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else if (plan.BlockedByFullBag > 0)
         {
-            cachedRetainerButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 false,
                 "Bag Full",
@@ -567,13 +460,10 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else
         {
-            cachedRetainerButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
 
-        lastRetainerButtonActiveId = activeId;
-        lastRetainerArmouryOpen = armouryOpen;
-        lastRetainerButtonUtc = now;
-        return cachedRetainerButton;
+        return retainerButtonCache.Set(key, state);
     }
 
     private static void AppendTooltipItems(System.Text.StringBuilder sb, IReadOnlyList<string> items, int maxShown)
@@ -634,42 +524,34 @@ public sealed unsafe class MagicSortService : IDisposable
         return 0;
     }
 
+    public Dictionary<ulong, RetainerBellWorkSummary> EvaluateAllBellWork()
+    {
+        var known = holdings.GetKnownRetainersForCurrentCharacter();
+        return bellEvaluator.EvaluateAllRetainers(known, GetLatestManifest());
+    }
+
     public string BuildBellSortTooltip(IReadOnlyList<string> retainerNames)
     {
         var sb = new System.Text.StringBuilder();
         sb.Append("Sort retainers: ").Append(string.Join(", ", retainerNames));
 
-        var missingTracked = getMissingTrackedQuantities();
-        if (missingTracked.Count > 0)
-        {
-            var pullCount = 0;
-            foreach (var (trackedId, needQty) in missingTracked)
-            {
-                if (needQty > 0 && holdings.GetHoldingSummary(trackedId).TotalRetainerCount > 0)
-                {
-                    pullCount++;
-                }
-            }
-
-            if (pullCount > 0)
-            {
-                sb.Append($"\n  - Withdraw {pullCount} tracked crafting material(s)");
-            }
-        }
-
         var known = holdings.GetKnownRetainersForCurrentCharacter();
-        var funnelCount = 0;
+        var work = bellEvaluator.EvaluateAllRetainers(known, GetLatestManifest());
         foreach (var r in known)
         {
-            if (HasRetainerMisplacedWithdrawWork(r.RetainerId, out _))
+            if (!work.TryGetValue(r.RetainerId, out var s) || !s.HasAnyWork)
             {
-                funnelCount++;
+                continue;
             }
-        }
 
-        if (funnelCount > 0)
-        {
-            sb.Append("\n  - Consolidate misplaced specialty items across retainers");
+            var parts = new List<string>(3);
+            if (s.TrackedWithdrawCount > 0) parts.Add($"pull {s.TrackedWithdrawCount} tracked");
+            if (s.WithdrawCount > 0) parts.Add($"withdraw {s.WithdrawCount}");
+            if (s.DepositCount > 0) parts.Add($"deposit {s.DepositCount}");
+            if (parts.Count > 0)
+            {
+                sb.Append($"\n  - {r.Name}: {string.Join(", ", parts)}");
+            }
         }
 
         return sb.ToString();
@@ -892,10 +774,32 @@ public sealed unsafe class MagicSortService : IDisposable
             return slots;
         }
 
+        if (string.Equals(hoveredSellAddon, "RetainerList:Sell", StringComparison.Ordinal))
+        {
+            foreach (var p in CollectBagMarketPlansForPreview())
+            {
+                slots.Add((p.Container, p.Slot));
+            }
+
+            return slots;
+        }
+
+        if (string.Equals(hoveredSellAddon, "RetainerList:Sort", StringComparison.Ordinal))
+        {
+            GetSlotsMatchingRouteFilter("Retainer", out var retBags, out _, out _);
+            foreach (var s in retBags)
+            {
+                slots.Add(s);
+            }
+
+            return slots;
+        }
+
         if (string.Equals(hoveredSellAddon, "Shop", StringComparison.Ordinal)
             && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Shop"))
         {
-            foreach (var p in vendorPlanner.PlanSales(MaxTwoStepBatchItems, includeArmoury: false, entries))
+            var includeArmoury = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
+            foreach (var p in vendorPlanner.PlanSales(MaxTwoStepBatchItems, includeArmoury, entries))
             {
                 slots.Add((p.Container, p.Slot));
             }
@@ -931,15 +835,9 @@ public sealed unsafe class MagicSortService : IDisposable
         if (string.Equals(hoveredSellAddon, "MiragePrismPrismBoxCrystallize", StringComparison.Ordinal)
             && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
         {
-            GetSlotsMatchingRouteFilter("Glamour", out var glamBags, out _, out var glamArmoury);
-            foreach (var s in glamBags)
+            foreach (var p in glamourPlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, entries, out _))
             {
-                slots.Add(s);
-            }
-
-            foreach (var s in glamArmoury)
-            {
-                slots.Add(s);
+                slots.Add((p.Container, p.Slot));
             }
 
             return slots;
@@ -1042,41 +940,14 @@ public sealed unsafe class MagicSortService : IDisposable
                     continue;
                 }
 
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-                if (!CanLockOrTagBaseId(baseId))
+                var resolved = slotResolver.ResolveSlot(slot->ItemId, containerType, slot, entries, gearsetIds, unlockedTop);
+                if (resolved is null)
                 {
                     continue;
                 }
 
-                var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null)
-                {
-                    continue;
-                }
-
-                string effective;
-                ulong targetRetId = 0;
-                if (InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot))
-                {
-                    effective = "Materia";
-                }
-                else if (safety.IsItemTracked(baseId) || gearsetIds.Contains(baseId))
-                {
-                    effective = "Keep";
-                }
-                else if (!entries.TryGetValue(baseId, out var entry))
-                {
-                    effective = "Keep";
-                }
-                else if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
-                {
-                    effective = "Keep";
-                }
-                else
-                {
-                    effective = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, entries, gearsetIds, unlockedTop) ?? "Keep";
-                    targetRetId = entry.TargetRetainerId;
-                }
+                var effective = resolved.Value.Route;
+                var targetRetId = resolved.Value.TargetRetainerId;
 
                 if (matchAnySell)
                 {
@@ -1130,52 +1001,7 @@ public sealed unsafe class MagicSortService : IDisposable
     }
 
     public bool HasPendingBagMarketItems()
-    {
-        var entries = GetLatestManifest();
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || entries.Count == 0)
-        {
-            return false;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-
-        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var container = manager->GetInventoryContainer(bag);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < container->Size; i++)
-            {
-                var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-                if (!entries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var row = itemSheet.GetRowOrDefault(baseId);
-                if (row is not null
-                    && safety.IsSafeToDisposeOrList(slot, row.Value, "Market", entries, gearsetIds, unlockedTop))
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
+        => CollectBagMarketPlansForPreview().Count > 0;
 
     public bool HasPotentialBellWorkForRetainer(ulong retainerId, bool includeMarketWork)
     {
@@ -1189,231 +1015,21 @@ public sealed unsafe class MagicSortService : IDisposable
             return true;
         }
 
-        var missingTracked = getMissingTrackedQuantities();
-        if (missingTracked.Count > 0)
+        var work = EvaluateAllBellWork();
+        return work.TryGetValue(retainerId, out var summary) && summary.HasAnyWork;
+    }
+
+    public bool HasRetainerMisplacedWithdrawWork(ulong retainerId, out HashSet<ulong> destinationRetainerIds)
+    {
+        var work = EvaluateAllBellWork();
+        if (work.TryGetValue(retainerId, out var summary) && summary.FunnelDestinationIds.Count > 0)
         {
-            foreach (var (trackedId, needQty) in missingTracked)
-            {
-                if (needQty <= 0)
-                {
-                    continue;
-                }
-
-                var summary = holdings.GetHoldingSummary(trackedId);
-                foreach (var ret in summary.Retainers)
-                {
-                    if (ret.RetainerId == retainerId && ret.Quantity > 0)
-                    {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        var entries = GetLatestManifest();
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || entries.Count == 0)
-        {
-            return false;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-
-        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var container = manager->GetInventoryContainer(bag);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < container->Size; i++)
-            {
-                var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                    || gearsetIds.Contains(baseId)
-                    || safety.IsItemTracked(baseId))
-                {
-                    continue;
-                }
-
-                if (!entries.TryGetValue(baseId, out var entry))
-                {
-                    continue;
-                }
-
-                var row = itemSheet.GetRowOrDefault(baseId);
-                if (row is null || row.Value.ItemUICategory.RowId == 62 || row.Value.Rarity >= 4)
-                {
-                    continue;
-                }
-
-                var effRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, entries, gearsetIds, unlockedTop);
-                if (effRoute != "Retainer")
-                {
-                    continue;
-                }
-
-                var isHq = slot->ItemId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                var stackSize = (int)Math.Max(1, row.Value.StackSize);
-                var isPrimary = entry.TargetRetainerId == retainerId
-                    && !holdings.IsRetainerKnownFullFor(retainerId, baseId, isHq, stackSize);
-                var isOverflow = entry.TargetRetainerId != 0
-                    && entry.TargetRetainerId != retainerId
-                    && holdings.IsRetainerKnownFullFor(entry.TargetRetainerId, baseId, isHq, stackSize)
-                    && !holdings.IsRetainerKnownFullFor(retainerId, baseId, isHq, stackSize);
-                if (isPrimary || isOverflow)
-                {
-                    return true;
-                }
-            }
-        }
-
-        if (HasRetainerMisplacedWithdrawWork(retainerId, out _))
-        {
+            destinationRetainerIds = summary.FunnelDestinationIds;
             return true;
         }
 
-        return false;
-    }
-
-    /// <summary>
-    /// Checks whether a retainer holds unlocked, non-gearset items whose assigned specialty/target
-    /// belongs on a DIFFERENT non-full retainer (so Bell Sweep can pull them first and deposit next).
-    /// </summary>
-    public bool HasRetainerMisplacedWithdrawWork(ulong retainerId, out HashSet<ulong> destinationRetainerIds)
-    {
         destinationRetainerIds = new HashSet<ulong>();
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        var entries = GetLatestManifest();
-        if (retainerId == 0 || manager == null || itemSheet == null || entries.Count == 0 || manager->GetEmptySlotsInBag() < 1)
-        {
-            return false;
-        }
-
-        var known = holdings.GetKnownRetainersForCurrentCharacter();
-        KnownRetainerInfo? retInfo = null;
-        foreach (var r in known)
-        {
-            if (r.RetainerId == retainerId)
-            {
-                retInfo = r;
-                break;
-            }
-        }
-
-        if (retInfo == null || retInfo.Quantities.Count == 0)
-        {
-            return false;
-        }
-
-        // Subtract player-bag items already queued for each destination retainer so we never trigger a funnel
-        // visit when the target retainer will already be full after receiving bag deposits.
-        var destFreeBudget = new Dictionary<ulong, int>();
-        foreach (var bagType in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var bag = manager->GetInventoryContainer(bagType);
-            if (!InventorySafetyEvaluator.IsContainerReadable(bag))
-            {
-                continue;
-            }
-
-            for (var s = 0; s < bag->Size; s++)
-            {
-                var pSlot = InventorySafetyEvaluator.GetSlot(bag, s);
-                if (pSlot == null || pSlot->ItemId == 0 || pSlot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var pBase = HoldingsService.NormalizeBaseItemId(pSlot->ItemId);
-                if (!entries.TryGetValue(pBase, out var pEntry)
-                    || !string.Equals(pEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
-                    || pEntry.TargetRetainerId == 0
-                    || pEntry.TargetRetainerId == retainerId)
-                {
-                    continue;
-                }
-
-                var pRow = itemSheet.GetRowOrDefault(pBase);
-                if (pRow is null)
-                {
-                    continue;
-                }
-
-                var pStack = (int)Math.Max(1, pRow.Value.StackSize);
-                var pHq = pSlot->ItemId >= 1_000_000 || pSlot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                if (pStack > 1 && holdings.HasPartialStackOnRetainer(pEntry.TargetRetainerId, pBase, pHq))
-                {
-                    continue;
-                }
-
-                if (!destFreeBudget.TryGetValue(pEntry.TargetRetainerId, out var rem))
-                {
-                    rem = holdings.GetKnownRetainerFreeSlots(pEntry.TargetRetainerId);
-                }
-
-                destFreeBudget[pEntry.TargetRetainerId] = Math.Max(0, rem - 1);
-            }
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        foreach (var (baseId, qty) in retInfo.Quantities)
-        {
-            if (qty <= 0
-                || !InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
-                || gearsetIds.Contains(baseId)
-                || safety.IsItemTracked(baseId))
-            {
-                continue;
-            }
-
-            if (!entries.TryGetValue(baseId, out var entry)
-                || !string.Equals(entry.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
-                || entry.TargetRetainerId == 0
-                || entry.TargetRetainerId == retainerId)
-            {
-                continue;
-            }
-
-            var row = itemSheet.GetRowOrDefault(baseId);
-            if (row is null || row.Value.ItemUICategory.RowId == 62 || row.Value.Rarity >= 4 || row.Value.IsUnique)
-            {
-                continue;
-            }
-
-            var stackSize = (int)Math.Max(1, row.Value.StackSize);
-            var mergesIntoPartial = stackSize > 1
-                && (holdings.HasPartialStackOnRetainer(entry.TargetRetainerId, baseId, isHq: false)
-                    || holdings.HasPartialStackOnRetainer(entry.TargetRetainerId, baseId, isHq: true));
-            if (mergesIntoPartial)
-            {
-                destinationRetainerIds.Add(entry.TargetRetainerId);
-                continue;
-            }
-
-            if (!destFreeBudget.TryGetValue(entry.TargetRetainerId, out var remSlots))
-            {
-                remSlots = holdings.GetKnownRetainerFreeSlots(entry.TargetRetainerId);
-            }
-
-            if (remSlots > 0)
-            {
-                destFreeBudget[entry.TargetRetainerId] = remSlots - 1;
-                destinationRetainerIds.Add(entry.TargetRetainerId);
-            }
-        }
-
-        return destinationRetainerIds.Count > 0;
+        return false;
     }
 
     public MagicSortButtonState GetMarketSortButtonState()
@@ -1430,26 +1046,25 @@ public sealed unsafe class MagicSortService : IDisposable
             return HiddenSortButton;
         }
 
-        var now = DateTime.UtcNow;
         var sourceMask = marketPlanner.GetOpenMarketSourceMask();
-        if (active->RetainerId == lastMarketButtonActiveId
-            && sourceMask == lastMarketSourceMask
-            && (now - lastMarketButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        var key = (active->RetainerId, sourceMask);
+        if (marketButtonCache.TryGet(key, out var cached))
         {
-            return cachedMarketButton;
+            return cached;
         }
 
         var entries = GetLatestManifest();
         var liveMarketCount = InventorySafetyEvaluator.GetLiveRetainerMarketCount(InventoryManager.Instance(), active);
+        MagicSortButtonState state;
         if ((sourceMask & 3) == 0)
         {
-            cachedMarketButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
         else if (liveMarketCount >= MarketListingPlanner.MaxRetainerMarketListings)
         {
             var hasWaiting = marketPlanner.PlanListings(1, entries).Count > 0
                 || marketPlanner.CountArmouryMarketItems(1, entries) > 0;
-            cachedMarketButton = hasWaiting
+            state = hasWaiting
                 ? new MagicSortButtonState(
                     true,
                     false,
@@ -1464,7 +1079,7 @@ public sealed unsafe class MagicSortService : IDisposable
             var plans = marketPlanner.PlanListings(batchLimit, entries);
             if (plans.Count > 0)
             {
-                cachedMarketButton = new MagicSortButtonState(
+                state = new MagicSortButtonState(
                     true,
                     true,
                     $"Magic Sell ({plans.Count})",
@@ -1473,7 +1088,7 @@ public sealed unsafe class MagicSortService : IDisposable
             else
             {
                 var armouryMkt = marketPlanner.CountArmouryMarketItems(SafeTransactionQueue.MaxBatchSize, entries);
-                cachedMarketButton = armouryMkt > 0
+                state = armouryMkt > 0
                     ? new MagicSortButtonState(
                         true,
                         false,
@@ -1483,10 +1098,7 @@ public sealed unsafe class MagicSortService : IDisposable
             }
         }
 
-        lastMarketButtonActiveId = active->RetainerId;
-        lastMarketSourceMask = sourceMask;
-        lastMarketButtonUtc = now;
-        return cachedMarketButton;
+        return marketButtonCache.Set(key, state);
     }
 
     public bool HasMoreMarketSellWork()
@@ -1551,8 +1163,18 @@ public sealed unsafe class MagicSortService : IDisposable
 
             var steps = marketPlanner.BuildListingSteps(plans, GetLatestManifest);
             var counted = new List<TransactionStep>(steps.Count);
-            foreach (var step in steps)
+            for (var i = 0; i < steps.Count; i++)
             {
+                var step = steps[i];
+                // Each listing produces 3 steps (Open, Set price, Confirm).
+                // Record 1 daily Market Board action ONLY on the final Confirm step — NOT 3x per item!
+                var isFinalListingStep = ((i + 1) % 3) == 0;
+                if (!isFinalListingStep)
+                {
+                    counted.Add(step);
+                    continue;
+                }
+
                 var original = step.HasServerAck;
                 var recorded = false;
                 counted.Add(step with
@@ -1583,19 +1205,18 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
         var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
-        if (armouryOpen == lastVendorArmouryOpen
-            && (now - lastVendorButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (vendorButtonCache.TryGet(armouryOpen, out var cached))
         {
-            return cachedVendorButton;
+            return cached;
         }
 
         var entries = GetLatestManifest();
         var plans = vendorPlanner.PlanSales(MaxTwoStepBatchItems, armouryOpen, entries);
+        MagicSortButtonState state;
         if (plans.Count > 0)
         {
-            cachedVendorButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 true,
                 $"Magic Sell ({plans.Count})",
@@ -1604,7 +1225,7 @@ public sealed unsafe class MagicSortService : IDisposable
         else if (!armouryOpen)
         {
             var armouryCount = vendorPlanner.CountArmouryVendorItems(99, entries);
-            cachedVendorButton = armouryCount > 0
+            state = armouryCount > 0
                 ? new MagicSortButtonState(
                     true,
                     false,
@@ -1614,12 +1235,10 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else
         {
-            cachedVendorButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
 
-        lastVendorArmouryOpen = armouryOpen;
-        lastVendorButtonUtc = now;
-        return cachedVendorButton;
+        return vendorButtonCache.Set(armouryOpen, state);
     }
 
     public void ExecuteVendorSort()
@@ -1651,21 +1270,21 @@ public sealed unsafe class MagicSortService : IDisposable
             return HiddenSortButton;
         }
 
-        var now = DateTime.UtcNow;
         var tab = supplyAddon->SelectedTab;
         var filter = supplyAddon->SelectedFilter;
-        if (tab == lastGcSelectedTab
-            && filter == lastGcSelectedFilter
-            && (now - lastGcButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        var sortBy = supplyAddon->SelectedSortBy;
+        var key = (tab, filter, sortBy);
+        if (gcButtonCache.TryGet(key, out var cached))
         {
-            return cachedGcButton;
+            return cached;
         }
 
         var entries = GetLatestManifest();
+        MagicSortButtonState state;
         if (tab != 2)
         {
             var eligibleCount = grandCompanyPlanner.CountEligibleItemsInBagsAndArmoury(MaxTwoStepBatchItems, entries);
-            cachedGcButton = eligibleCount == 0
+            state = eligibleCount == 0
                 ? HiddenSortButton
                 : new MagicSortButtonState(
                     true,
@@ -1678,7 +1297,7 @@ public sealed unsafe class MagicSortService : IDisposable
             var plans = grandCompanyPlanner.PlanTurnIns(MaxTwoStepBatchItems, entries, out var blockedBySealCap);
             if (plans.Count > 0)
             {
-                cachedGcButton = new MagicSortButtonState(
+                state = new MagicSortButtonState(
                     true,
                     true,
                     $"Magic Sell ({plans.Count})",
@@ -1686,7 +1305,7 @@ public sealed unsafe class MagicSortService : IDisposable
             }
             else if (blockedBySealCap)
             {
-                cachedGcButton = new MagicSortButtonState(
+                state = new MagicSortButtonState(
                     true,
                     false,
                     "Seal Cap",
@@ -1694,14 +1313,11 @@ public sealed unsafe class MagicSortService : IDisposable
             }
             else
             {
-                cachedGcButton = HiddenSortButton;
+                state = HiddenSortButton;
             }
         }
 
-        lastGcSelectedTab = tab;
-        lastGcSelectedFilter = filter;
-        lastGcButtonUtc = now;
-        return cachedGcButton;
+        return gcButtonCache.Set(key, state);
     }
 
     public void ExecuteGrandCompanySort()
@@ -1748,16 +1364,16 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
-        if ((now - lastMateriaButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (materiaButtonCache.TryGet(0, out var cached))
         {
-            return cachedMateriaButton;
+            return cached;
         }
 
         var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize, out var blockedByFullBag);
+        MagicSortButtonState state;
         if (plans.Count > 0)
         {
-            cachedMateriaButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 true,
                 $"Extract All ({plans.Count})",
@@ -1765,7 +1381,7 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else if (blockedByFullBag > 0)
         {
-            cachedMateriaButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 false,
                 "Bag Full",
@@ -1773,11 +1389,10 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else
         {
-            cachedMateriaButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
 
-        lastMateriaButtonUtc = now;
-        return cachedMateriaButton;
+        return materiaButtonCache.Set(0, state);
     }
 
     public void ExecuteMateriaExtractSort()
@@ -1802,14 +1417,13 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
-        if ((now - lastArmoireButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (armoireButtonCache.TryGet(0, out var cached))
         {
-            return cachedArmoireButton;
+            return cached;
         }
 
-        lastArmoireButtonUtc = now;
         var plans = armoirePlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, GetLatestManifest(), out var needsRepair, out var meldedSkipped);
+        MagicSortButtonState state;
         if (plans.Count > 0)
         {
             var sb = new System.Text.StringBuilder();
@@ -1830,11 +1444,11 @@ public sealed unsafe class MagicSortService : IDisposable
                 sb.Append($"\n({needsRepair} skipped — repair to 100% first)");
             }
 
-            cachedArmoireButton = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
+            state = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
         }
         else if (needsRepair > 0)
         {
-            cachedArmoireButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 false,
                 "Repair First",
@@ -1842,7 +1456,7 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else if (meldedSkipped > 0)
         {
-            cachedArmoireButton = new MagicSortButtonState(
+            state = new MagicSortButtonState(
                 true,
                 false,
                 "Unmeld First",
@@ -1850,10 +1464,10 @@ public sealed unsafe class MagicSortService : IDisposable
         }
         else
         {
-            cachedArmoireButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
 
-        return cachedArmoireButton;
+        return armoireButtonCache.Set(0, state);
     }
 
     public void ExecuteArmoireStore()
@@ -1883,14 +1497,13 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
-        var now = DateTime.UtcNow;
-        if ((now - lastGlamourButtonUtc).TotalMilliseconds < ButtonStatePollMs)
+        if (glamourButtonCache.TryGet(0, out var cached))
         {
-            return cachedGlamourButton;
+            return cached;
         }
 
-        lastGlamourButtonUtc = now;
         var plans = glamourPlanner.PlanStores(SafeTransactionQueue.MaxBatchSize, GetLatestManifest(), out var blockReason);
+        MagicSortButtonState state;
         if (plans.Count > 0)
         {
             var sb = new System.Text.StringBuilder();
@@ -1906,18 +1519,18 @@ public sealed unsafe class MagicSortService : IDisposable
                 sb.Append($"\n  ... and {plans.Count - shown} more");
             }
 
-            cachedGlamourButton = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
+            state = new MagicSortButtonState(true, true, $"Magic Store ({plans.Count})", sb.ToString());
         }
         else if (!string.IsNullOrEmpty(blockReason))
         {
-            cachedGlamourButton = new MagicSortButtonState(true, false, "Magic Store", blockReason);
+            state = new MagicSortButtonState(true, false, "Magic Store", blockReason);
         }
         else
         {
-            cachedGlamourButton = HiddenSortButton;
+            state = HiddenSortButton;
         }
 
-        return cachedGlamourButton;
+        return glamourButtonCache.Set(0, state);
     }
 
     public void ExecuteGlamourDresserStore()

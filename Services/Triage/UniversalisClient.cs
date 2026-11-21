@@ -21,7 +21,8 @@ public sealed record MarketPriceSnapshot(
     int RecentHistoryMedian,
     float RegularSaleVelocity,
     DateTime FetchedUtc,
-    int ListingCount = -1);
+    int ListingCount = -1,
+    int RecentHistoryMedianHq = 0);
 
 public sealed record DcCheapestListing(
     uint ItemId,
@@ -47,6 +48,7 @@ public sealed class UniversalisClient : IDisposable
     private readonly HttpClient httpClient;
     private readonly CancellationTokenSource cts = new();
 
+    private readonly object diskSaveGate = new();
     private readonly ConcurrentDictionary<(string World, uint ItemId), MarketPriceSnapshot> cache = new();
     private readonly ConcurrentDictionary<(string World, uint ItemId), byte> queuedKeys = new();
     private readonly ConcurrentQueue<(string World, uint ItemId)> pendingQueue = new();
@@ -347,9 +349,24 @@ public sealed class UniversalisClient : IDisposable
                     || (int)resp.StatusCode >= 500)
                 {
                     lastError = $"HTTP {(int)resp.StatusCode} from Universalis (retrying...)";
-                    var backoffMs = (attempt + 1) * 2000;
-                    await Task.Delay(backoffMs, ct).ConfigureAwait(false);
+                    var retryAfterMs = resp.Headers.RetryAfter?.Delta is { } delta
+                        ? (int)Math.Clamp(delta.TotalMilliseconds, 1000, 30000)
+                        : (2000 << attempt);
+                    await Task.Delay(retryAfterMs, ct).ConfigureAwait(false);
                     continue;
+                }
+
+                if (resp.StatusCode == HttpStatusCode.NotFound)
+                {
+                    // Short 15-minute cooldown instead of infinite 1.5s re-poll loop or 6-hour poisoning
+                    var shortExpiryFetch = DateTime.UtcNow - CacheTtl + TimeSpan.FromMinutes(15);
+                    foreach (var requestedId in itemIds)
+                    {
+                        cache.TryAdd((world, requestedId), new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, shortExpiryFetch, -1));
+                    }
+
+                    lastError = string.Empty;
+                    return 0;
                 }
 
                 if (!resp.IsSuccessStatusCode)
@@ -386,12 +403,13 @@ public sealed class UniversalisClient : IDisposable
                     updated++;
                 }
 
-                // Mark any requested IDs not returned as verified 0-listing entries so we don't re-poll endlessly
+                // Short 15-minute cooldown for unreturned batch IDs (ListingCount = -1 unknown, NOT 6-hour poisoned 0-listing)
+                var missingFetchUtc = now - CacheTtl + TimeSpan.FromMinutes(15);
                 foreach (var requestedId in itemIds)
                 {
                     if (!returnedIds.Contains(requestedId))
                     {
-                        cache[(world, requestedId)] = new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, now, 0);
+                        cache[(world, requestedId)] = new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, missingFetchUtc, -1);
                         updated++;
                     }
                 }
@@ -408,7 +426,7 @@ public sealed class UniversalisClient : IDisposable
                 lastError = ex.Message;
                 if (attempt < 2)
                 {
-                    await Task.Delay((attempt + 1) * 1500, ct).ConfigureAwait(false);
+                    await Task.Delay(1500 << attempt, ct).ConfigureAwait(false);
                 }
             }
         }
@@ -422,7 +440,7 @@ public sealed class UniversalisClient : IDisposable
         var minHq = ReadInt(el, "minPriceHQ");
         var minAny = ReadInt(el, "minPrice");
         var velocity = ReadFloat(el, "regularSaleVelocity");
-        var median = ComputeRecentHistoryMedian(el);
+        var (medianNq, medianHq) = ComputeRecentHistoryMedians(el);
 
         int listingCount;
         if (el.TryGetProperty("listingsCount", out var lcEl) && lcEl.ValueKind == JsonValueKind.Number && lcEl.TryGetInt32(out var lc))
@@ -438,37 +456,57 @@ public sealed class UniversalisClient : IDisposable
             listingCount = minAny > 0 ? 1 : 0;
         }
 
-        snapshot = new MarketPriceSnapshot(itemId, minNq, minHq, minAny, median, velocity, fetchedUtc, listingCount);
+        snapshot = new MarketPriceSnapshot(itemId, minNq, minHq, minAny, medianNq, velocity, fetchedUtc, listingCount, medianHq);
         return true;
     }
 
-    private static int ComputeRecentHistoryMedian(JsonElement el)
+    private static (int MedianNq, int MedianHq) ComputeRecentHistoryMedians(JsonElement el)
     {
         if (!el.TryGetProperty("recentHistory", out var histEl) || histEl.ValueKind != JsonValueKind.Array)
         {
-            return 0;
+            return (0, 0);
         }
 
-        var prices = new List<int>(8);
+        var nqPrices = new List<int>(8);
+        var hqPrices = new List<int>(8);
+        var allPrices = new List<int>(8);
         foreach (var entry in histEl.EnumerateArray())
         {
             var price = ReadInt(entry, "pricePerUnit");
-            if (price > 0)
+            if (price <= 0)
             {
-                prices.Add(price);
+                continue;
+            }
+
+            allPrices.Add(price);
+            var isHq = entry.TryGetProperty("hq", out var hqEl) && hqEl.ValueKind == JsonValueKind.True;
+            if (isHq)
+            {
+                hqPrices.Add(price);
+            }
+            else
+            {
+                nqPrices.Add(price);
             }
         }
 
-        if (prices.Count == 0)
+        static int Median(List<int> list)
         {
-            return 0;
+            if (list.Count == 0)
+            {
+                return 0;
+            }
+
+            list.Sort();
+            var mid = list.Count / 2;
+            return (list.Count & 1) == 1
+                ? list[mid]
+                : (list[mid - 1] + list[mid]) / 2;
         }
 
-        prices.Sort();
-        var mid = prices.Count / 2;
-        return (prices.Count & 1) == 1
-            ? prices[mid]
-            : (prices[mid - 1] + prices[mid]) / 2;
+        var medNq = nqPrices.Count > 0 ? Median(nqPrices) : Median(allPrices);
+        var medHq = Median(hqPrices);
+        return (medNq, medHq);
     }
 
     private static int ReadInt(JsonElement obj, string prop)
@@ -555,33 +593,43 @@ public sealed class UniversalisClient : IDisposable
 
     private void SaveDiskCache()
     {
-        try
+        lock (diskSaveGate)
         {
-            var dir = Path.GetDirectoryName(cacheFilePath);
-            if (!string.IsNullOrEmpty(dir))
+            try
             {
-                Directory.CreateDirectory(dir);
-            }
-
-            var dto = new DiskCacheDto();
-            foreach (var ((world, id), snap) in cache)
-            {
-                if (!dto.Worlds.TryGetValue(world, out var map))
+                var dir = Path.GetDirectoryName(cacheFilePath);
+                if (!string.IsNullOrEmpty(dir))
                 {
-                    map = new Dictionary<uint, MarketPriceSnapshot>();
-                    dto.Worlds[world] = map;
+                    Directory.CreateDirectory(dir);
                 }
 
-                map[id] = snap;
-            }
+                var cutoff = DateTime.UtcNow.AddDays(-3);
+                var dto = new DiskCacheDto();
+                foreach (var ((world, id), snap) in cache)
+                {
+                    if (snap.FetchedUtc < cutoff)
+                    {
+                        cache.TryRemove((world, id), out _);
+                        continue;
+                    }
 
-            var tempPath = cacheFilePath + ".tmp";
-            File.WriteAllText(tempPath, JsonSerializer.Serialize(dto));
-            File.Move(tempPath, cacheFilePath, overwrite: true);
-        }
-        catch (Exception ex)
-        {
-            log.Debug(ex, "Failed to persist Universalis disk cache.");
+                    if (!dto.Worlds.TryGetValue(world, out var map))
+                    {
+                        map = new Dictionary<uint, MarketPriceSnapshot>();
+                        dto.Worlds[world] = map;
+                    }
+
+                    map[id] = snap;
+                }
+
+                var tempPath = cacheFilePath + ".tmp";
+                File.WriteAllText(tempPath, JsonSerializer.Serialize(dto));
+                File.Move(tempPath, cacheFilePath, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                log.Debug(ex, "Failed to persist Universalis disk cache.");
+            }
         }
     }
 
@@ -596,12 +644,14 @@ public sealed class UniversalisClient : IDisposable
         {
         }
 
+        var stopped = false;
         try
         {
-            workerTask.Wait(TimeSpan.FromSeconds(1));
+            stopped = workerTask.Wait(TimeSpan.FromSeconds(2.5));
         }
         catch
         {
+            stopped = true;
         }
 
         if (cacheDirty)
@@ -610,8 +660,11 @@ public sealed class UniversalisClient : IDisposable
             SaveDiskCache();
         }
 
-        httpClient.Dispose();
-        wakeSignal.Dispose();
-        cts.Dispose();
+        if (stopped)
+        {
+            httpClient.Dispose();
+            wakeSignal.Dispose();
+            cts.Dispose();
+        }
     }
 }

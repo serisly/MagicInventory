@@ -33,7 +33,8 @@ public sealed record TransactionStep(
     Func<bool> HasServerAck,
     PacingProfile Pacing = PacingProfile.StandardSlot,
     string? SecondaryRequiredAddon = null,
-    double TimeoutSeconds = 4.0);
+    double TimeoutSeconds = 4.0,
+    int SkipOnFailureCount = 0);
 
 public sealed unsafe class SafeTransactionQueue : IDisposable
 {
@@ -197,7 +198,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             state = State.Idle;
         }
 
-        if (wasBusy)
+        if (wasActive)
         {
             LastOutcome = outcome;
             if (!string.IsNullOrWhiteSpace(echoReason))
@@ -206,6 +207,12 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             }
 
             BatchEnded?.Invoke(outcome, echoReason);
+        }
+        else if (wasBusy && LastOutcome == QueueBatchOutcome.None)
+        {
+            // All steps already completed; only trailing jitter was interrupted.
+            LastOutcome = QueueBatchOutcome.Succeeded;
+            BatchEnded?.Invoke(QueueBatchOutcome.Succeeded, null);
         }
     }
 
@@ -287,7 +294,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         else
         {
             var allowModalTransitionGrace = !string.IsNullOrEmpty(currentStep.SecondaryRequiredAddon)
-                && state == State.AwaitingAck;
+                && state is State.AwaitingAck or State.PostAckJitter;
             if (allowModalTransitionGrace)
             {
                 secondaryGraceStartedUtc ??= now;
@@ -335,6 +342,13 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
 
                 if (!dispatched)
                 {
+                    // Skip dependent follow-up steps (e.g. Deliver after failed Select, SetPrice+Confirm after failed Open)
+                    // so a skipped prerequisite never executes orphaned steps on the wrong modal.
+                    for (var skip = 0; skip < currentStep.SkipOnFailureCount && pendingSteps.Count > 0; skip++)
+                    {
+                        pendingSteps.Dequeue();
+                    }
+
                     consecutiveFailures++;
                     if (consecutiveFailures >= 2)
                     {
@@ -443,6 +457,8 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         return !condition[ConditionFlag.BetweenAreas]
             && !condition[ConditionFlag.BetweenAreas51]
             && !condition[ConditionFlag.InCombat]
+            && !condition[ConditionFlag.Casting]
+            && !condition[ConditionFlag.BoundByDuty]
             && !condition[ConditionFlag.OccupiedInCutSceneEvent]
             && !condition[ConditionFlag.Unconscious];
     }

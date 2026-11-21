@@ -294,7 +294,14 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                var pBase = HoldingsService.NormalizeBaseItemId(pSlot->ItemId);
+                var pBase = ItemIdentity.NormalizeBaseItemId(pSlot->ItemId);
+                if (!ItemIdentity.CanLockOrTagBaseId(pBase)
+                    || gearsetIds.Contains(pBase)
+                    || safety.IsItemTracked(pBase))
+                {
+                    continue;
+                }
+
                 if (!manifestEntries.TryGetValue(pBase, out var pEntry)
                     || !string.Equals(pEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
                     || pEntry.TargetRetainerId == 0
@@ -304,13 +311,23 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var pRow = itemSheet.GetRowOrDefault(pBase);
-                if (pRow is null)
+                if (pRow is null
+                    || ItemIdentity.IsSoulCrystal(pRow.Value)
+                    || pRow.Value.Rarity >= 4)
+                {
+                    continue;
+                }
+
+                if (!string.Equals(
+                        safety.ResolveEffectiveSlotRoute(pEntry, pRow.Value, pSlot, manifestEntries, gearsetIds, unlockedTop),
+                        "Retainer",
+                        StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
                 var pStack = (int)Math.Max(1, pRow.Value.StackSize);
-                var pHq = pSlot->ItemId >= 1_000_000 || pSlot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
+                var pHq = ItemIdentity.IsHighQuality(pSlot);
                 if (pStack > 1 && holdings.HasPartialStackOnRetainer(pEntry.TargetRetainerId, pBase, pHq))
                 {
                     continue;
@@ -737,9 +754,13 @@ public sealed unsafe class RetainerSortPlanner
                     playerExistingBaseIds.Add(cand.BaseItemId);
                 }
 
+                var movedQty = (!canSplit && fitsAnyPartial && !fitsCompletelyInPartial)
+                    ? Math.Min(effectiveQty, freeInPartials)
+                    : effectiveQty;
+
                 if (!withdrawAll)
                 {
-                    remainingNeeded[cand.BaseItemId] = Math.Max(0, needed - effectiveQty);
+                    remainingNeeded[cand.BaseItemId] = Math.Max(0, needed - movedQty);
                 }
 
                 trackedWithdrawCount++;

@@ -101,10 +101,16 @@ public sealed class Configuration : IPluginConfiguration
     public string MarketActionsDay { get; set; } = string.Empty;
     public int MarketActionsToday { get; set; }
 
+    [NonSerialized]
+    private CharacterProfile? fallbackProfile;
+
     public int GetRemainingMarketActionsToday()
     {
-        RollMarketDayIfNeeded();
-        return Math.Max(0, MarketDailyActionLimit - MarketActionsToday);
+        var today = DateTime.Now.ToString("yyyy-MM-dd");
+        var usedToday = string.Equals(MarketActionsDay, today, StringComparison.Ordinal)
+            ? MarketActionsToday
+            : 0;
+        return Math.Max(0, MarketDailyActionLimit - usedToday);
     }
 
     public void RecordMarketAction()
@@ -121,6 +127,24 @@ public sealed class Configuration : IPluginConfiguration
             MarketActionsDay = today;
             MarketActionsToday = 0;
         }
+    }
+
+    public static HashSet<string> GetOrCreateRetainerSpecialtySet(CharacterProfile profile, ulong retainerId)
+    {
+        if (!profile.RetainerSpecialties.TryGetValue(retainerId, out var set) || set == null)
+        {
+            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            profile.RetainerSpecialties[retainerId] = set;
+            return set;
+        }
+
+        if (!ReferenceEquals(set.Comparer, StringComparer.OrdinalIgnoreCase))
+        {
+            set = new HashSet<string>(set, StringComparer.OrdinalIgnoreCase);
+            profile.RetainerSpecialties[retainerId] = set;
+        }
+
+        return set;
     }
 
     /// <summary>
@@ -152,7 +176,7 @@ public sealed class Configuration : IPluginConfiguration
     {
         if (contentId == 0)
         {
-            return new CharacterProfile
+            fallbackProfile ??= new CharacterProfile
             {
                 TrackedRecipeId = TrackedRecipeId,
                 TrackedTitle = TrackedTitle,
@@ -161,6 +185,7 @@ public sealed class Configuration : IPluginConfiguration
                 TrackedItems = TrackedItems,
                 LockedItemIds = LockedItemIds,
             };
+            return fallbackProfile;
         }
 
         if (!Characters.TryGetValue(contentId, out var profile))

@@ -352,6 +352,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             return;
         }
 
+        var remainingToday = configuration.GetRemainingMarketActionsToday();
+        if (remainingToday <= 0)
+        {
+            chatGui.Print($"Magic Buy: daily limit reached ({configuration.MarketDailyActionLimit} Market Board actions). Buy the rest manually or raise the limit in Settings.");
+            return;
+        }
+
         var infoProxy = InfoProxyItemSearch.Instance();
         if (infoProxy == null || infoProxy->WaitingForListings || infoProxy->SearchItemId == 0)
         {
@@ -440,8 +447,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                             return false;
                         }
 
-                        if (!DoesPurchaseConfirmMatch(yesNo, captured.ItemName, captured.TotalCost))
+                        if (!DoesPurchaseConfirmMatch(yesNo, captured.ItemId, captured.ItemName, captured.UnitPrice, captured.Quantity, captured.TotalCost))
                         {
+                            if (yesNo->NoButton != null)
+                            {
+                                NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
+                            }
+
                             transactionQueue.Cancel("Purchase confirmation did not match selected listing.", QueueBatchOutcome.AbortedOnError);
                             return false;
                         }
@@ -457,6 +469,8 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 
                 if (HoldingsService.GetLiveBagCount(captured.ItemId) > singlePreBag)
                 {
+                    configuration.RecordMarketAction();
+                    configuration.Save(pluginInterface);
                     tracker.MarkDirty();
                     return true;
                 }
@@ -734,8 +748,19 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                     return;
                 }
 
-                if (!DoesPurchaseConfirmMatch(yesNo, activeCandidate.ItemName, activeCandidate.TotalCost))
+                if (!DoesPurchaseConfirmMatch(
+                        yesNo,
+                        activeCandidate.ItemId,
+                        activeCandidate.ItemName,
+                        activeCandidate.UnitPrice,
+                        activeCandidate.Quantity,
+                        activeCandidate.TotalCost))
                 {
+                    if (yesNo->NoButton != null)
+                    {
+                        NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
+                    }
+
                     StopAutoBuy("Magic Buy stopped: confirmation dialog did not match listing.");
                     return;
                 }
@@ -1189,7 +1214,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         return normalized;
     }
 
-    private static bool DoesPurchaseConfirmMatch(AddonSelectYesno* yesNo, string expectedName, uint expectedTotalCost)
+    private bool DoesPurchaseConfirmMatch(
+        AddonSelectYesno* yesNo,
+        uint baseItemId,
+        string expectedName,
+        uint unitPrice,
+        uint quantity,
+        uint expectedTotalCost)
     {
         if (yesNo == null || yesNo->PromptText == null || string.IsNullOrWhiteSpace(expectedName))
         {
@@ -1203,14 +1234,39 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         }
 
         var cleanName = NativeUiHelpers.NormalizeItemLabel(expectedName);
-        if (!prompt.Contains(cleanName, StringComparison.OrdinalIgnoreCase))
+        var nameMatches = prompt.Contains(cleanName, StringComparison.OrdinalIgnoreCase);
+        if (!nameMatches && quantity > 1 && baseItemId > 0)
+        {
+            var plural = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId)?.Plural.ExtractText();
+            if (!string.IsNullOrWhiteSpace(plural))
+            {
+                nameMatches = prompt.Contains(NativeUiHelpers.NormalizeItemLabel(plural), StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        if (!nameMatches)
         {
             return false;
         }
 
-        var costFormatted = expectedTotalCost.ToString("N0");
-        return prompt.Contains(costFormatted, StringComparison.Ordinal)
-            || prompt.Contains(expectedTotalCost.ToString(), StringComparison.Ordinal);
+        // FFXIV displays subtotal (unitPrice * quantity) separately from cross-city tax fee on taxed listings.
+        // Accept either exact total cost OR subtotal (in both comma-formatted InvariantCulture and raw digits).
+        var subtotal = (long)unitPrice * Math.Max(1u, quantity);
+        return PromptContainsGilAmount(prompt, expectedTotalCost)
+            || PromptContainsGilAmount(prompt, subtotal);
+    }
+
+    private static bool PromptContainsGilAmount(string prompt, long amount)
+    {
+        if (amount <= 0)
+        {
+            return false;
+        }
+
+        var formatted = amount.ToString("N0", System.Globalization.CultureInfo.InvariantCulture);
+        var raw = amount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return prompt.Contains(formatted, StringComparison.Ordinal)
+            || prompt.Contains(raw, StringComparison.Ordinal);
     }
 
     private void TransitionTo(AutoBuyState nextState, DateTime now, int delayMs)

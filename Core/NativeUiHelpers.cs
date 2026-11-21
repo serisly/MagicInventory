@@ -49,7 +49,7 @@ public static unsafe class NativeUiHelpers
     }
 
     public static string NormalizeItemLabel(string raw)
-        => raw.Trim().TrimEnd('\uE03C', '', ' ');
+        => raw.Trim().TrimEnd('\uE03C', ' ');
 
     public static AtkComponentButton* FindEnabledButtonByLabel(
         AtkUnitBase* addon,
@@ -129,14 +129,41 @@ public static unsafe class NativeUiHelpers
             return false;
         }
 
+        // Walk the AtkEvent linked list for an actual ButtonClick event owned by this addon
+        // so we never blindly fire an unrelated hover/focus/injected head event.
         var evt = owner->AtkResNode.AtkEventManager.Event;
-        if (evt == null)
+        AtkEvent* matched = null;
+        AtkEvent* fallbackClick = null;
+        var guard = 0;
+        while (evt != null && guard++ < 64)
+        {
+            if (evt->State.EventType == AtkEventType.ButtonClick)
+            {
+                if (evt->Listener == (AtkEventListener*)addon)
+                {
+                    matched = evt;
+                    break;
+                }
+
+                if (fallbackClick == null)
+                {
+                    fallbackClick = evt;
+                }
+            }
+
+            evt = evt->NextEvent;
+        }
+
+        var target = matched != null
+            ? matched
+            : (fallbackClick != null ? fallbackClick : owner->AtkResNode.AtkEventManager.Event);
+        if (target == null)
         {
             return false;
         }
 
         var eventData = default(AtkEventData);
-        addon->ReceiveEvent(evt->State.EventType, (int)evt->Param, evt, &eventData);
+        addon->ReceiveEvent(target->State.EventType, (int)target->Param, target, &eventData);
         return true;
     }
 

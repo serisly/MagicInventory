@@ -67,7 +67,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         public required MagicActionIntent Intent { get; init; }
         public required string StationName { get; init; }
         public required Vector3 OriginPosition { get; init; }
-        public required DateTime StartedUtc { get; init; }
+        public required DateTime StartedUtc { get; set; }
         public DateTime ReadyAtUtc { get; set; } = DateTime.MinValue;
         public bool ClickedSubMenu { get; set; }
     }
@@ -218,6 +218,12 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
                 {
                     magicSort.ExecuteArmoireStore();
+                    return true;
+                }
+
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
+                {
+                    magicSort.ExecuteGlamourDresserStore();
                     return true;
                 }
 
@@ -395,17 +401,37 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 {
                     if (WaitHumanBeat(req, now))
                     {
-                        pendingStation = null;
-                        magicSort.ExecuteGrandCompanySort();
+                        var gcAddon = (FFXIVClientStructs.FFXIV.Client.UI.AddonGrandCompanySupplyList*)NativeUiHelpers.GetReadyAddon(gameGui, "GrandCompanySupplyList");
+                        if (gcAddon != null && gcAddon->SelectedTab != 2)
+                        {
+                            // Switch to Expert Delivery tab first, then wait a beat and deliver automatically
+                            magicSort.ExecuteGrandCompanySort();
+                            req.ReadyAtUtc = DateTime.MinValue;
+                            req.StartedUtc = now;
+                        }
+                        else
+                        {
+                            pendingStation = null;
+                            magicSort.ExecuteGrandCompanySort();
+                        }
                     }
                 }
                 else if (!req.ClickedSubMenu
                     && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString"))
                 {
-                    if (WaitHumanBeat(req, now) && TryClickGcSupplyMenuEntry())
+                    if (WaitHumanBeat(req, now))
                     {
-                        req.ClickedSubMenu = true;
-                        req.ReadyAtUtc = DateTime.MinValue;
+                        if (TryClickGcSupplyMenuEntry())
+                        {
+                            req.ClickedSubMenu = true;
+                            req.ReadyAtUtc = DateTime.MinValue;
+                            req.StartedUtc = now;
+                        }
+                        else
+                        {
+                            pendingStation = null;
+                            chatGui.Print("Open the Grand Company Expert Delivery tab, then click Magic Sell.");
+                        }
                     }
                 }
 

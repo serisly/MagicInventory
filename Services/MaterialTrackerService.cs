@@ -73,6 +73,7 @@ public sealed unsafe class MaterialTrackerService
     private DateTime lastSnapshotUtc = DateTime.MinValue;
     private TrackerSnapshot cachedSnapshot = new(string.Empty, Array.Empty<TrackedMaterialLine>());
     private bool dirty = true;
+    private Dictionary<uint, List<uint>>? recipesByResultItemId;
 
     // Self-terminating native Quick Synthesis starter (zero idle polling; 6s hard timeout)
     private enum PendingCraftStage { None, WaitingForRecipeNote, WaitingForQuickSynthDialog }
@@ -116,11 +117,10 @@ public sealed unsafe class MaterialTrackerService
 
     public bool IsItemTracked(uint baseItemId)
     {
-        var normalized = HoldingsService.NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
         return normalized != 0
-            && ActiveProfile.TrackedRecipeId == 0
-            && ActiveProfile.TrackedItems.Count == 1
-            && ActiveProfile.TrackedItems.ContainsKey(normalized);
+            && ActiveProfile.TrackedItems.TryGetValue(normalized, out var needed)
+            && needed > 0;
     }
 
     public string CraftCountModeLabel
@@ -329,40 +329,51 @@ public sealed unsafe class MaterialTrackerService
         dirty = true;
     }
 
-    public bool HasRecipeForItem(uint rawItemId)
+    private Dictionary<uint, List<uint>> GetRecipeLookup()
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-        if (baseId == 0)
+        if (recipesByResultItemId != null)
         {
-            return false;
+            return recipesByResultItemId;
         }
 
+        var map = new Dictionary<uint, List<uint>>(8192);
         var recipeSheet = dataManager.GetExcelSheet<Recipe>();
-        if (recipeSheet == null)
+        if (recipeSheet != null)
         {
-            return false;
-        }
-
-        foreach (var row in recipeSheet)
-        {
-            if (row.ItemResult.RowId == baseId && row.CraftType.RowId < CraftTypeToClassJobId.Length)
+            foreach (var row in recipeSheet)
             {
-                return true;
+                var resId = row.ItemResult.RowId;
+                if (resId == 0 || row.CraftType.RowId >= CraftTypeToClassJobId.Length)
+                {
+                    continue;
+                }
+
+                if (!map.TryGetValue(resId, out var list))
+                {
+                    list = new List<uint>(1);
+                    map[resId] = list;
+                }
+
+                list.Add(row.RowId);
             }
         }
 
-        return false;
+        recipesByResultItemId = map;
+        return map;
     }
 
-    public bool TrackRecipeForResultItem(uint rawItemId, out string statusMessage)
+    public bool HasRecipeForItem(uint rawItemId)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        return baseId != 0 && GetRecipeLookup().ContainsKey(baseId);
+    }
+
+    private bool TryResolveBestRecipeForItem(uint baseId, out Recipe recipe)
+    {
+        recipe = default;
         var recipeSheet = dataManager.GetExcelSheet<Recipe>();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
-        if (baseId == 0 || recipeSheet == null || itemSheet == null)
+        if (baseId == 0 || recipeSheet == null || !GetRecipeLookup().TryGetValue(baseId, out var recipeIds))
         {
-            statusMessage = "Recipe data is not available.";
             return false;
         }
 
@@ -370,9 +381,9 @@ public sealed unsafe class MaterialTrackerService
         var currentJobId = ps != null ? (uint)ps->CurrentClassJobId : 0u;
         Recipe? chosen = null;
 
-        foreach (var row in recipeSheet)
+        foreach (var rid in recipeIds)
         {
-            if (row.ItemResult.RowId != baseId || row.CraftType.RowId >= CraftTypeToClassJobId.Length)
+            if (!recipeSheet.TryGetRow(rid, out var row) || row.CraftType.RowId >= CraftTypeToClassJobId.Length)
             {
                 continue;
             }
@@ -389,14 +400,51 @@ public sealed unsafe class MaterialTrackerService
 
         if (chosen is null)
         {
+            return false;
+        }
+
+        recipe = chosen.Value;
+        return true;
+    }
+
+    private void FlattenCraftMultiplierIntoItems(CharacterProfile profile)
+    {
+        var mult = Math.Max(1, profile.TrackedCraftCount);
+        if (mult > 1 && profile.TrackedItems.Count > 0)
+        {
+            foreach (var key in profile.TrackedItems.Keys.ToArray())
+            {
+                profile.TrackedItems[key] = profile.TrackedItems[key] * mult;
+            }
+        }
+
+        profile.TrackedCraftCount = 1;
+    }
+
+    public bool TrackRecipeForResultItem(uint rawItemId, out string statusMessage)
+        => TrackRecipeForResultItem(rawItemId, addToExistingList: false, out statusMessage);
+
+    public bool AddRecipeToList(uint rawItemId, out string statusMessage)
+        => TrackRecipeForResultItem(rawItemId, addToExistingList: true, out statusMessage);
+
+    private bool TrackRecipeForResultItem(uint rawItemId, bool addToExistingList, out string statusMessage)
+    {
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        var itemSheet = dataManager.GetExcelSheet<Item>();
+        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
+        if (baseId == 0 || itemSheet == null)
+        {
+            statusMessage = "Recipe data is not available.";
+            return false;
+        }
+
+        if (!TryResolveBestRecipeForItem(baseId, out var recipe))
+        {
             statusMessage = "No crafting recipe found for this item.";
             return false;
         }
 
-        var recipe = chosen.Value;
-        var profile = ActiveProfile;
-        profile.TrackedItems.Clear();
-
+        var ingredients = new Dictionary<uint, int>();
         var ingCount = Math.Min(6, Math.Min(recipe.Ingredient.Count, recipe.AmountIngredient.Count));
         for (var i = 0; i < ingCount; i++)
         {
@@ -407,16 +455,42 @@ public sealed unsafe class MaterialTrackerService
                 continue;
             }
 
-            profile.TrackedItems[ingId] = profile.TrackedItems.GetValueOrDefault(ingId) + amt;
+            ingredients[ingId] = ingredients.GetValueOrDefault(ingId) + amt;
         }
 
-        if (profile.TrackedItems.Count == 0)
+        if (ingredients.Count == 0)
         {
             statusMessage = "This recipe has no trackable ingredients.";
             return false;
         }
 
         var recipeName = itemSheet.TryGetRow(baseId, out var resItem) ? resItem.Name.ExtractText() : $"Recipe #{recipe.RowId}";
+        var profile = ActiveProfile;
+        var mergingIntoExisting = addToExistingList && profile.TrackedItems.Count > 0;
+
+        if (mergingIntoExisting)
+        {
+            FlattenCraftMultiplierIntoItems(profile);
+            foreach (var (ingId, amt) in ingredients)
+            {
+                profile.TrackedItems[ingId] = profile.TrackedItems.GetValueOrDefault(ingId) + amt;
+            }
+
+            profile.TrackedRecipeId = 0;
+            profile.TrackedTitle = $"Tracked List ({profile.TrackedItems.Count} items)";
+            profile.TrackWithdrawAllStacks = false;
+            config.Save(pluginInterface);
+            dirty = true;
+            statusMessage = $"Added {recipeName} ingredients to tracked list ({profile.TrackedItems.Count} items).";
+            return true;
+        }
+
+        profile.TrackedItems.Clear();
+        foreach (var (ingId, amt) in ingredients)
+        {
+            profile.TrackedItems[ingId] = amt;
+        }
+
         profile.TrackedRecipeId = recipe.RowId;
         profile.TrackedTitle = recipeName;
         profile.TrackedCraftCount = 1;
@@ -433,22 +507,60 @@ public sealed unsafe class MaterialTrackerService
         return true;
     }
 
-    public void ToggleSingleItem(uint rawItemId)
+    public void AddItemToList(uint rawItemId, out string statusMessage)
     {
-        var baseItemId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseItemId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         if (baseItemId == 0)
         {
-            return;
-        }
-
-        if (IsItemTracked(baseItemId))
-        {
-            ClearAll();
+            statusMessage = string.Empty;
             return;
         }
 
         var itemSheet = dataManager.GetExcelSheet<Item>();
-        var itemName = itemSheet.TryGetRow(baseItemId, out var row)
+        var itemName = itemSheet != null && itemSheet.TryGetRow(baseItemId, out var row)
+            ? row.Name.ExtractText()
+            : $"Item #{baseItemId}";
+
+        var profile = ActiveProfile;
+        if (profile.TrackedItems.Count == 0)
+        {
+            TrackItemOnly(rawItemId, out statusMessage);
+            return;
+        }
+
+        FlattenCraftMultiplierIntoItems(profile);
+        var summary = holdings.GetHoldingSummary(baseItemId);
+        if (profile.TrackedItems.TryGetValue(baseItemId, out var existing))
+        {
+            profile.TrackedItems[baseItemId] = Math.Max(existing + 1, summary.BagCount + 1);
+            statusMessage = $"Updated {itemName} in tracked list (target: {profile.TrackedItems[baseItemId]}).";
+        }
+        else
+        {
+            profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
+            statusMessage = $"Added {itemName} to tracked list ({profile.TrackedItems.Count} items).";
+        }
+
+        profile.TrackedRecipeId = 0;
+        profile.TrackedTitle = profile.TrackedItems.Count == 1
+            ? itemName
+            : $"Tracked List ({profile.TrackedItems.Count} items)";
+        profile.TrackWithdrawAllStacks = false;
+        config.Save(pluginInterface);
+        dirty = true;
+    }
+
+    public void TrackItemOnly(uint rawItemId, out string statusMessage)
+    {
+        var baseItemId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        if (baseItemId == 0)
+        {
+            statusMessage = string.Empty;
+            return;
+        }
+
+        var itemSheet = dataManager.GetExcelSheet<Item>();
+        var itemName = itemSheet != null && itemSheet.TryGetRow(baseItemId, out var row)
             ? row.Name.ExtractText()
             : $"Item #{baseItemId}";
 
@@ -462,6 +574,61 @@ public sealed unsafe class MaterialTrackerService
         profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
         config.Save(pluginInterface);
         dirty = true;
+        statusMessage = $"Tracking only: {itemName}.";
+    }
+
+    public void RemoveItemFromList(uint rawItemId, out string statusMessage)
+    {
+        var baseItemId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        var profile = ActiveProfile;
+        if (baseItemId == 0 || !profile.TrackedItems.Remove(baseItemId))
+        {
+            statusMessage = string.Empty;
+            return;
+        }
+
+        var itemSheet = dataManager.GetExcelSheet<Item>();
+        var itemName = itemSheet != null && itemSheet.TryGetRow(baseItemId, out var row)
+            ? row.Name.ExtractText()
+            : $"Item #{baseItemId}";
+
+        if (profile.TrackedItems.Count == 0)
+        {
+            profile.TrackedRecipeId = 0;
+            profile.TrackedTitle = string.Empty;
+            statusMessage = $"Removed {itemName}; tracked list is now empty.";
+        }
+        else
+        {
+            profile.TrackedRecipeId = 0;
+            if (profile.TrackedItems.Count == 1)
+            {
+                var remainingId = profile.TrackedItems.Keys.First();
+                profile.TrackedTitle = itemSheet != null && itemSheet.TryGetRow(remainingId, out var remRow)
+                    ? remRow.Name.ExtractText()
+                    : $"Item #{remainingId}";
+            }
+            else
+            {
+                profile.TrackedTitle = $"Tracked List ({profile.TrackedItems.Count} items)";
+            }
+
+            statusMessage = $"Removed {itemName} from tracked list ({profile.TrackedItems.Count} left).";
+        }
+
+        config.Save(pluginInterface);
+        dirty = true;
+    }
+
+    public void ToggleSingleItem(uint rawItemId)
+    {
+        if (IsItemTracked(rawItemId))
+        {
+            RemoveItemFromList(rawItemId, out _);
+            return;
+        }
+
+        TrackItemOnly(rawItemId, out _);
     }
 
     public void ClearAll()
@@ -923,7 +1090,7 @@ public sealed unsafe class MaterialTrackerService
             var gm = RaptureGearsetModule.Instance();
             if (gm != null)
             {
-                for (var i = 0; i < 100; i++)
+                for (var i = 0; i < gm->Entries.Length; i++)
                 {
                     var entry = gm->GetGearset(i);
                     if (entry != null && entry->Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists) && entry->ClassJob == reqJobId)
@@ -952,14 +1119,11 @@ public sealed unsafe class MaterialTrackerService
                 && active.Ingredients.Count == profile.TrackedItems.Count
                 && active.Ingredients.All(i => profile.TrackedItems.TryGetValue(i.ItemId, out var q) && q == i.Amount))
             {
-                profile.TrackedRecipeId = active.RecipeId;
-                profile.TrackedTitle = active.Name;
-                config.Save(pluginInterface);
                 return active.Name;
             }
         }
 
-        return lines.Count == 1 ? lines[0].Name : "Tracked Materials";
+        return lines.Count == 1 ? lines[0].Name : $"Tracked List ({lines.Count} items)";
     }
 
     public string? GetOpenRetainerAddonName()

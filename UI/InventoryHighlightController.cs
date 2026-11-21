@@ -29,29 +29,6 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     // Crisp teal for items leaving retainer bags (tracked materials / Market / Vendor / misplaced withdrawals)
     private static readonly (short R, short G, short B) RetainerWithdrawTint = (-18, 64, 76);
 
-    private static readonly string[] ExpansionGridAddons =
-    [
-        "InventoryGrid0E",
-        "InventoryGrid1E",
-        "InventoryGrid2E",
-        "InventoryGrid3E",
-    ];
-
-    private static readonly string[] LargeGridAddons =
-    [
-        "InventoryGrid0",
-        "InventoryGrid1",
-    ];
-
-    private static readonly string[] RetainerGridAddons =
-    [
-        "RetainerGrid0",
-        "RetainerGrid1",
-        "RetainerGrid2",
-        "RetainerGrid3",
-        "RetainerGrid4",
-    ];
-
     private static readonly string[] AllGridAddons =
     [
         "InventoryGrid0E",
@@ -68,23 +45,6 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         "RetainerGrid4",
         "RetainerGrid",
         "ArmouryBoard",
-    ];
-
-    // Standard 12 Armoury Chest tab order: Left 6 top-to-bottom, Right 6 top-to-bottom.
-    private static readonly InventoryType[] ArmouryTabContainers =
-    [
-        InventoryType.ArmoryMainHand,
-        InventoryType.ArmoryHead,
-        InventoryType.ArmoryBody,
-        InventoryType.ArmoryHands,
-        InventoryType.ArmoryLegs,
-        InventoryType.ArmoryFeets,
-        InventoryType.ArmoryOffHand,
-        InventoryType.ArmoryEar,
-        InventoryType.ArmoryNeck,
-        InventoryType.ArmoryWrist,
-        InventoryType.ArmoryRings,
-        InventoryType.ArmorySoulCrystal,
     ];
 
     private readonly IFramework framework;
@@ -241,11 +201,21 @@ public sealed unsafe class InventoryHighlightController : IDisposable
                 {
                     desiredNodes[key] = DepositOrSellTint;
                 }
+
+                foreach (var key in ResolveArmouryVisualHighlightNodes(depositSlots))
+                {
+                    desiredNodes[key] = DepositOrSellTint;
+                }
             }
 
             if (withdrawSlots.Count > 0)
             {
                 foreach (var key in ResolveRetainerVisualHighlightNodes(withdrawSlots))
+                {
+                    desiredNodes[key] = RetainerWithdrawTint;
+                }
+
+                foreach (var key in ResolveArmouryVisualHighlightNodes(withdrawSlots))
                 {
                     desiredNodes[key] = RetainerWithdrawTint;
                 }
@@ -427,26 +397,12 @@ public sealed unsafe class InventoryHighlightController : IDisposable
                     continue;
                 }
 
-                var rx = 0f;
-                var ry = 0f;
-                var sx = 1f;
-                var sy = 1f;
-                var cur = owner;
-                while (cur != null && cur->ParentNode != null)
+                if (!InventoryGridLayout.TryGetNodeScreenRect(menu, owner, vpPos, out var min, out var max))
                 {
-                    rx = rx * cur->ScaleX + cur->X;
-                    ry = ry * cur->ScaleY + cur->Y;
-                    sx *= cur->ScaleX;
-                    sy *= cur->ScaleY;
-                    cur = cur->ParentNode;
+                    continue;
                 }
 
-                var left = vpPos.X + menu->X + rx * addonScale;
-                var top = vpPos.Y + menu->Y + ry * addonScale;
-                var width = owner->Width * sx * addonScale;
-                var height = owner->Height * sy * addonScale;
-
-                if (mouse.X >= left && mouse.X <= left + width && mouse.Y >= top && mouse.Y <= top + height)
+                if (mouse.X >= min.X && mouse.X <= max.X && mouse.Y >= min.Y && mouse.Y <= max.Y)
                 {
                     hoveredIdx = i;
                     break;
@@ -454,11 +410,7 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             }
         }
 
-        if (hoveredIdx < 0 || hoveredIdx >= activeRowCount)
-        {
-            hoveredIdx = list->SelectedItemIndex;
-        }
-
+        // Only highlight while actively hovering a row (do NOT fall back to sticky SelectedItemIndex on unhover!)
         if (hoveredIdx < 0 || hoveredIdx >= activeRowCount)
         {
             return false;
@@ -480,136 +432,22 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     /// completely independent of client language or ULD node ID order.
     /// </summary>
     public static int GetActiveArmouryTabIndex(IGameGui gameGui)
-    {
-        var armoury = NativeUiHelpers.GetReadyAddon(gameGui, "ArmouryBoard");
-        if (armoury == null || !armoury->IsVisible)
-        {
-            return -1;
-        }
-
-        var buttons = new List<(float X, float Y, bool Selected)>(12);
-        for (uint nodeId = 7; nodeId <= 18; nodeId++)
-        {
-            var node = armoury->GetNodeById(nodeId);
-            if (node == null)
-            {
-                continue;
-            }
-
-            var radio = node->GetAsAtkComponentRadioButton();
-            if (radio == null)
-            {
-                continue;
-            }
-
-            buttons.Add((node->X, node->Y, radio->IsSelected));
-        }
-
-        if (buttons.Count != 12)
-        {
-            // Fallback: find any selected radio button directly in 7..18
-            for (var i = 0; i < buttons.Count; i++)
-            {
-                if (buttons[i].Selected)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
-        }
-
-        // Split into left column (6 smallest X) and right column (6 largest X), each sorted top-to-bottom by Y
-        buttons.Sort((a, b) => a.X.CompareTo(b.X));
-        var left = buttons.GetRange(0, 6);
-        var right = buttons.GetRange(6, 6);
-        left.Sort((a, b) => a.Y.CompareTo(b.Y));
-        right.Sort((a, b) => a.Y.CompareTo(b.Y));
-
-        for (var i = 0; i < 6; i++)
-        {
-            if (left[i].Selected)
-            {
-                return i;
-            }
-        }
-
-        for (var i = 0; i < 6; i++)
-        {
-            if (right[i].Selected)
-            {
-                return 6 + i;
-            }
-        }
-
-        return -1;
-    }
+        => InventoryGridLayout.GetActiveArmouryTabIndex(gameGui);
 
     public static InventoryType? GetActiveArmouryTabContainer(IGameGui gameGui)
-    {
-        var tabIdx = GetActiveArmouryTabIndex(gameGui);
-        return tabIdx >= 0 && tabIdx < ArmouryTabContainers.Length
-            ? ArmouryTabContainers[tabIdx]
-            : null;
-    }
+        => InventoryGridLayout.GetActiveArmouryTabContainer(gameGui);
 
     private HashSet<(string AddonName, uint NodeId)> ResolveArmouryVisualHighlightNodes(
         HashSet<(InventoryType Container, int Slot)> physicalTargets)
     {
         var result = new HashSet<(string AddonName, uint NodeId)>();
-        var tabIdx = GetActiveArmouryTabIndex(gameGui);
-        if (tabIdx < 0 || tabIdx >= ArmouryTabContainers.Length)
+        var visible = new List<InventoryGridLayout.VisualGridSlot>(50);
+        InventoryGridLayout.CollectVisibleArmourySlots(gameGui, visible);
+        foreach (var vs in visible)
         {
-            return result;
-        }
-
-        var activeContainer = ArmouryTabContainers[tabIdx];
-        var orderModule = ItemOrderModule.Instance();
-        ItemOrderModuleSorter* sorter = null;
-        if (orderModule != null)
-        {
-            sorter = tabIdx switch
+            if (physicalTargets.Contains((vs.Container, vs.PhysicalSlot)))
             {
-                0 => orderModule->ArmouryMainHandSorter,
-                1 => orderModule->ArmouryHeadSorter,
-                2 => orderModule->ArmouryBodySorter,
-                3 => orderModule->ArmouryHandsSorter,
-                4 => orderModule->ArmouryLegsSorter,
-                5 => orderModule->ArmouryFeetSorter,
-                6 => orderModule->ArmouryOffHandSorter,
-                7 => orderModule->ArmouryEarsSorter,
-                8 => orderModule->ArmouryNeckSorter,
-                9 => orderModule->ArmouryWristsSorter,
-                10 => orderModule->ArmouryRingsSorter,
-                11 => orderModule->ArmourySoulCrystalSorter,
-                _ => null,
-            };
-        }
-
-        if (sorter != null && sorter->Items.Count > 0)
-        {
-            for (var v = 0; v < sorter->Items.Count && v < 50; v++)
-            {
-                var entryPtr = sorter->Items[v].Value;
-                if (entryPtr == null)
-                {
-                    continue;
-                }
-
-                if (physicalTargets.Contains((activeContainer, entryPtr->Slot)))
-                {
-                    result.Add(("ArmouryBoard", (uint)(71 + v)));
-                }
-            }
-        }
-        else
-        {
-            foreach (var (container, slot) in physicalTargets)
-            {
-                if (container == activeContainer && slot is >= 0 and < 50)
-                {
-                    result.Add(("ArmouryBoard", (uint)(71 + slot)));
-                }
+                result.Add((vs.AddonName, vs.NodeId));
             }
         }
 
@@ -620,95 +458,13 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         HashSet<(InventoryType Container, int Slot)> physicalTargets)
     {
         var result = new HashSet<(string AddonName, uint NodeId)>();
-
-        // Build visual slot list (page 0..3, slot 0..34) from ItemOrderModule.InventorySorter
-        var visualCoords = new List<(int Page, int Slot)>(physicalTargets.Count);
-        var orderModule = ItemOrderModule.Instance();
-        var sorter = orderModule != null ? orderModule->InventorySorter : null;
-
-        if (sorter != null && sorter->Items.Count > 0)
+        var visible = new List<InventoryGridLayout.VisualGridSlot>(140);
+        InventoryGridLayout.CollectVisiblePlayerBagSlots(gameGui, visible);
+        foreach (var vs in visible)
         {
-            var perPage = sorter->ItemsPerPage > 0 ? sorter->ItemsPerPage : 35;
-            for (var v = 0; v < sorter->Items.Count; v++)
+            if (physicalTargets.Contains((vs.Container, vs.PhysicalSlot)))
             {
-                var entryPtr = sorter->Items[v].Value;
-                if (entryPtr == null)
-                {
-                    continue;
-                }
-
-                var physType = entryPtr->Page switch
-                {
-                    0 => InventoryType.Inventory1,
-                    1 => InventoryType.Inventory2,
-                    2 => InventoryType.Inventory3,
-                    3 => InventoryType.Inventory4,
-                    _ => InventoryType.Invalid,
-                };
-
-                if (physType != InventoryType.Invalid && physicalTargets.Contains((physType, entryPtr->Slot)))
-                {
-                    visualCoords.Add((v / perPage, v % perPage));
-                }
-            }
-        }
-        else
-        {
-            foreach (var (container, slot) in physicalTargets)
-            {
-                var page = container switch
-                {
-                    InventoryType.Inventory1 => 0,
-                    InventoryType.Inventory2 => 1,
-                    InventoryType.Inventory3 => 2,
-                    InventoryType.Inventory4 => 3,
-                    _ => -1,
-                };
-                if (page >= 0 && slot is >= 0 and < 35)
-                {
-                    visualCoords.Add((page, slot));
-                }
-            }
-        }
-
-        if (visualCoords.Count == 0)
-        {
-            return result;
-        }
-
-        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryExpansion"))
-        {
-            foreach (var (page, slot) in visualCoords)
-            {
-                if (page is >= 0 and < 4)
-                {
-                    result.Add((ExpansionGridAddons[page], (uint)(slot + 3)));
-                }
-            }
-        }
-        else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryLarge"))
-        {
-            var invLarge = NativeUiHelpers.GetReadyAddon(gameGui, "InventoryLarge");
-            var tabOffset = invLarge != null && invLarge->AtkValuesCount > 0 && invLarge->AtkValues[0].Int == 1 ? 2 : 0;
-            foreach (var (page, slot) in visualCoords)
-            {
-                var relPage = page - tabOffset;
-                if (relPage is >= 0 and < 2)
-                {
-                    result.Add((LargeGridAddons[relPage], (uint)(slot + 3)));
-                }
-            }
-        }
-        else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Inventory"))
-        {
-            var inv = NativeUiHelpers.GetReadyAddon(gameGui, "Inventory");
-            var activeTab = inv != null && inv->AtkValuesCount > 0 ? inv->AtkValues[0].Int : 0;
-            foreach (var (page, slot) in visualCoords)
-            {
-                if (page == activeTab)
-                {
-                    result.Add(("InventoryGrid", (uint)(slot + 3)));
-                }
+                result.Add((vs.AddonName, vs.NodeId));
             }
         }
 
@@ -719,92 +475,13 @@ public sealed unsafe class InventoryHighlightController : IDisposable
         HashSet<(InventoryType Container, int Slot)> physicalTargets)
     {
         var result = new HashSet<(string AddonName, uint NodeId)>();
-
-        // Build visual slot list (page 0..4, slot 0..34) from ItemOrderModule.GetActiveRetainerSorter()
-        var visualCoords = new List<(int Page, int Slot)>(physicalTargets.Count);
-        var orderModule = ItemOrderModule.Instance();
-        var sorter = orderModule != null ? orderModule->GetActiveRetainerSorter() : null;
-
-        if (sorter != null && sorter->Items.Count > 0)
+        var visible = new List<InventoryGridLayout.VisualGridSlot>(175);
+        InventoryGridLayout.CollectVisibleRetainerSlots(gameGui, visible);
+        foreach (var vs in visible)
         {
-            var perPage = sorter->ItemsPerPage > 0 ? sorter->ItemsPerPage : 35;
-            for (var v = 0; v < sorter->Items.Count; v++)
+            if (physicalTargets.Contains((vs.Container, vs.PhysicalSlot)))
             {
-                var entryPtr = sorter->Items[v].Value;
-                if (entryPtr == null)
-                {
-                    continue;
-                }
-
-                var physType = entryPtr->Page switch
-                {
-                    0 => InventoryType.RetainerPage1,
-                    1 => InventoryType.RetainerPage2,
-                    2 => InventoryType.RetainerPage3,
-                    3 => InventoryType.RetainerPage4,
-                    4 => InventoryType.RetainerPage5,
-                    5 => InventoryType.RetainerPage6,
-                    6 => InventoryType.RetainerPage7,
-                    _ => InventoryType.Invalid,
-                };
-
-                if (physType != InventoryType.Invalid && physicalTargets.Contains((physType, entryPtr->Slot)))
-                {
-                    visualCoords.Add((v / perPage, v % perPage));
-                }
-            }
-        }
-        else
-        {
-            // Fallback linear mapping: 7 physical pages x 25 slots -> 5 visual pages x 35 slots
-            foreach (var (container, slot) in physicalTargets)
-            {
-                var rawPage = container switch
-                {
-                    InventoryType.RetainerPage1 => 0,
-                    InventoryType.RetainerPage2 => 1,
-                    InventoryType.RetainerPage3 => 2,
-                    InventoryType.RetainerPage4 => 3,
-                    InventoryType.RetainerPage5 => 4,
-                    InventoryType.RetainerPage6 => 5,
-                    InventoryType.RetainerPage7 => 6,
-                    _ => -1,
-                };
-                if (rawPage >= 0 && slot is >= 0 and < 25)
-                {
-                    var flatIndex = rawPage * 25 + slot;
-                    visualCoords.Add((flatIndex / 35, flatIndex % 35));
-                }
-            }
-        }
-
-        if (visualCoords.Count == 0)
-        {
-            return result;
-        }
-
-        // RetainerGrid0..4 (visible per active retainer view/tab in InventoryRetainerLarge & InventoryRetainer)
-        var matchedNamedGrid = false;
-        foreach (var (page, slot) in visualCoords)
-        {
-            if (page is >= 0 and < 5 && NativeUiHelpers.IsAddonOpenAndReady(gameGui, RetainerGridAddons[page]))
-            {
-                result.Add((RetainerGridAddons[page], (uint)(slot + 3)));
-                matchedNamedGrid = true;
-            }
-        }
-
-        // Fallback if single RetainerGrid addon is used
-        if (!matchedNamedGrid && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerGrid"))
-        {
-            var retAddon = NativeUiHelpers.GetReadyAddon(gameGui, "InventoryRetainer");
-            var activeTab = retAddon != null && retAddon->AtkValuesCount > 0 ? retAddon->AtkValues[0].Int : 0;
-            foreach (var (page, slot) in visualCoords)
-            {
-                if (page == activeTab)
-                {
-                    result.Add(("RetainerGrid", (uint)(slot + 3)));
-                }
+                result.Add((vs.AddonName, vs.NodeId));
             }
         }
 

@@ -151,6 +151,12 @@ public sealed unsafe class InventorySortPlanner
                 {
                     bagFreeSlots++;
                 }
+                else
+                {
+                    // dst is now full and src still holds a remainder: promote src as the next destination!
+                    dst = (src.Container, src.Slot, src.Qty - merged, src.StackSize, src.BaseId, src.Name);
+                    dstQty = dst.Qty;
+                }
             }
         }
 
@@ -373,7 +379,7 @@ public sealed unsafe class InventorySortPlanner
                         dstContainer = captured.DstContainer;
                         dstSlot = captured.DstSlot;
                         var dst = InventorySafetyEvaluator.GetSlot(mgr, dstContainer, dstSlot);
-                        if (dst == null || dst->ItemId != captured.RawItemId)
+                        if (dst == null || dst->ItemId != captured.RawItemId || dst->Flags != srcSlot->Flags)
                         {
                             return false;
                         }

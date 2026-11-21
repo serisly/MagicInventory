@@ -20,6 +20,7 @@ public sealed class Plugin : IDalamudPlugin
     private const string MagicShortCommandName = "/m";
 
     private readonly IDalamudPluginInterface pluginInterface;
+    private readonly IGameGui gameGui;
     private readonly IContextMenu contextMenu;
     private readonly ICommandManager commandManager;
     private readonly IDataManager dataManager;
@@ -37,7 +38,7 @@ public sealed class Plugin : IDalamudPlugin
     private MarketBoardController? marketBoardController;
     private MagicSortControllers? magicSortControllers;
     private MaterialTrackerOverlay? trackerOverlay;
-    private bool isDisposed;
+    private volatile bool isDisposed;
 
     public Configuration Configuration { get; }
     public HoldingsService Holdings { get; }
@@ -66,6 +67,7 @@ public sealed class Plugin : IDalamudPlugin
         IPluginLog log)
     {
         this.pluginInterface = pluginInterface;
+        this.gameGui = gameGui;
         this.contextMenu = contextMenu;
         this.commandManager = commandManager;
         this.dataManager = dataManager;
@@ -200,7 +202,7 @@ public sealed class Plugin : IDalamudPlugin
                 recipeNoteController = new RecipeNoteController(MaterialTracker);
                 recipeNoteController.Enable();
 
-                retainerController = new RetainerController(MagicSort, inventoryHighlightController);
+                retainerController = new RetainerController(MagicSort, inventoryHighlightController, inventoryRouteOverlay);
                 retainerController.Enable();
 
                 marketBoardController = new MarketBoardController(MaterialTracker, MarketBoardBuy);
@@ -313,18 +315,41 @@ public sealed class Plugin : IDalamudPlugin
 
         if (args.Target is MenuTargetInventory invTarget && invTarget.TargetItem is { } invItem)
         {
-            baseItemId = invItem.BaseItemId;
-        }
-        else if (args.Target is MenuTargetDefault)
-        {
-            // Support right-clicking items in Market Board, Crafting Log, chat links, Armoury Chest, etc. via AgentItemDetail
-            var detail = AgentItemDetail.Instance();
-            if (detail != null && detail->ItemId != 0)
+            baseItemId = ItemIdentity.NormalizeBaseItemId(invItem.ItemId);
+            if (baseItemId == 0)
             {
-                var addon = args.AddonName ?? string.Empty;
-                if (addon is "ItemSearch" or "ItemSearchResult" or "RecipeNote" or "ChatLog" or "RetainerSellList" or "Shop" or "GrandCompanySupplyList" or "ArmouryBoard")
+                baseItemId = invItem.BaseItemId;
+            }
+        }
+        else if (args.Target is MenuTargetDefault defaultTarget)
+        {
+            // Never attach item menus to right-clicks on players, NPCs, or world objects
+            var isActorTarget = defaultTarget.TargetObjectId != 0
+                || defaultTarget.TargetContentId != 0
+                || !string.IsNullOrEmpty(defaultTarget.TargetName);
+
+            if (!isActorTarget)
+            {
+                uint rawId = 0;
+                var detail = AgentItemDetail.Instance();
+                if (detail != null
+                    && detail->ItemId != 0
+                    && detail->DetailKind < FFXIVClientStructs.FFXIV.Client.Enums.DetailKind.Action)
                 {
-                    baseItemId = HoldingsService.NormalizeBaseItemId(detail->ItemId);
+                    rawId = detail->ItemId;
+                }
+                else if (gameGui.HoveredItem is > 0 and < (ulong)ItemIdentity.EventItemIdThreshold)
+                {
+                    rawId = (uint)gameGui.HoveredItem;
+                }
+
+                if (rawId != 0)
+                {
+                    var normalized = ItemIdentity.NormalizeBaseItemId(rawId);
+                    if (normalized != 0 && dataManager.GetExcelSheet<Item>()?.TryGetRow(normalized, out _) == true)
+                    {
+                        baseItemId = normalized;
+                    }
                 }
             }
         }
@@ -336,23 +361,25 @@ public sealed class Plugin : IDalamudPlugin
 
         var capturedId = baseItemId;
         var itemName = MagicSort.GetItemDisplayName(capturedId);
+        var openedFromRetainer = string.Equals(args.AddonName, "InventoryRetainer", StringComparison.Ordinal)
+            || string.Equals(args.AddonName, "InventoryRetainerLarge", StringComparison.Ordinal);
 
         args.AddMenuItem(new MenuItem
         {
             Name = "Magic Inventory",
             UseDefaultPrefix = true,
             IsSubmenu = true,
-            OnClicked = clickedArgs => OpenItemRuleSubmenu(clickedArgs, capturedId, itemName),
+            OnClicked = clickedArgs => OpenItemRuleSubmenu(clickedArgs, capturedId, itemName, openedFromRetainer),
         });
     }
 
-    private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName)
+    private void OpenItemRuleSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName, bool openedFromRetainer)
     {
         var items = new List<IMenuItem>();
         var routeFilters = new List<string?>();
 
         var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId);
-        var canTag = MagicSortService.CanLockOrTagBaseId(baseItemId);
+        var canTag = ItemIdentity.CanLockOrTagItem(baseItemId, itemRow);
         var isManual = MagicSort.IsItemOverwritten(baseItemId);
 
         if (canTag)
@@ -363,7 +390,17 @@ public sealed class Plugin : IDalamudPlugin
                 : currentEntry;
 
             var currentRoute = currentEntry?.Route ?? "Keep";
-            var autoLabel = FormatAutoPredictedLabel(autoEntry, out var autoRouteFilter);
+            var autoLabel = RoutePresentation.FormatAutoPredictedLabel(autoEntry, out var autoRouteFilter);
+            if (openedFromRetainer && string.Equals(autoRouteFilter, "Keep", StringComparison.OrdinalIgnoreCase))
+            {
+                var activeRetId = HoldingsService.GetActiveRetainerId();
+                var activeRetName = HoldingsService.GetActiveRetainerName();
+                if (activeRetId != 0 && !string.IsNullOrWhiteSpace(activeRetName))
+                {
+                    autoLabel = activeRetName;
+                    autoRouteFilter = $"Retainer:{activeRetId}";
+                }
+            }
 
             items.Add(new MenuItem
             {
@@ -384,7 +421,9 @@ public sealed class Plugin : IDalamudPlugin
             });
             routeFilters.Add("Keep");
 
-            if (itemRow is { ItemAction.RowId: > 0 })
+            var eligibility = ItemRouteEligibility.Compute(itemRow, TriageEngine.IsCabinetItem(baseItemId));
+
+            if (eligibility.CanUse)
             {
                 var isUseActive = isManual && string.Equals(currentRoute, "Use", StringComparison.OrdinalIgnoreCase);
                 items.Add(new MenuItem
@@ -408,12 +447,7 @@ public sealed class Plugin : IDalamudPlugin
                 routeFilters.Add("Retainer");
             }
 
-            var canMarket = itemRow is null || !itemRow.Value.IsUntradable;
-            var canVendor = itemRow is null || (itemRow.Value.PriceLow > 0 && !itemRow.Value.IsUnique);
-            var canGc = itemRow is { EquipSlotCategory.RowId: > 0, Rarity: 2 or 3 or 7 } && itemRow.Value.LevelItem.RowId >= 15;
-            var canGoldSaucer = itemRow is not null
-                && string.Equals(itemRow.Value.ItemUICategory.ValueNullable?.Name.ExtractText(), "Triple Triad Card", StringComparison.OrdinalIgnoreCase);
-            if (canMarket || canVendor || canGc || canGoldSaucer)
+            if (eligibility.CanSellAny)
             {
                 var isSellActive = isManual
                     && (string.Equals(currentRoute, "Market", StringComparison.OrdinalIgnoreCase)
@@ -424,12 +458,21 @@ public sealed class Plugin : IDalamudPlugin
                 {
                     Name = isSellActive ? "• Sell" : "Sell",
                     IsSubmenu = true,
-                    OnClicked = subArgs => OpenSellSubmenu(subArgs, baseItemId, itemName, isManual, currentRoute, canMarket, canVendor, canGc, canGoldSaucer),
+                    OnClicked = subArgs => OpenSellSubmenu(
+                        subArgs,
+                        baseItemId,
+                        itemName,
+                        isManual,
+                        currentRoute,
+                        eligibility.CanMarket,
+                        eligibility.CanVendor,
+                        eligibility.CanGrandCompany,
+                        eligibility.CanGoldSaucer),
                 });
                 routeFilters.Add("Sell");
             }
 
-            if (itemRow is { EquipSlotCategory.RowId: > 0 })
+            if (eligibility.CanGlamour)
             {
                 var isGlamActive = isManual && string.Equals(currentRoute, "Glamour", StringComparison.OrdinalIgnoreCase);
                 items.Add(new MenuItem
@@ -440,7 +483,7 @@ public sealed class Plugin : IDalamudPlugin
                 routeFilters.Add("Glamour");
             }
 
-            if (TriageEngine.IsCabinetItem(baseItemId))
+            if (eligibility.CanArmoire)
             {
                 var isArmoireActive = isManual && string.Equals(currentRoute, "Armoire", StringComparison.OrdinalIgnoreCase);
                 items.Add(new MenuItem
@@ -568,79 +611,131 @@ public sealed class Plugin : IDalamudPlugin
     {
         var items = new List<IMenuItem>();
         var isItemTracked = MaterialTracker.IsItemTracked(baseItemId);
+        var hasTrackedList = MaterialTracker.HasTrackedItems;
 
-        items.Add(new MenuItem
-        {
-            Name = isItemTracked ? "Untrack Item" : "Item",
-            OnClicked = _ =>
-            {
-                MaterialTracker.ToggleSingleItem(baseItemId);
-                chatGui.Print(isItemTracked ? $"Stopped tracking {itemName}." : $"Tracking item: {itemName}.");
-            },
-        });
-
-        if (MaterialTracker.HasRecipeForItem(baseItemId))
+        if (!isItemTracked)
         {
             items.Add(new MenuItem
             {
-                Name = "Recipe",
+                Name = hasTrackedList ? "Add to List" : "Track Item",
                 OnClicked = _ =>
                 {
-                    MaterialTracker.TrackRecipeForResultItem(baseItemId, out var msg);
+                    MaterialTracker.AddItemToList(baseItemId, out var msg);
                     if (!string.IsNullOrWhiteSpace(msg))
                     {
                         chatGui.Print(msg);
                     }
                 },
             });
+
+            if (hasTrackedList)
+            {
+                items.Add(new MenuItem
+                {
+                    Name = "Track Only",
+                    OnClicked = _ =>
+                    {
+                        MaterialTracker.TrackItemOnly(baseItemId, out var msg);
+                        if (!string.IsNullOrWhiteSpace(msg))
+                        {
+                            chatGui.Print(msg);
+                        }
+                    },
+                });
+            }
+        }
+        else
+        {
+            items.Add(new MenuItem
+            {
+                Name = "Remove from List",
+                OnClicked = _ =>
+                {
+                    MaterialTracker.RemoveItemFromList(baseItemId, out var msg);
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        chatGui.Print(msg);
+                    }
+                },
+            });
+
+            items.Add(new MenuItem
+            {
+                Name = "Add +1 to List",
+                OnClicked = _ =>
+                {
+                    MaterialTracker.AddItemToList(baseItemId, out var msg);
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        chatGui.Print(msg);
+                    }
+                },
+            });
+
+            if (MaterialTracker.TrackedItemCount > 1)
+            {
+                items.Add(new MenuItem
+                {
+                    Name = "Track Only",
+                    OnClicked = _ =>
+                    {
+                        MaterialTracker.TrackItemOnly(baseItemId, out var msg);
+                        if (!string.IsNullOrWhiteSpace(msg))
+                        {
+                            chatGui.Print(msg);
+                        }
+                    },
+                });
+            }
+        }
+
+        if (MaterialTracker.HasRecipeForItem(baseItemId))
+        {
+            items.Add(new MenuItem
+            {
+                Name = hasTrackedList ? "Add Recipe to List" : "Track Recipe",
+                OnClicked = _ =>
+                {
+                    MaterialTracker.AddRecipeToList(baseItemId, out var msg);
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        chatGui.Print(msg);
+                    }
+                },
+            });
+
+            if (hasTrackedList)
+            {
+                items.Add(new MenuItem
+                {
+                    Name = "Track Recipe Only",
+                    OnClicked = _ =>
+                    {
+                        MaterialTracker.TrackRecipeForResultItem(baseItemId, out var msg);
+                        if (!string.IsNullOrWhiteSpace(msg))
+                        {
+                            chatGui.Print(msg);
+                        }
+                    },
+                });
+            }
+        }
+
+        if (hasTrackedList)
+        {
+            items.Add(new MenuItem
+            {
+                Name = "Clear Tracked List",
+                OnClicked = _ =>
+                {
+                    MaterialTracker.ClearAll();
+                    chatGui.Print("Cleared tracked list.");
+                },
+            });
         }
 
         inventoryHighlightController.SetActiveContextSubmenuRoutes(null, null);
         clickedArgs.OpenSubmenu("Track", items);
-    }
-
-    private static string FormatAutoPredictedLabel(MagicSortEntry? autoEntry, out string routeFilter)
-    {
-        if (autoEntry == null || string.Equals(autoEntry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Keep";
-            return "Keep";
-        }
-
-        if (string.Equals(autoEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = autoEntry.TargetRetainerId != 0
-                ? $"Retainer:{autoEntry.TargetRetainerId}"
-                : "Retainer";
-            return string.IsNullOrWhiteSpace(autoEntry.TargetRetainerName) ? "Retainer" : autoEntry.TargetRetainerName;
-        }
-
-        if (string.Equals(autoEntry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "GrandCompany";
-            return "GC Seals";
-        }
-
-        if (string.Equals(autoEntry.Route, "GoldSaucer", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "GoldSaucer";
-            return "Gold Saucer";
-        }
-
-        if (string.Equals(autoEntry.Route, "Materia", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Materia";
-            return "Extract Materia";
-        }
-
-        if (string.Equals(autoEntry.Route, "Glamour", StringComparison.OrdinalIgnoreCase))
-        {
-            routeFilter = "Glamour";
-            return "Glamour Dresser";
-        }
-
-        routeFilter = autoEntry.Route;
-        return autoEntry.Route;
     }
 
     private void ApplyContextOverride(uint baseItemId, string itemName, string routeSpec, int? marketPriority, string displayLabel)
@@ -659,17 +754,9 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(MagicCommandName);
         commandManager.RemoveHandler(MagicShortCommandName);
         contextMenu.OnMenuOpened -= OnContextMenuOpened;
-        inventoryRouteOverlay.Dispose();
-        inventoryHighlightController.Dispose();
-        itemTooltipController.Dispose();
-        MagicActions.Dispose();
-        MarketBoardBuy.Dispose();
-        BellSweep.Dispose();
-        MagicSort.Dispose();
-        TriageEngine.Dispose();
-        Universalis.Dispose();
-        TransactionQueue.Dispose();
 
+        // Dispose native UI controllers BEFORE highlight/overlay/services so their DetachButton()
+        // hover-clear callbacks never touch already-disposed services or re-tint cleared nodes.
         try
         {
             trackerOverlay?.Dispose();
@@ -691,6 +778,17 @@ public sealed class Plugin : IDalamudPlugin
         {
             log.Warning(ex, "Cleanup warning during UI controller disposal.");
         }
+
+        inventoryRouteOverlay.Dispose();
+        inventoryHighlightController.Dispose();
+        itemTooltipController.Dispose();
+        MagicActions.Dispose();
+        MarketBoardBuy.Dispose();
+        BellSweep.Dispose();
+        MagicSort.Dispose();
+        TriageEngine.Dispose();
+        Universalis.Dispose();
+        TransactionQueue.Dispose();
 
         KamiToolKitLibrary.Dispose();
     }

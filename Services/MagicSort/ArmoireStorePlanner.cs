@@ -219,10 +219,15 @@ public sealed unsafe class ArmoireStorePlanner
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
                             // Only confirm a prompt that is clearly about this item / the armoire; never blind-click Yes.
-                            var promptText = yesNo->PromptText != null ? yesNo->PromptText->NodeText.ToString() : string.Empty;
+                            var promptText = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
                             if (!promptText.Contains(captured.Name, StringComparison.OrdinalIgnoreCase)
                                 && !promptText.Contains("armoire", StringComparison.OrdinalIgnoreCase))
                             {
+                                if (yesNo->NoButton != null)
+                                {
+                                    NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
+                                }
+
                                 transactionQueue.Cancel("Stopped: unexpected confirmation prompt.", QueueBatchOutcome.AbortedOnError);
                                 return false;
                             }
@@ -248,6 +253,11 @@ public sealed unsafe class ArmoireStorePlanner
 
                             return false;
                         }
+                    }
+
+                    if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectYesno"))
+                    {
+                        return false;
                     }
 
                     var uiState = UIState.Instance();

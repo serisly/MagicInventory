@@ -243,11 +243,20 @@ public sealed unsafe class VendorSellPlanner
                     yesNoConfirmed = false;
                     yesNoReadyAtUtc = DateTime.MinValue;
 
+                    CloseOpenContextMenu();
                     contextAgent->OpenForItemSlot(captured.Container, captured.Slot, 0, 0);
                     return true;
                 },
-                HasServerAck: () => GetOpenContextAddon(AgentInventoryContext.Instance()) != null,
-                PacingProfile.MarketFormEntry));
+                HasServerAck: () =>
+                {
+                    var ctx = AgentInventoryContext.Instance();
+                    return ctx != null
+                        && GetOpenContextAddon(ctx) != null
+                        && ctx->TargetInventoryId == captured.Container
+                        && ctx->TargetInventorySlotId == captured.Slot;
+                },
+                PacingProfile.MarketFormEntry,
+                SkipOnFailureCount: 1));
 
             steps.Add(new TransactionStep(
                 $"Sell {captured.Name}",
@@ -255,8 +264,20 @@ public sealed unsafe class VendorSellPlanner
                 Dispatch: () =>
                 {
                     if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Shop")
-                        || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectYesno"))
+                        || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectYesno")
+                        || (InventorySafetyEvaluator.IsArmouryContainer(captured.Container)
+                            && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard")))
                     {
+                        CloseOpenContextMenu();
+                        return false;
+                    }
+
+                    var ctx = AgentInventoryContext.Instance();
+                    if (ctx == null
+                        || ctx->TargetInventoryId != captured.Container
+                        || ctx->TargetInventorySlotId != captured.Slot)
+                    {
+                        CloseOpenContextMenu();
                         return false;
                     }
 
@@ -313,6 +334,11 @@ public sealed unsafe class VendorSellPlanner
 
                             if (!IsSafeVendorSellConfirmPrompt(yesNo))
                             {
+                                if (yesNo->NoButton != null)
+                                {
+                                    NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
+                                }
+
                                 transactionQueue.Cancel("Unexpected confirmation prompt while selling.", QueueBatchOutcome.AbortedOnError);
                                 return false;
                             }

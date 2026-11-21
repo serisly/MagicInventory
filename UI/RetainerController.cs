@@ -18,10 +18,13 @@ public sealed unsafe class RetainerController : IDisposable
     private readonly RetainerAddonBinding largeBinding;
     private readonly RetainerAddonBinding standardBinding;
 
-    public RetainerController(MagicSortService magicSort, InventoryHighlightController highlightController)
+    public RetainerController(
+        MagicSortService magicSort,
+        InventoryHighlightController highlightController,
+        InventoryRouteOverlay routeOverlay)
     {
-        largeBinding = new RetainerAddonBinding("InventoryRetainerLarge", magicSort, highlightController);
-        standardBinding = new RetainerAddonBinding("InventoryRetainer", magicSort, highlightController);
+        largeBinding = new RetainerAddonBinding("InventoryRetainerLarge", magicSort, highlightController, routeOverlay);
+        standardBinding = new RetainerAddonBinding("InventoryRetainer", magicSort, highlightController, routeOverlay);
     }
 
     public void Enable()
@@ -43,6 +46,7 @@ public sealed unsafe class RetainerController : IDisposable
         private readonly string addonName;
         private readonly MagicSortService magicSort;
         private readonly InventoryHighlightController highlightController;
+        private readonly InventoryRouteOverlay routeOverlay;
         private readonly AddonController<AtkUnitBase> controller;
 
         private TextButtonNode? magicSortButton;
@@ -56,11 +60,13 @@ public sealed unsafe class RetainerController : IDisposable
         public RetainerAddonBinding(
             string addonName,
             MagicSortService magicSort,
-            InventoryHighlightController highlightController)
+            InventoryHighlightController highlightController,
+            InventoryRouteOverlay routeOverlay)
         {
             this.addonName = addonName;
             this.magicSort = magicSort;
             this.highlightController = highlightController;
+            this.routeOverlay = routeOverlay;
             controller = new AddonController<AtkUnitBase>
             {
                 AddonName = addonName,
@@ -99,8 +105,16 @@ public sealed unsafe class RetainerController : IDisposable
                 IsVisible = false,
                 OnClick = magicSort.ExecuteRetainerSort,
             };
-            magicSortButton.AddEvent(AtkEventType.MouseOver, () => highlightController.SetHoveredRetainerSortAddon(addonName, true));
-            magicSortButton.AddEvent(AtkEventType.MouseOut, () => highlightController.SetHoveredRetainerSortAddon(addonName, false));
+            magicSortButton.AddEvent(AtkEventType.MouseOver, () =>
+            {
+                highlightController.SetHoveredRetainerSortAddon(addonName, true);
+                routeOverlay.SetHoveredInventorySortAddon(addonName, true);
+            });
+            magicSortButton.AddEvent(AtkEventType.MouseOut, () =>
+            {
+                highlightController.SetHoveredRetainerSortAddon(addonName, false);
+                routeOverlay.SetHoveredInventorySortAddon(addonName, false);
+            });
             magicSortButton.AttachNode(addon->RootNode, NodePosition.AsLastChild);
 
             ResetCache();
@@ -186,9 +200,18 @@ public sealed unsafe class RetainerController : IDisposable
 
         private void SyncState(AtkUnitBase* addon)
         {
-            if (addon == null || magicSortButton == null)
+            if (addon == null)
             {
                 return;
+            }
+
+            if (magicSortButton == null)
+            {
+                OnSetup(addon);
+                if (magicSortButton == null)
+                {
+                    return;
+                }
             }
 
             var sortState = magicSort.GetRetainerSortButtonState();
@@ -200,6 +223,7 @@ public sealed unsafe class RetainerController : IDisposable
                 if (!sortState.IsVisible)
                 {
                     highlightController.SetHoveredRetainerSortAddon(addonName, false);
+                    routeOverlay.SetHoveredInventorySortAddon(addonName, false);
                 }
             }
 
@@ -236,6 +260,7 @@ public sealed unsafe class RetainerController : IDisposable
         private void DetachButton()
         {
             highlightController.SetHoveredRetainerSortAddon(addonName, false);
+            routeOverlay.SetHoveredInventorySortAddon(addonName, false);
             if (magicSortButton != null)
             {
                 magicSortButton.DetachNode();

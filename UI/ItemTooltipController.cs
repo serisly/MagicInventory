@@ -317,74 +317,59 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     }
                 }
 
-                // Fallback for ArmouryBoard (where AgentItemDetail may report a visual container ID or clear hoveredContainer):
-                // if we still didn't bind a physical InventoryItem* for this hovered item, resolve it from Armoury Chest.
+                // Fallback when hoveredContainer didn't bind a live InventoryItem* (e.g. ArmouryBoard visual codes or RetainerGrid):
+                // Resolve in strict priority: Bags -> Armoury -> Active Retainer (never letting a Bag hover fall into Retainer!).
                 if (liveItem == null && rawId != 0)
                 {
-                    var targetBase = HoldingsService.NormalizeBaseItemId(rawId);
+                    var targetBase = ItemIdentity.NormalizeBaseItemId(rawId);
                     var manager = InventoryManager.Instance();
-                    if (manager != null)
+                    if (manager != null && targetBase != 0)
                     {
-                        var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
-                        var inBags = false;
-                        if (!armouryOpen)
+                        InventoryItem* TryFindInContainer(InventoryType cType, out short foundSlot)
                         {
-                            foreach (var bagType in Core.InventorySafetyEvaluator.PlayerBagContainers)
+                            foundSlot = -1;
+                            var c = manager->GetInventoryContainer(cType);
+                            if (!Core.InventorySafetyEvaluator.IsContainerReadable(c))
                             {
-                                var bag = manager->GetInventoryContainer(bagType);
-                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(bag))
+                                return null;
+                            }
+
+                            InventoryItem* baseFallback = null;
+                            short baseFallbackSlot = -1;
+                            for (var i = 0; i < c->Size; i++)
+                            {
+                                var s = c->GetInventorySlot(i);
+                                if (s == null || s->ItemId == 0)
                                 {
                                     continue;
                                 }
 
-                                for (var i = 0; i < bag->Size; i++)
+                                if (s->ItemId == rawId)
                                 {
-                                    var s = bag->GetInventorySlot(i);
-                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
-                                    {
-                                        inBags = true;
-                                        break;
-                                    }
+                                    foundSlot = (short)i;
+                                    return s;
                                 }
 
-                                if (inBags)
+                                if (baseFallback == null && ItemIdentity.NormalizeBaseItemId(s->ItemId) == targetBase)
                                 {
-                                    break;
+                                    baseFallback = s;
+                                    baseFallbackSlot = (short)i;
                                 }
                             }
+
+                            foundSlot = baseFallbackSlot;
+                            return baseFallback;
                         }
 
-                        if (armouryOpen || !inBags)
+                        var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
+                        var retainerOpen = HoldingsService.GetActiveRetainerId() != 0
+                            && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge")
+                                || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"));
+
+                        // 1. Check active Armoury tab first if ArmouryBoard is open
+                        if (armouryOpen)
                         {
-                            // Prefer active Armoury tab first when ArmouryBoard is open
-                            InventoryType? activeTabContainer = null;
-                            if (armouryOpen)
-                            {
-                                activeTabContainer = InventoryHighlightController.GetActiveArmouryTabContainer(gameGui);
-                            }
-
-                            InventoryItem* TryFindInContainer(InventoryType cType, out short foundSlot)
-                            {
-                                foundSlot = -1;
-                                var c = manager->GetInventoryContainer(cType);
-                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(c))
-                                {
-                                    return null;
-                                }
-
-                                for (var i = 0; i < c->Size; i++)
-                                {
-                                    var s = c->GetInventorySlot(i);
-                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
-                                    {
-                                        foundSlot = (short)i;
-                                        return s;
-                                    }
-                                }
-
-                                return null;
-                            }
-
+                            var activeTabContainer = InventoryGridLayout.GetActiveArmouryTabContainer(gameGui);
                             if (activeTabContainer.HasValue)
                             {
                                 var hit = TryFindInContainer(activeTabContainer.Value, out var hitSlot);
@@ -395,60 +380,66 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                     liveItem = hit;
                                 }
                             }
+                        }
 
-                            if (liveItem == null)
+                        // 2. Check Player Bags (and bind liveItem/effectiveContainer so bag items never leak into retainer scan!)
+                        var inBags = false;
+                        if (liveItem == null)
+                        {
+                            foreach (var bagType in Core.InventorySafetyEvaluator.PlayerBagContainers)
                             {
-                                foreach (var armType in Core.InventorySafetyEvaluator.ArmouryGearContainers)
-                                {
-                                    var hit = TryFindInContainer(armType, out var hitSlot);
-                                    if (hit != null)
-                                    {
-                                        effectiveContainer = armType;
-                                        effectiveSlot = hitSlot;
-                                        liveItem = hit;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (liveItem == null)
-                            {
-                                var hit = TryFindInContainer(InventoryType.ArmorySoulCrystal, out var hitSlot);
+                                var hit = TryFindInContainer(bagType, out var hitSlot);
                                 if (hit != null)
                                 {
-                                    effectiveContainer = InventoryType.ArmorySoulCrystal;
+                                    effectiveContainer = bagType;
                                     effectiveSlot = hitSlot;
                                     liveItem = hit;
+                                    inBags = true;
+                                    break;
                                 }
                             }
                         }
 
-                        if (liveItem == null && HoldingsService.GetActiveRetainerId() != 0)
+                        // 3. Check Active Retainer BEFORE remaining Armoury tabs when a retainer window is open and item wasn't in bags
+                        if (liveItem == null && !inBags && retainerOpen)
                         {
                             foreach (var retType in Core.InventorySafetyEvaluator.RetainerBagContainers)
                             {
-                                var c = manager->GetInventoryContainer(retType);
-                                if (!Core.InventorySafetyEvaluator.IsContainerReadable(c))
+                                var hit = TryFindInContainer(retType, out var hitSlot);
+                                if (hit != null)
                                 {
-                                    continue;
-                                }
-
-                                for (var i = 0; i < c->Size; i++)
-                                {
-                                    var s = c->GetInventorySlot(i);
-                                    if (s != null && s->ItemId != 0 && HoldingsService.NormalizeBaseItemId(s->ItemId) == targetBase)
-                                    {
-                                        effectiveContainer = retType;
-                                        effectiveSlot = (short)i;
-                                        liveItem = s;
-                                        break;
-                                    }
-                                }
-
-                                if (liveItem != null)
-                                {
+                                    effectiveContainer = retType;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
                                     break;
                                 }
+                            }
+                        }
+
+                        // 4. Remaining Armoury tabs + Soul Crystal
+                        if (liveItem == null)
+                        {
+                            foreach (var armType in Core.InventorySafetyEvaluator.ArmouryGearContainers)
+                            {
+                                var hit = TryFindInContainer(armType, out var hitSlot);
+                                if (hit != null)
+                                {
+                                    effectiveContainer = armType;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (liveItem == null)
+                        {
+                            var hit = TryFindInContainer(InventoryType.ArmorySoulCrystal, out var hitSlot);
+                            if (hit != null)
+                            {
+                                effectiveContainer = InventoryType.ArmorySoulCrystal;
+                                effectiveSlot = hitSlot;
+                                liveItem = hit;
                             }
                         }
                     }

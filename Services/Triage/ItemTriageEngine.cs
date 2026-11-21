@@ -58,49 +58,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         "Outfits",
     };
 
-    private static readonly HashSet<string> HousingCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Furnishing",
-        "Tabletop",
-        "Wall-mounted",
-        "Rug",
-        "Outdoor Furnishing",
-        "Interior Fixtures",
-        "Exterior Fixtures",
-        "Roof",
-        "Exterior Wall",
-        "Window",
-        "Door",
-        "Roof Decoration",
-        "Exterior Wall Decoration",
-        "Placard",
-        "Fence",
-        "Interior Wall",
-        "Flooring",
-        "Ceiling Light",
-        "Painting",
-    };
-
-    private static readonly HashSet<string> ProtectedNoVendorCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Fishing Tackle",
-        "Materia",
-        "Dye",
-        "Catalyst",
-    };
-
-    private static readonly HashSet<string> CraftingStapleCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Ingredient",
-        "Reagent",
-        "Seafood",
-        "Meal",
-    };
-
-    private static readonly HashSet<uint> ProtectedConsumableCategoryIds = [44, 46]; // Medicine (Tinctures/Potions/Cordials), Meal (Food)
-    private static readonly HashSet<uint> ProtectedStoreNoAutoMarketCategoryIds = [33, 55, 58, 60]; // Fishing Tackle, Dye, Materia, Catalyst
-    private static readonly HashSet<uint> ProtectedUnlockableCategoryIds = [80, 81, 94]; // Triple Triad Card, Minion, Orchestrion Roll
-
     private static readonly string[] ActiveUtilityTokens =
     [
         "Gysahl Greens",
@@ -124,7 +81,12 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         "Ceremony Invitation",
         "Atma of ",
         "Unidentifiable ",
-        "Luminous ",
+        "Luminous Fire Crystal",
+        "Luminous Wind Crystal",
+        "Luminous Lightning Crystal",
+        "Luminous Ice Crystal",
+        "Luminous Earth Crystal",
+        "Luminous Water Crystal",
         "Proto Armor Identification Key",
         "Soul of the Crafter",
         "Jandelaine's Token",
@@ -135,7 +97,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
     [
         " Coffer",
         " Whistle",
-        " Horn",
         " Barding",
         "Ballroom Etiquette",
         "Modern Aesthetics",
@@ -227,13 +188,13 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var tradableIds = new List<uint>(ownedIds.Count);
         foreach (var id in ownedIds)
         {
-            if (id <= 20)
+            if (!ItemIdentity.CanLockOrTagBaseId(id))
             {
                 continue;
             }
 
             var row = itemSheet.GetRowOrDefault(id);
-            if (row is not null && !row.Value.IsUntradable)
+            if (row is not null && ItemIdentity.IsMarketable(row.Value) && !ItemIdentity.IsCurrencyOrCrystal(id, row.Value))
             {
                 tradableIds.Add(id);
             }
@@ -413,7 +374,16 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             if (ret.Quantities.TryGetValue(normalizedBaseId, out var retQty) && retQty > 0)
             {
                 totalQty += retQty;
-                hasNq = true;
+                var hqQty = ret.HqQuantities?.GetValueOrDefault(normalizedBaseId) ?? 0;
+                if (hqQty > 0)
+                {
+                    hasHq = true;
+                }
+
+                if (retQty > hqQty)
+                {
+                    hasNq = true;
+                }
             }
         }
 
@@ -629,7 +599,16 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 }
 
                 qtyById[itemId] = qtyById.GetValueOrDefault(itemId) + qty;
-                hasNq.Add(itemId);
+                var hqQty = ret.HqQuantities?.GetValueOrDefault(itemId) ?? 0;
+                if (hqQty > 0)
+                {
+                    hasHq.Add(itemId);
+                }
+
+                if (qty > hqQty)
+                {
+                    hasNq.Add(itemId);
+                }
             }
         }
 
@@ -675,10 +654,11 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var priceLow = (long)itemRow.PriceLow;
         var untradable = itemRow.IsUntradable;
 
-        // Fetch cached market snapshot (if tradable)
+        // Fetch cached market snapshot (if marketable)
         MarketPriceSnapshot? mkt = null;
         var hasFreshPrice = false;
-        if (!untradable && baseId > 20 && !string.IsNullOrWhiteSpace(world))
+        var isMarketable = ItemIdentity.IsMarketable(itemRow);
+        if (isMarketable && ItemIdentity.CanLockOrTagBaseId(baseId) && !string.IsNullOrWhiteSpace(world))
         {
             if (universalis.TryGetFreshPrice(world, baseId, out var fresh))
             {
@@ -692,12 +672,13 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             }
         }
 
-        var targetNq = mkt != null && !untradable
+        var targetNq = mkt != null && isMarketable
             ? ComputeTargetPrice(mkt.MinPriceNq > 0 ? mkt.MinPriceNq : mkt.MinPriceAny, mkt.RecentHistoryMedian, priceLow)
             : 0L;
-        // Fail-closed for HQ items: ONLY compute an HQ listing price when Universalis has a real HQ minimum price!
-        var targetHq = mkt != null && !untradable && itemRow.CanBeHq && mkt.MinPriceHq > 0
-            ? ComputeTargetPrice(mkt.MinPriceHq, mkt.RecentHistoryMedian, priceLow)
+        // Fail-closed for HQ items: ONLY compute an HQ listing price when Universalis has a real HQ minimum price,
+        // and cap against HQ history median (NOT NQ history median!)
+        var targetHq = mkt != null && isMarketable && itemRow.CanBeHq && mkt.MinPriceHq > 0
+            ? ComputeTargetPrice(mkt.MinPriceHq, mkt.RecentHistoryMedianHq, priceLow)
             : 0L;
 
         // 0. Explicit Manual User Override (always wins over automatic rules)
@@ -727,30 +708,29 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             }
             else
             {
-                var overrideLabel = overrideSpec switch
+                var isMarketOverride = string.Equals(overrideSpec, "Market", StringComparison.OrdinalIgnoreCase);
+                if (isMarketOverride && mkt == null && isMarketable && !string.IsNullOrWhiteSpace(world))
                 {
-                    "GrandCompany" => "GC Seals",
-                    "Glamour" => "Glamour Dresser",
-                    "GoldSaucer" => "Gold Saucer",
-                    "Materia" => "Extract Materia",
-                    _ => overrideSpec,
-                };
+                    missingPriceIds.Add(baseId);
+                }
+
+                var overrideLabel = RoutePresentation.GetDisplayLabel(overrideSpec);
                 return new MagicSortEntry(
                     baseId,
                     name,
                     overrideSpec,
                     0,
                     string.Empty,
-                    string.Equals(overrideSpec, "Market", StringComparison.OrdinalIgnoreCase) ? targetNq : 0,
-                    string.Equals(overrideSpec, "Market", StringComparison.OrdinalIgnoreCase) ? targetHq : 0,
+                    isMarketOverride ? targetNq : 0,
+                    isMarketOverride ? targetHq : 0,
                     priceLow,
                     untradable,
                     $"Override: {overrideLabel}");
             }
         }
 
-        // 1. Currencies & Elemental Crystals
-        if (baseId <= 19 || string.Equals(uiCat, "Currency", StringComparison.OrdinalIgnoreCase))
+        // 1. Currencies & Elemental Crystals (locale-safe; NEVER uses FilterGroup == 16!)
+        if (ItemIdentity.IsCurrencyOrCrystal(baseId, itemRow))
         {
             return KeepEntry(baseId, name, priceLow, untradable, "Currency or crystal");
         }
@@ -831,7 +811,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         }
 
         // 5. Unlockables, Coffers, Food/Potions/Tinctures, Utility Consumables, Quest/Relic/Key Items
-        if (ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId))
+        if (ItemIdentity.ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId))
         {
             return KeepEntry(baseId, name, priceLow, untradable, string.IsNullOrEmpty(uiCat) ? "Food / Potion" : uiCat);
         }
@@ -843,7 +823,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         if (IsUnlockableOrCoffer(itemRow, name, uiCat))
         {
-            if (string.Equals(uiCat, "Triple Triad Card", StringComparison.OrdinalIgnoreCase))
+            if (ItemIdentity.IsTripleTriadCard(itemRow))
             {
                 return new MagicSortEntry(
                     baseId, name, "GoldSaucer", 0, string.Empty, 0, 0, priceLow, untradable,
@@ -866,8 +846,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var stackSize = (int)Math.Max(1, itemRow.StackSize);
         var preferHq = obs.HasHq && !obs.HasNq;
 
-        // 6. Protected Housing Furnishings (FilterGroup 14 or Housing UI Category) -> Retainer storage ONLY
-        if (itemRow.FilterGroup == 14 || HousingCategories.Contains(uiCat))
+        // 6. Protected Housing Furnishings (FilterGroup 14/34 or Housing UI Categories incl. Table, Construction Permit, Rug, Painting) -> Retainer storage ONLY
+        if (ItemIdentity.IsHousingItem(itemRow))
         {
             return RouteToBestRetainer(
                 baseId, name, uiCat, isEquip, preferHq, stackSize, priceLow, untradable, retainers, profile,
@@ -911,8 +891,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 $"Old normal gear (iLvl {itemRow.LevelItem.RowId}, {priceLow:N0}g)");
         }
 
-        // 10. Tradable Market vs Vendor vs Retainer — FAIL-SAFE PendingPrice -> Keep!
-        if (!untradable)
+        // 10. Marketable Market vs Vendor vs Retainer — FAIL-SAFE PendingPrice -> Keep!
+        if (isMarketable)
         {
             if (mkt == null)
             {
@@ -935,8 +915,9 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             var isAnyRecipeIngredient = globalRecipeIngredientIds.Contains(baseId);
             var isUpcomingCraft = upcomingCraftIngredients.Contains(baseId);
 
-            var isProtectedStoreCat = ProtectedStoreNoAutoMarketCategoryIds.Contains(itemRow.ItemUICategory.RowId)
-                || ProtectedNoVendorCategories.Contains(uiCat);
+            var uiCatId = itemRow.ItemUICategory.RowId;
+            var isProtectedStoreCat = ItemIdentity.ProtectedStoreNoAutoMarketCategoryIds.Contains(uiCatId)
+                || ItemIdentity.ProtectedNoVendorCategoryIds.Contains(uiCatId);
 
             // 10a. Vendor Junk Rules (NEVER vendor 0-listing scarce items, HQ gear, upcoming crafts, or protected categories!)
             if (hasFreshPrice
@@ -992,7 +973,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             //      Never auto-list Materia, Dyes, Catalysts, or Fishing Tackle (store on retainer unless manually overridden).
             //      Safe mode keeps retainer crafting staples; Balanced/Purge only protect upcoming craft ingredients.
             var isCraftingStaple = (isUpcomingCraft || (sellMode == SellMode.Safe && totalRetainerQty > 0))
-                && CraftingStapleCategories.Contains(uiCat)
+                && ItemIdentity.CraftingStapleCategoryIds.Contains(uiCatId)
                 && unitPrice < 1500;
 
             var purgeCraftAllowed = sellMode != SellMode.Purge || !isUpcomingCraft;
@@ -1078,13 +1059,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return new MagicSortEntry(baseId, name, "Retainer", only.RetainerId, only.Name, 0, 0, priceLow, untradable, reason);
         }
 
-        // 1. Explicit user-configured specialty in Settings (keeps intended retainer even if full; Sort overflows automatically)
+        // 1. Explicit user-configured specialty in Settings (case-insensitive)
         if (!string.IsNullOrEmpty(uiCat))
         {
             foreach (var ret in retainers)
             {
                 if (profile.RetainerSpecialties.TryGetValue(ret.RetainerId, out var specs)
-                    && specs.Contains(uiCat))
+                    && specs != null
+                    && specs.Contains(uiCat, StringComparer.OrdinalIgnoreCase))
                 {
                     var label = overrideReasonPrefix ?? $"{uiCat} ({ret.Name})";
                     return new MagicSortEntry(baseId, name, "Retainer", ret.RetainerId, ret.Name, 0, 0, priceLow, untradable, label);
@@ -1094,33 +1076,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         var hasUnvisitedRetainers = retainers.Any(r => !r.IsVisited);
 
-        // 2. Existing partial stack merge ALWAYS wins even on a 175/175 retainer (costs 0 new slots!)
-        if (stackSize > 1)
-        {
-            KnownRetainerInfo? mergeOwner = null;
-            var bestMergeQty = 0;
-            foreach (var ret in retainers)
-            {
-                if (holdings.HasPartialStackOnRetainer(ret.RetainerId, baseId, isHq))
-                {
-                    var qty = ret.Quantities.GetValueOrDefault(baseId);
-                    if (qty > bestMergeQty)
-                    {
-                        bestMergeQty = qty;
-                        mergeOwner = ret;
-                    }
-                }
-            }
-
-            if (mergeOwner != null)
-            {
-                var reason = overrideReasonPrefix ?? $"Stacks with {mergeOwner.Name}";
-                return new MagicSortEntry(baseId, name, "Retainer", mergeOwner.RetainerId, mergeOwner.Name, 0, 0, priceLow, untradable, reason);
-            }
-        }
-
-        // 3. Clear majority specialty (>= 3 items AND >= 2x runner-up -> converges cleanly with zero ping-pong)
-        //    Keeps true intended retainer even if currently full so items naturally return home once space opens!
+        // Compute majority category owner upfront so a tiny misplaced partial stack on a full retainer
+        // does not trap items away from an uncrowded majority-category owner.
         KnownRetainerInfo? bestCatOwner = null;
         var bestCatScore = 0;
         var secondBestCatScore = 0;
@@ -1140,12 +1097,44 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     secondBestCatScore = score;
                 }
             }
+        }
 
-            if (!hasUnvisitedRetainers && bestCatOwner != null && bestCatScore >= 3 && bestCatScore >= secondBestCatScore * 2)
+        var hasClearMajorityCat = !hasUnvisitedRetainers
+            && bestCatOwner != null
+            && bestCatScore >= 3
+            && bestCatScore >= secondBestCatScore * 2;
+
+        // 2. Existing partial stack merge wins when it costs 0 new slots (unless another retainer with space owns the clear majority category)
+        if (stackSize > 1)
+        {
+            KnownRetainerInfo? mergeOwner = null;
+            var bestMergeQty = 0;
+            foreach (var ret in retainers)
             {
-                var label = overrideReasonPrefix ?? $"{uiCat} ({bestCatOwner.Name})";
-                return new MagicSortEntry(baseId, name, "Retainer", bestCatOwner.RetainerId, bestCatOwner.Name, 0, 0, priceLow, untradable, label);
+                if (holdings.HasPartialStackOnRetainer(ret.RetainerId, baseId, isHq))
+                {
+                    var qty = ret.Quantities.GetValueOrDefault(baseId);
+                    if (qty > bestMergeQty)
+                    {
+                        bestMergeQty = qty;
+                        mergeOwner = ret;
+                    }
+                }
             }
+
+            if (mergeOwner != null
+                && (!hasClearMajorityCat || mergeOwner.RetainerId == bestCatOwner!.RetainerId || bestCatOwner.UsedBagSlots >= HoldingsService.MaxRetainerBagSlots))
+            {
+                var reason = overrideReasonPrefix ?? $"Stacks with {mergeOwner.Name}";
+                return new MagicSortEntry(baseId, name, "Retainer", mergeOwner.RetainerId, mergeOwner.Name, 0, 0, priceLow, untradable, reason);
+            }
+        }
+
+        // 3. Clear majority specialty (>= 3 items AND >= 2x runner-up -> converges cleanly with zero ping-pong)
+        if (hasClearMajorityCat && bestCatOwner != null)
+        {
+            var label = overrideReasonPrefix ?? $"{uiCat} ({bestCatOwner.Name})";
+            return new MagicSortEntry(baseId, name, "Retainer", bestCatOwner.RetainerId, bestCatOwner.Name, 0, 0, priceLow, untradable, label);
         }
 
         // 4. Existing stack match (keeps split-category items stable)
@@ -1201,7 +1190,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         reason = string.Empty;
         if (itemRow.ItemAction.RowId == 0
             || itemRow.EquipSlotCategory.RowId > 0
-            || ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId)
+            || ItemIdentity.ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId)
             || IsActiveUtilityConsumable(name))
         {
             return false;
@@ -1227,7 +1216,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             }
         }
 
-        if (name.Contains(" Coffer", StringComparison.OrdinalIgnoreCase))
+        // Only auto-open UNTRADABLE coffers (never crack open tradable million-gil glamour/venture coffers!)
+        if (itemRow.IsUntradable && name.Contains(" Coffer", StringComparison.OrdinalIgnoreCase))
         {
             reason = "Coffer";
             return true;
@@ -1362,14 +1352,13 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 ? ps->ClassJobExperience[job.Value.ExpArrayIndex]
                 : 0;
 
-            // Ignore untouched Lv 1 unlocks (e.g. ROG Lv 1 with 0 XP and no gearset) and untouched 0-XP expansion unlocks
-            if (!isActiveJob && !isDoHOrDoL && (jobLevel <= 1 || (jobExp == 0 && jobLevel is 30 or 50 or 60 or 70 or 80)))
+            var startLv = Math.Max(1, (int)job.Value.StartingLevel);
+            if (!isActiveJob && !isDoHOrDoL && (jobLevel <= 1 || (jobExp == 0 && jobLevel <= startLv)))
             {
                 continue;
             }
 
-            var abbr = job.Value.Abbreviation.ExtractText();
-            if (!InventorySafetyEvaluator.CanJobUseCategory(category, abbr))
+            if (!InventorySafetyEvaluator.CanJobUseCategory(category, jobId))
             {
                 continue;
             }
@@ -1399,7 +1388,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return set;
         }
 
-        for (var i = 0; i < 100; i++)
+        for (var i = 0; i < gm->Entries.Length; i++)
         {
             var entry = gm->GetGearset(i);
             if (entry != null && entry->Flags.HasFlag(FFXIVClientStructs.FFXIV.Client.UI.Misc.RaptureGearsetModule.GearsetFlag.Exists))
@@ -1438,8 +1427,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 continue;
             }
 
-            var abbr = job.Value.Abbreviation.ExtractText();
-            if (InventorySafetyEvaluator.CanJobUseCategory(category, abbr) && itemIlvl < topIlvl - 5)
+            if (InventorySafetyEvaluator.CanJobUseCategory(category, jobId) && topIlvl > 0 && itemIlvl < topIlvl - 5)
             {
                 return true;
             }
@@ -1450,7 +1438,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
     private static bool IsUnlockableOrCoffer(Item itemRow, string name, string uiCat)
     {
-        if (ProtectedUnlockableCategoryIds.Contains(itemRow.ItemUICategory.RowId) || UnlockableCategories.Contains(uiCat))
+        if (ItemIdentity.IsUnlockableCategory(itemRow))
         {
             return true;
         }
@@ -1465,8 +1453,8 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         return itemRow.ItemAction.RowId > 0
             && itemRow.EquipSlotCategory.RowId == 0
-            && !CraftingStapleCategories.Contains(uiCat)
-            && !string.Equals(uiCat, "Medicine", StringComparison.OrdinalIgnoreCase);
+            && !ItemIdentity.CraftingStapleCategoryIds.Contains(itemRow.ItemUICategory.RowId)
+            && !ItemIdentity.ProtectedConsumableCategoryIds.Contains(itemRow.ItemUICategory.RowId);
     }
 
     private static bool IsActiveUtilityConsumable(string name)
@@ -1653,7 +1641,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         }
 
         var levels = new int[8];
-        var sigChars = new char[8];
         for (var ct = 0; ct < 8; ct++)
         {
             var job = classJobSheet.GetRowOrDefault(CraftTypeToClassJobId[ct]);
@@ -1661,11 +1648,9 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             {
                 levels[ct] = ps->ClassJobLevels[job.Value.ExpArrayIndex];
             }
-
-            sigChars[ct] = (char)Math.Clamp(levels[ct] + 32, 32, 126);
         }
 
-        var sig = new string(sigChars);
+        var sig = string.Join(',', levels);
         if (contentId == cachedCraftCharId && sig == cachedCraftLevelSignature)
         {
             return cachedUpcomingCraftIngredients;

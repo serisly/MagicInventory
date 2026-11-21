@@ -186,6 +186,8 @@ public sealed unsafe class UseItemsPlanner
         {
             var captured = item;
             var expectedQtyBefore = captured.Quantity;
+            var expectedTotalBefore = 0;
+            var usedIsHq = false;
             var dispatched = false;
 
             steps.Add(new TransactionStep(
@@ -211,6 +213,7 @@ public sealed unsafe class UseItemsPlanner
                     {
                         dispatched = true;
                         expectedQtyBefore = 0;
+                        expectedTotalBefore = 0;
                         return true;
                     }
 
@@ -221,7 +224,10 @@ public sealed unsafe class UseItemsPlanner
                     }
 
                     expectedQtyBefore = slot->Quantity;
-                    var ok = actionMgr->UseAction(ActionType.Item, captured.RawItemId, 0xE0000000, 65535);
+                    usedIsHq = ItemIdentity.IsHighQuality(slot);
+                    expectedTotalBefore = mgr->GetInventoryItemCount(captured.BaseItemId, usedIsHq, false, false);
+                    var actionItemId = ItemIdentity.ToActionItemId(captured.BaseItemId, usedIsHq);
+                    var ok = actionMgr->UseAction(ActionType.Item, actionItemId, 0xE0000000, 65535);
                     if (!ok)
                     {
                         return false;
@@ -241,6 +247,12 @@ public sealed unsafe class UseItemsPlanner
                     if (mgr == null)
                     {
                         return false;
+                    }
+
+                    if (expectedTotalBefore > 0
+                        && mgr->GetInventoryItemCount(captured.BaseItemId, usedIsHq, false, false) < expectedTotalBefore)
+                    {
+                        return true;
                     }
 
                     var container = mgr->GetInventoryContainer(captured.Container);

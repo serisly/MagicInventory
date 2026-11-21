@@ -108,11 +108,9 @@ public sealed unsafe class MarketListingPlanner
                     continue;
                 }
 
-                var isHq = rawId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                // Fail-closed on HQ items: NEVER fall back to NQ price if no verified HQ market price exists!
-                var unitPrice = isHq
-                    ? entry.TargetPriceHq
-                    : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
+                var isHq = ItemIdentity.IsHighQuality(slot);
+                // Fail-closed: HQ uses ONLY TargetPriceHq; NQ uses ONLY TargetPriceNq (never cross-list NQ at HQ price!)
+                var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
 
                 var minAllowed = Math.Max(2L, itemRow.Value.PriceLow + 1L);
                 if (unitPrice < minAllowed || unitPrice > 999_999_999L)
@@ -292,7 +290,8 @@ public sealed unsafe class MarketListingPlanner
                 },
                 HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"),
                 PacingProfile.MarketFormEntry,
-                SecondaryRequiredAddon: "RetainerSell"));
+                SecondaryRequiredAddon: "RetainerSell",
+                SkipOnFailureCount: 2));
 
             steps.Add(new TransactionStep(
                 $"Set price for {captured.Name} ({captured.UnitPrice:N0}g)",
@@ -323,10 +322,11 @@ public sealed unsafe class MarketListingPlanner
                 HasServerAck: () =>
                 {
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
-                    return sellAddon != null && sellAddon->AskingPrice != null;
+                    return sellAddon != null && DoesAskingPriceMatch(sellAddon->AskingPrice, targetUnitPrice);
                 },
                 PacingProfile.MarketFormEntry,
-                SecondaryRequiredAddon: "RetainerSellList"));
+                SecondaryRequiredAddon: "RetainerSellList",
+                SkipOnFailureCount: 1));
 
             steps.Add(new TransactionStep(
                 $"Confirm {captured.Name} for {captured.UnitPrice:N0}g",
@@ -451,7 +451,7 @@ public sealed unsafe class MarketListingPlanner
 
         if (input->AtkTextNode == null)
         {
-            return true;
+            return false;
         }
 
         var raw = NativeUiHelpers.ReadTextNodeValue(input->AtkTextNode);
