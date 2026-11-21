@@ -22,7 +22,14 @@ public sealed record MarketPriceSnapshot(
     float RegularSaleVelocity,
     DateTime FetchedUtc,
     int ListingCount = -1,
-    int RecentHistoryMedianHq = 0);
+    int RecentHistoryMedianHq = 0,
+    float NqSaleVelocity = 0f,
+    float HqSaleVelocity = 0f,
+    long LastSaleUnixNq = 0,
+    long LastSaleUnixHq = 0,
+    int SalesLast7DaysNq = 0,
+    int SalesLast7DaysHq = 0,
+    int SchemaVersion = 0);
 
 public sealed record DcCheapestListing(
     uint ItemId,
@@ -39,6 +46,7 @@ public sealed record DcCheapestListing(
 /// </summary>
 public sealed class UniversalisClient : IDisposable
 {
+    public const int CurrentSnapshotSchemaVersion = 2;
     public static readonly TimeSpan CacheTtl = TimeSpan.FromHours(6);
     private const int BatchSize = 95;
     private const int MinDelayBetweenRequestsMs = 1050;
@@ -100,7 +108,8 @@ public sealed class UniversalisClient : IDisposable
             return false;
         }
 
-        if ((DateTime.UtcNow - entry.FetchedUtc) > CacheTtl)
+        if (entry.SchemaVersion < CurrentSnapshotSchemaVersion
+            || (DateTime.UtcNow - entry.FetchedUtc) > CacheTtl)
         {
             return false;
         }
@@ -137,7 +146,10 @@ public sealed class UniversalisClient : IDisposable
             }
 
             var key = (world, id);
-            if (!forceRefresh && cache.TryGetValue(key, out var existing) && (now - existing.FetchedUtc) <= CacheTtl)
+            if (!forceRefresh
+                && cache.TryGetValue(key, out var existing)
+                && existing.SchemaVersion >= CurrentSnapshotSchemaVersion
+                && (now - existing.FetchedUtc) <= CacheTtl)
             {
                 continue;
             }
@@ -338,7 +350,7 @@ public sealed class UniversalisClient : IDisposable
     private async Task<int> FetchBatchWithBackoffAsync(string world, List<uint> itemIds, CancellationToken ct)
     {
         var idsJoined = string.Join(',', itemIds);
-        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=5&entries=5";
+        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=10&entries=10";
 
         for (var attempt = 0; attempt < 3; attempt++)
         {
@@ -362,7 +374,9 @@ public sealed class UniversalisClient : IDisposable
                     var shortExpiryFetch = DateTime.UtcNow - CacheTtl + TimeSpan.FromMinutes(15);
                     foreach (var requestedId in itemIds)
                     {
-                        cache.TryAdd((world, requestedId), new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, shortExpiryFetch, -1));
+                        cache.TryAdd(
+                            (world, requestedId),
+                            new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, shortExpiryFetch, -1, SchemaVersion: CurrentSnapshotSchemaVersion));
                     }
 
                     lastError = string.Empty;
@@ -409,7 +423,8 @@ public sealed class UniversalisClient : IDisposable
                 {
                     if (!returnedIds.Contains(requestedId))
                     {
-                        cache[(world, requestedId)] = new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, missingFetchUtc, -1);
+                        cache[(world, requestedId)] = new MarketPriceSnapshot(
+                            requestedId, 0, 0, 0, 0, 0f, missingFetchUtc, -1, SchemaVersion: CurrentSnapshotSchemaVersion);
                         updated++;
                     }
                 }
@@ -440,7 +455,9 @@ public sealed class UniversalisClient : IDisposable
         var minHq = ReadInt(el, "minPriceHQ");
         var minAny = ReadInt(el, "minPrice");
         var velocity = ReadFloat(el, "regularSaleVelocity");
-        var (medianNq, medianHq) = ComputeRecentHistoryMedians(el);
+        var nqVelocity = ReadFloat(el, "nqSaleVelocity");
+        var hqVelocity = ReadFloat(el, "hqSaleVelocity");
+        var history = AnalyzeRecentHistory(el, fetchedUtc);
 
         int listingCount;
         if (el.TryGetProperty("listingsCount", out var lcEl) && lcEl.ValueKind == JsonValueKind.Number && lcEl.TryGetInt32(out var lc))
@@ -456,37 +473,76 @@ public sealed class UniversalisClient : IDisposable
             listingCount = minAny > 0 ? 1 : 0;
         }
 
-        snapshot = new MarketPriceSnapshot(itemId, minNq, minHq, minAny, medianNq, velocity, fetchedUtc, listingCount, medianHq);
+        snapshot = new MarketPriceSnapshot(
+            itemId,
+            minNq,
+            minHq,
+            minAny,
+            history.MedianNq,
+            velocity,
+            fetchedUtc,
+            listingCount,
+            history.MedianHq,
+            nqVelocity,
+            hqVelocity,
+            history.LastSaleUnixNq,
+            history.LastSaleUnixHq,
+            history.SalesLast7DaysNq,
+            history.SalesLast7DaysHq,
+            CurrentSnapshotSchemaVersion);
         return true;
     }
 
-    private static (int MedianNq, int MedianHq) ComputeRecentHistoryMedians(JsonElement el)
+    private readonly record struct HistoryStats(
+        int MedianNq,
+        int MedianHq,
+        long LastSaleUnixNq,
+        long LastSaleUnixHq,
+        int SalesLast7DaysNq,
+        int SalesLast7DaysHq);
+
+    private static HistoryStats AnalyzeRecentHistory(JsonElement el, DateTime fetchedUtc)
     {
         if (!el.TryGetProperty("recentHistory", out var histEl) || histEl.ValueKind != JsonValueKind.Array)
         {
-            return (0, 0);
+            return default;
         }
 
-        var nqPrices = new List<int>(8);
-        var hqPrices = new List<int>(8);
-        var allPrices = new List<int>(8);
+        var sevenDaysCutoffUnix = new DateTimeOffset(fetchedUtc).ToUnixTimeSeconds() - (7L * 86400L);
+        var nqPrices = new List<int>(10);
+        var hqPrices = new List<int>(10);
+        long lastNqUnix = 0;
+        long lastHqUnix = 0;
+        var sales7dNq = 0;
+        var sales7dHq = 0;
+
         foreach (var entry in histEl.EnumerateArray())
         {
+            // Ignore mannequin transfers so gil transfers never poison medians or sale recency
+            if (entry.TryGetProperty("onMannequin", out var manEl) && manEl.ValueKind == JsonValueKind.True)
+            {
+                continue;
+            }
+
             var price = ReadInt(entry, "pricePerUnit");
             if (price <= 0)
             {
                 continue;
             }
 
-            allPrices.Add(price);
+            var ts = ReadLong(entry, "timestamp");
             var isHq = entry.TryGetProperty("hq", out var hqEl) && hqEl.ValueKind == JsonValueKind.True;
             if (isHq)
             {
                 hqPrices.Add(price);
+                if (ts > lastHqUnix) lastHqUnix = ts;
+                if (ts >= sevenDaysCutoffUnix) sales7dHq++;
             }
             else
             {
                 nqPrices.Add(price);
+                if (ts > lastNqUnix) lastNqUnix = ts;
+                if (ts >= sevenDaysCutoffUnix) sales7dNq++;
             }
         }
 
@@ -504,9 +560,23 @@ public sealed class UniversalisClient : IDisposable
                 : (list[mid - 1] + list[mid]) / 2;
         }
 
-        var medNq = nqPrices.Count > 0 ? Median(nqPrices) : Median(allPrices);
-        var medHq = Median(hqPrices);
-        return (medNq, medHq);
+        return new HistoryStats(
+            Median(nqPrices),
+            Median(hqPrices),
+            lastNqUnix,
+            lastHqUnix,
+            sales7dNq,
+            sales7dHq);
+    }
+
+    private static long ReadLong(JsonElement obj, string prop)
+    {
+        if (obj.TryGetProperty(prop, out var el) && el.ValueKind == JsonValueKind.Number && el.TryGetInt64(out var val))
+        {
+            return val;
+        }
+
+        return 0L;
     }
 
     private static int ReadInt(JsonElement obj, string prop)
@@ -544,7 +614,7 @@ public sealed class UniversalisClient : IDisposable
 
     private sealed class DiskCacheDto
     {
-        public int Version { get; set; } = 1;
+        public int Version { get; set; } = CurrentSnapshotSchemaVersion;
         public Dictionary<string, Dictionary<uint, MarketPriceSnapshot>> Worlds { get; set; } = new();
     }
 

@@ -853,14 +853,44 @@ public sealed class SettingsWindow : Window
             changed = true;
         }
 
+        var reviewBeforeConfirm = config.MarketReviewBeforeConfirm;
+        if (ImGui.Checkbox("Review price before confirming (Magic Sell prefills price without submitting)", ref reviewBeforeConfirm))
+        {
+            config.MarketReviewBeforeConfirm = reviewBeforeConfirm;
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, "    Opens Retainer Sell and sets the undercut price so you inspect and click Confirm yourself.");
+
+        var autoFillSell = config.MarketAutoFillRetainerSell;
+        if (ImGui.Checkbox("Auto-fill undercut price when opening Retainer Sell / Compare Prices", ref autoFillSell))
+        {
+            config.MarketAutoFillRetainerSell = autoFillSell;
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, "    Sets the asking price from live Compare Prices (excluding your own retainers) or world history.");
+
+        var promptStale = config.MarketPromptStaleListings;
+        if (ImGui.Checkbox("Prompt to remove or reprice stale / unrealistic active listings", ref promptStale))
+        {
+            config.MarketPromptStaleListings = promptStale;
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, "    Flags dead, below-vendor, or heavily overpriced listings in Retainer Sell List.");
+
+        ImGui.BeginDisabled(config.MarketReviewBeforeConfirm);
         var onePerClick = config.MarketOneListingPerClick;
-        if (ImGui.Checkbox("Magic Sell lists one item per click", ref onePerClick))
+        if (ImGui.Checkbox("Magic Sell lists one item per click (auto-confirm mode)", ref onePerClick))
         {
             config.MarketOneListingPerClick = onePerClick;
             changed = true;
         }
 
-        ImGui.TextColored(ColorMuted, "    Keeps every Market Board listing tied to a click. Magic Buy is always one purchase per click.");
+        ImGui.EndDisabled();
+
+        ImGui.TextColored(ColorMuted, "    Only applies when auto-confirm is enabled. Review mode always prepares one item at a time.");
 
         ImGui.SetNextItemWidth(160f);
         var dailyLimit = config.MarketDailyActionLimit;
@@ -927,6 +957,30 @@ public sealed class SettingsWindow : Window
             }
 
             ImGui.SetNextItemWidth(160f);
+            var maxDays = config.MarketMaxDaysSinceLastSale;
+            if (ImGui.InputInt("Max days since last sale for Market", ref maxDays, 1, 7))
+            {
+                config.MarketMaxDaysSinceLastSale = Math.Clamp(maxDays, 1, 90);
+                changed = true;
+            }
+
+            ImGui.SetNextItemWidth(160f);
+            var maxCompDays = config.MarketMaxCompetitionDays;
+            if (ImGui.InputInt("Max seller backlog (days) before oversupplied", ref maxCompDays, 5, 15))
+            {
+                config.MarketMaxCompetitionDays = Math.Clamp(maxCompDays, 5, 180);
+                changed = true;
+            }
+
+            ImGui.SetNextItemWidth(160f);
+            var stalePct = config.StaleListingUndercutPct;
+            if (ImGui.InputInt("Flag active listing if overpriced by (%)", ref stalePct, 5, 10))
+            {
+                config.StaleListingUndercutPct = Math.Clamp(stalePct, 5, 200);
+                changed = true;
+            }
+
+            ImGui.SetNextItemWidth(160f);
             var vendorMaxStack = config.VendorMaxStackValue;
             if (ImGui.InputInt("Max stack value to sell to Vendor (Gil)", ref vendorMaxStack, 50, 200))
             {
@@ -952,6 +1006,10 @@ public sealed class SettingsWindow : Window
             config.BuyOutlierMultiplier = 2.5f;
             config.EnableLifestreamWorldHopPrompt = false;
             config.EnableHoverHighlights = true;
+            config.MarketReviewBeforeConfirm = true;
+            config.MarketAutoFillRetainerSell = true;
+            config.MarketPromptStaleListings = true;
+            config.StaleListingUndercutPct = 25;
             config.MarketOneListingPerClick = true;
             config.MarketDailyActionLimit = 20;
             changed = true;

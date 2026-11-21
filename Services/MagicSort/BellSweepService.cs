@@ -714,6 +714,14 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
+        // Review mode: RetainerSell is open and prefilled for manual inspection — stop cleanly without closing it.
+        if (magicSort.IsMarketReviewOnly)
+        {
+            magicSort.InvalidateButtonCache();
+            Stop("Prepared 1 listing for review. Inspect price and click Confirm, then click Prep Sell for the next item.");
+            return;
+        }
+
         // One listing per click: stop after the first listing pass so every listing is a separate user click.
         if (magicSort.IsMarketOnePerClick)
         {

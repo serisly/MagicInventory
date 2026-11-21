@@ -30,6 +30,9 @@ public sealed class Plugin : IDalamudPlugin
     private readonly InventoryHighlightController inventoryHighlightController;
     private readonly InventoryRouteOverlay inventoryRouteOverlay;
     private readonly ItemContextMenuController itemContextMenuController;
+    private readonly ActiveListingAuditor activeListingAuditor;
+    private readonly RetainerSellPriceController retainerSellPriceController;
+    private readonly StaleListingsOverlay staleListingsOverlay;
     private RecipeNoteController? recipeNoteController;
     private RetainerController? retainerController;
     private MarketBoardController? marketBoardController;
@@ -154,6 +157,22 @@ public sealed class Plugin : IDalamudPlugin
             MagicSort,
             MaterialTracker,
             inventoryHighlightController);
+        activeListingAuditor = new ActiveListingAuditor(
+            dataManager,
+            gameGui,
+            chatGui,
+            Configuration,
+            Universalis,
+            TriageEngine,
+            TransactionQueue);
+        retainerSellPriceController = new RetainerSellPriceController(
+            dataManager,
+            gameGui,
+            Configuration,
+            Holdings,
+            Universalis,
+            TriageEngine);
+        staleListingsOverlay = new StaleListingsOverlay(gameGui, Configuration, activeListingAuditor);
 
         settingsWindow = new SettingsWindow(
             pluginInterface,
@@ -234,6 +253,8 @@ public sealed class Plugin : IDalamudPlugin
     {
         windowSystem.Draw();
         inventoryRouteOverlay.Draw();
+        retainerSellPriceController.Draw();
+        staleListingsOverlay.Draw();
     }
 
     private void ToggleSettingsWindow() => settingsWindow.IsOpen = !settingsWindow.IsOpen;

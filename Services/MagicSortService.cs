@@ -981,11 +981,13 @@ public sealed unsafe class MagicSortService : IDisposable
             var plans = marketPlanner.PlanListings(batchLimit, entries);
             if (plans.Count > 0)
             {
-                state = new MagicSortButtonState(
-                    true,
-                    true,
-                    $"Magic Sell ({plans.Count})",
-                    FormatMarketSellTooltip(plans));
+                var label = configuration.MarketReviewBeforeConfirm
+                    ? $"Prep Sell ({plans.Count})"
+                    : $"Magic Sell ({plans.Count})";
+                var tooltip = configuration.MarketReviewBeforeConfirm
+                    ? "Review mode: opens & prefills 1 item so you can inspect the price before confirming.\n" + FormatMarketSellTooltip(plans)
+                    : FormatMarketSellTooltip(plans);
+                state = new MagicSortButtonState(true, true, label, tooltip);
             }
             else
             {
@@ -1025,6 +1027,8 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public bool IsMarketOnePerClick => configuration.MarketOneListingPerClick;
 
+    public bool IsMarketReviewOnly => configuration.MarketReviewBeforeConfirm;
+
     public void ExecuteMarketSortFromOrchestrator() => ExecuteMarketSortInternal(fromOrchestrator: true);
 
     private void ExecuteMarketSortInternal(bool fromOrchestrator)
@@ -1046,15 +1050,18 @@ public sealed unsafe class MagicSortService : IDisposable
                 return (Array.Empty<TransactionStep>(), false);
             }
 
+            var reviewOnly = configuration.MarketReviewBeforeConfirm;
             var remainingToday = configuration.GetRemainingMarketActionsToday();
-            if (remainingToday <= 0)
+            if (!reviewOnly && remainingToday <= 0)
             {
                 chatGui.Print($"Magic Sell: daily limit reached ({configuration.MarketDailyActionLimit} Market Board actions). List the rest manually or raise the limit in Settings.");
                 return (Array.Empty<TransactionStep>(), false);
             }
 
-            var perClick = configuration.MarketOneListingPerClick ? 1 : MaxThreeStepBatchItems;
-            var batchLimit = Math.Min(Math.Min(perClick, availableSlots), remainingToday);
+            var perClick = (reviewOnly || configuration.MarketOneListingPerClick) ? 1 : MaxThreeStepBatchItems;
+            var batchLimit = reviewOnly
+                ? Math.Min(1, availableSlots)
+                : Math.Min(Math.Min(perClick, availableSlots), remainingToday);
             var probeLimit = Math.Min(batchLimit + 1, availableSlots);
             var plans = marketPlanner.PlanListings(probeLimit, GetLatestManifest());
             var hasMore = plans.Count > batchLimit;
@@ -1063,7 +1070,13 @@ public sealed unsafe class MagicSortService : IDisposable
                 plans.RemoveRange(batchLimit, plans.Count - batchLimit);
             }
 
-            var steps = marketPlanner.BuildListingSteps(plans, GetLatestManifest);
+            var steps = marketPlanner.BuildListingSteps(plans, GetLatestManifest, reviewOnly: reviewOnly);
+            if (reviewOnly)
+            {
+                // Review mode leaves RetainerSell open for user confirmation — don't consume automated action quota.
+                return (steps, hasMore);
+            }
+
             var counted = new List<TransactionStep>(steps.Count);
             for (var i = 0; i < steps.Count; i++)
             {

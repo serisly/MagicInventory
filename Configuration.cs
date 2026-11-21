@@ -52,6 +52,8 @@ public sealed class Configuration : IPluginConfiguration
     public int MarketMinUnitPrice { get; set; } = 1000;
     public int MarketMinFloorUnitPrice { get; set; } = 50;
     public float MarketMinVelocity { get; set; } = 0.5f;
+    public int MarketMaxDaysSinceLastSale { get; set; } = 14;
+    public int MarketMaxCompetitionDays { get; set; } = 30;
     public int MarketUndercutGil { get; set; } = 1;
 
     public int VendorMaxStackValue { get; set; } = 400;
@@ -67,6 +69,8 @@ public sealed class Configuration : IPluginConfiguration
                 MarketMinUnitPrice = 1000;
                 MarketMinFloorUnitPrice = 50;
                 MarketMinVelocity = 0.5f;
+                MarketMaxDaysSinceLastSale = 14;
+                MarketMaxCompetitionDays = 30;
                 VendorMaxStackValue = 400;
                 VendorMaxVelocity = 0.5f;
                 break;
@@ -74,7 +78,9 @@ public sealed class Configuration : IPluginConfiguration
                 MarketMinStackValue = 1000;
                 MarketMinUnitPrice = 500;
                 MarketMinFloorUnitPrice = 50;
-                MarketMinVelocity = 0.25f;
+                MarketMinVelocity = 0.35f;
+                MarketMaxDaysSinceLastSale = 21;
+                MarketMaxCompetitionDays = 45;
                 VendorMaxStackValue = 600;
                 VendorMaxVelocity = 1.0f;
                 break;
@@ -82,7 +88,9 @@ public sealed class Configuration : IPluginConfiguration
                 MarketMinStackValue = 500;
                 MarketMinUnitPrice = 250;
                 MarketMinFloorUnitPrice = 30;
-                MarketMinVelocity = 0.1f;
+                MarketMinVelocity = 0.2f;
+                MarketMaxDaysSinceLastSale = 30;
+                MarketMaxCompetitionDays = 60;
                 VendorMaxStackValue = 1000;
                 VendorMaxVelocity = 5.0f;
                 break;
@@ -95,7 +103,11 @@ public sealed class Configuration : IPluginConfiguration
     public bool EnableLifestreamWorldHopPrompt { get; set; } = false;
     public int WorldHopMinSavingsGil { get; set; } = 5_000;
 
-    // Market Board automation limits (lower automation footprint)
+    // Market Board selling workflow & safety limits
+    public bool MarketReviewBeforeConfirm { get; set; } = true;
+    public bool MarketAutoFillRetainerSell { get; set; } = true;
+    public bool MarketPromptStaleListings { get; set; } = true;
+    public int StaleListingUndercutPct { get; set; } = 25;
     public bool MarketOneListingPerClick { get; set; } = true;
     public int MarketDailyActionLimit { get; set; } = 20;
     public string MarketActionsDay { get; set; } = string.Empty;

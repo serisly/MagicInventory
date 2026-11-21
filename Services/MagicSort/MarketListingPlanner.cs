@@ -159,9 +159,11 @@ public sealed unsafe class MarketListingPlanner
 
     public List<TransactionStep> BuildListingSteps(
         IReadOnlyList<MarketPlanItem> plans,
-        Func<IReadOnlyDictionary<uint, MagicSortEntry>> getManifest)
+        Func<IReadOnlyDictionary<uint, MagicSortEntry>> getManifest,
+        bool reviewOnly = false)
     {
-        var steps = new List<TransactionStep>(plans.Count * 3);
+        var stepsPerItem = reviewOnly ? 2 : 3;
+        var steps = new List<TransactionStep>(plans.Count * stepsPerItem);
         foreach (var plan in plans)
         {
             var captured = plan;
@@ -233,7 +235,7 @@ public sealed unsafe class MarketListingPlanner
                 HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"),
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSell",
-                SkipOnFailureCount: 2));
+                SkipOnFailureCount: reviewOnly ? 1 : 2));
 
             steps.Add(new TransactionStep(
                 $"Set price for {captured.Name} ({captured.UnitPrice:N0}g)",
@@ -268,7 +270,13 @@ public sealed unsafe class MarketListingPlanner
                 },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSellList",
-                SkipOnFailureCount: 1));
+                SkipOnFailureCount: reviewOnly ? 0 : 1));
+
+            if (reviewOnly)
+            {
+                // Review mode: stop with RetainerSell open & price prefilled so the user inspects and clicks Confirm themselves.
+                continue;
+            }
 
             steps.Add(new TransactionStep(
                 $"Confirm {captured.Name} for {captured.UnitPrice:N0}g",

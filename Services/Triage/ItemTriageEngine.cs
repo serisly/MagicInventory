@@ -534,13 +534,16 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             }
         }
 
+        var nqMinRaw = mkt != null
+            ? (mkt.MinPriceNq > 0 ? mkt.MinPriceNq : (mkt.SchemaVersion < UniversalisClient.CurrentSnapshotSchemaVersion ? mkt.MinPriceAny : 0))
+            : 0;
         var targetNq = mkt != null && isMarketable
-            ? ComputeTargetPrice(mkt.MinPriceNq > 0 ? mkt.MinPriceNq : mkt.MinPriceAny, mkt.RecentHistoryMedian, priceLow)
+            ? MarketViabilityEvaluator.ComputeUndercutPrice(nqMinRaw, mkt.RecentHistoryMedian, priceLow, configuration.MarketUndercutGil)
             : 0L;
         // Fail-closed for HQ items: ONLY compute an HQ listing price when Universalis has a real HQ minimum price,
         // and cap against HQ history median (NOT NQ history median!)
         var targetHq = mkt != null && isMarketable && itemRow.CanBeHq && mkt.MinPriceHq > 0
-            ? ComputeTargetPrice(mkt.MinPriceHq, mkt.RecentHistoryMedianHq, priceLow)
+            ? MarketViabilityEvaluator.ComputeUndercutPrice(mkt.MinPriceHq, mkt.RecentHistoryMedianHq, priceLow, configuration.MarketUndercutGil)
             : 0L;
 
         // 0. Explicit Manual User Override (always wins over automatic rules)
@@ -767,9 +770,10 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 return KeepEntry(baseId, name, priceLow, untradable, "Checking Market Board price...");
             }
 
-            var unitPrice = ComputeRealisticUnitPrice(mkt, preferHq);
-            var velocity = mkt.RegularSaleVelocity;
-            var stackVal = (long)unitPrice * Math.Max(obs.TotalQty, 1);
+            var viability = MarketViabilityEvaluator.Evaluate(mkt, preferHq, obs.TotalQty, priceLow, configuration);
+            var unitPrice = viability.RealisticUnitPrice;
+            var velocity = viability.EffectiveVelocity;
+            var stackVal = viability.RealisticStackValue;
             var totalRetainerQty = retainers.Sum(r => r.Quantities.GetValueOrDefault(baseId));
             var listingCount = mkt.ListingCount; // -1 = legacy cache (unknown), 0 = scarce/out of stock, >0 = active listings
             var isZeroListings = listingCount == 0;
@@ -808,7 +812,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     }
                 }
 
-                // Dead-market junk check — same rules whether the item is in Bags or inside a Retainer
+                // Dead-market junk check — uses quality-specific velocity & realistic price
                 var isDeadMarketPrice = unitPrice > 0
                     && unitPrice <= Math.Max(priceLow * 2L, 30L)
                     && stackVal < configuration.VendorMaxStackValue
@@ -831,9 +835,9 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 }
             }
 
-            // 10b. High-value tradable surplus -> Market
-            //      Never auto-list Materia, Dyes, Catalysts, or Fishing Tackle (store on retainer unless manually overridden).
-            //      Safe mode keeps retainer crafting staples; Balanced/Purge only protect upcoming craft ingredients.
+            // 10b. Realistic high-value tradable surplus -> Market
+            //      Uses MarketViabilityEvaluator (quality-specific velocity, recency, oversupply saturation,
+            //      anti-manipulation median cap, and value floors) so dead/unrealistic items never clog Market slots.
             var isCraftingStaple = (isUpcomingCraft || (sellMode == SellMode.Safe && totalRetainerQty > 0))
                 && ItemIdentity.CraftingStapleCategoryIds.Contains(uiCatId)
                 && unitPrice < 1500;
@@ -843,10 +847,9 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             if (!obs.AllEquipSoulbound
                 && !isProtectedStoreCat
                 && !isCraftingStaple
+                && !isZeroListings
                 && purgeCraftAllowed
-                && unitPrice >= configuration.MarketMinFloorUnitPrice
-                && (stackVal >= configuration.MarketMinStackValue || unitPrice >= configuration.MarketMinUnitPrice)
-                && velocity >= configuration.MarketMinVelocity)
+                && viability.IsRealisticToSell)
             {
                 return new MagicSortEntry(
                     baseId,
@@ -858,7 +861,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     targetHq,
                     priceLow,
                     untradable,
-                    $"Worth selling (~{unitPrice:N0}g ea, ~{stackVal:N0}g total)");
+                    viability.Reason);
             }
 
             // Note scarce 0-listing items clearly when routing to retainer
@@ -868,6 +871,18 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     baseId, name, uiCat, isEquip, preferHq, stackSize, priceLow, untradable, retainers, profile,
                     preferMaterialsRetainer: false,
                     overrideReasonPrefix: "Rare — 0 on Market Board");
+            }
+
+            // Explain clearly when an item had high listing price but failed liquidity/frequency checks
+            if (viability.IsDeadOrIlliquid
+                && !isProtectedStoreCat
+                && (viability.ServerCheapest >= configuration.MarketMinUnitPrice
+                    || (long)viability.ServerCheapest * Math.Max(obs.TotalQty, 1) >= configuration.MarketMinStackValue))
+            {
+                return RouteToBestRetainer(
+                    baseId, name, uiCat, isEquip, preferHq, stackSize, priceLow, untradable, retainers, profile,
+                    preferMaterialsRetainer: false,
+                    overrideReasonPrefix: $"Stored ({viability.Reason})");
             }
         }
 
@@ -1092,42 +1107,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         }
 
         return false;
-    }
-
-    private long ComputeTargetPrice(int rawMin, int histMedian, long priceLow)
-    {
-        if (rawMin <= 0 && histMedian <= 0)
-        {
-            return 0;
-        }
-
-        var floorPrice = Math.Max(
-            Math.Max(priceLow * 2L, histMedian > 0 ? (long)(histMedian * 0.55) : 0L),
-            Math.Max(2L, configuration.MarketMinFloorUnitPrice));
-
-        long effective = rawMin > 0 ? rawMin : histMedian;
-        if (rawMin > 0 && histMedian > 0 && rawMin > histMedian * 4L)
-        {
-            effective = (long)(histMedian * 1.5);
-        }
-
-        var undercutStep = Math.Max(0, configuration.MarketUndercutGil);
-        var undercut = effective > floorPrice + undercutStep ? effective - undercutStep : floorPrice;
-        return Math.Max(undercut, floorPrice);
-    }
-
-    private static int ComputeRealisticUnitPrice(MarketPriceSnapshot mkt, bool preferHq)
-    {
-        var raw = preferHq && mkt.MinPriceHq > 0
-            ? mkt.MinPriceHq
-            : (mkt.MinPriceNq > 0 ? mkt.MinPriceNq : mkt.MinPriceAny);
-        var med = mkt.RecentHistoryMedian;
-        if (raw > 0 && med > 0)
-        {
-            return raw > med * 4 ? (int)(med * 1.5) : raw;
-        }
-
-        return raw > 0 ? raw : med;
     }
 
     private bool IsUnlockedCrafterGathererTool(Item itemRow, Dictionary<uint, int> unlockedJobTopIlvl)
