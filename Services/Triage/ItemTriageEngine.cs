@@ -21,43 +21,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 {
     private const double SnapshotTtlMs = 1500.0;
 
-    private static readonly HashSet<string> CulinaryBotanyDefaultCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Ingredient",
-        "Seafood",
-        "Meal",
-        "Medicine",
-        "Reagent",
-        "Catalyst",
-        "Gardening",
-        "Fishing Tackle",
-    };
-
-    private static readonly HashSet<string> MaterialsDefaultCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Stone",
-        "Metal",
-        "Lumber",
-        "Cloth",
-        "Leather",
-        "Bone",
-        "Part",
-        "Materia",
-        "Dye",
-        "Furnishing",
-        "Demimateria",
-        "Miscellany",
-        "Other",
-    };
-
-    private static readonly HashSet<string> UnlockableCategories = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Minion",
-        "Orchestrion Roll",
-        "Triple Triad Card",
-        "Outfits",
-    };
-
     private static readonly string[] ActiveUtilityTokens =
     [
         "Gysahl Greens",
@@ -162,7 +125,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
     public int PendingPriceCount { get; private set; }
     public string ActiveWorldName => ResolveHomeWorldName();
     public string ActiveDataCenterName => ResolveDataCenterName();
-    public bool IsCabinetItem(uint baseItemId) => cabinetRowByItemId.ContainsKey(HoldingsService.NormalizeBaseItemId(baseItemId));
+    public bool IsCabinetItem(uint baseItemId) => cabinetRowByItemId.ContainsKey(ItemIdentity.NormalizeBaseItemId(baseItemId));
 
     public void Invalidate()
     {
@@ -225,7 +188,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         bool queuePriceIfMissing = false,
         bool ignoreManualOverride = false)
     {
-        var normalized = HoldingsService.NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
         if (normalized == 0)
         {
             return null;
@@ -283,113 +246,10 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
     private ItemObservation BuildSingleItemObservation(uint normalizedBaseId, IReadOnlyList<KnownRetainerInfo> retainers)
     {
-        var totalQty = 0;
-        var hasNq = false;
-        var hasHq = false;
-        var anyMelded = false;
-        var anyGlamoured = false;
-        var anyExtractableMateria = false;
-        var equipCount = 0;
-        var soulboundCount = 0;
-
-        var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(normalizedBaseId);
-        var manager = InventoryManager.Instance();
-        if (manager != null)
-        {
-            void Scan(InventoryType type, bool isEquipped)
-            {
-                var container = manager->GetInventoryContainer(type);
-                if (!InventorySafetyEvaluator.IsContainerReadable(container))
-                {
-                    return;
-                }
-
-                for (var i = 0; i < container->Size; i++)
-                {
-                    var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                    if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                    {
-                        continue;
-                    }
-
-                    if (HoldingsService.NormalizeBaseItemId(slot->ItemId) != normalizedBaseId)
-                    {
-                        continue;
-                    }
-
-                    totalQty += (int)slot->Quantity;
-                    var isHq = slot->ItemId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                    if (isHq)
-                    {
-                        hasHq = true;
-                    }
-                    else
-                    {
-                        hasNq = true;
-                    }
-
-                    if (slot->GetMateriaCount() > 0 || slot->Materia[0] != 0)
-                    {
-                        anyMelded = true;
-                    }
-
-                    if (slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0)
-                    {
-                        anyGlamoured = true;
-                    }
-
-                    if (itemRow is not null && InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot))
-                    {
-                        anyExtractableMateria = true;
-                    }
-
-                    if (!isEquipped)
-                    {
-                        equipCount++;
-                        if (slot->SpiritbondOrCollectability > 0)
-                        {
-                            soulboundCount++;
-                        }
-                    }
-                }
-            }
-
-            Scan(InventoryType.EquippedItems, isEquipped: true);
-
-            foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
-            {
-                Scan(bag, isEquipped: false);
-            }
-
-            foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
-            {
-                Scan(arm, isEquipped: false);
-            }
-
-            Scan(InventoryType.ArmorySoulCrystal, isEquipped: false);
-        }
-
-        foreach (var ret in retainers)
-        {
-            if (ret.Quantities.TryGetValue(normalizedBaseId, out var retQty) && retQty > 0)
-            {
-                totalQty += retQty;
-                var hqQty = ret.HqQuantities?.GetValueOrDefault(normalizedBaseId) ?? 0;
-                if (hqQty > 0)
-                {
-                    hasHq = true;
-                }
-
-                if (retQty > hqQty)
-                {
-                    hasNq = true;
-                }
-            }
-        }
-
-        if (totalQty <= 0)
-        {
-            return new ItemObservation(
+        var map = BuildItemObservations(retainers, filterBaseId: normalizedBaseId);
+        return map.TryGetValue(normalizedBaseId, out var obs)
+            ? obs
+            : new ItemObservation(
                 TotalQty: 1,
                 HasNq: true,
                 HasHq: false,
@@ -397,16 +257,6 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 AnyGlamoured: false,
                 AllEquipSoulbound: false,
                 AnyExtractableMateria: false);
-        }
-
-        return new ItemObservation(
-            TotalQty: totalQty,
-            HasNq: hasNq,
-            HasHq: hasHq,
-            AnyMelded: anyMelded,
-            AnyGlamoured: anyGlamoured,
-            AllEquipSoulbound: equipCount > 0 && soulboundCount == equipCount,
-            AnyExtractableMateria: anyExtractableMateria);
     }
 
     private void OnExternalDataUpdated()
@@ -491,7 +341,9 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         bool AllEquipSoulbound,
         bool AnyExtractableMateria);
 
-    private Dictionary<uint, ItemObservation> BuildItemObservations(IReadOnlyList<KnownRetainerInfo> retainers)
+    private Dictionary<uint, ItemObservation> BuildItemObservations(
+        IReadOnlyList<KnownRetainerInfo> retainers,
+        uint? filterBaseId = null)
     {
         var qtyById = new Dictionary<uint, int>();
         var hasNq = new HashSet<uint>();
@@ -506,34 +358,12 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var manager = InventoryManager.Instance();
         if (manager != null)
         {
-            Span<InventoryType> activeContainers =
-            [
-                InventoryType.Inventory1,
-                InventoryType.Inventory2,
-                InventoryType.Inventory3,
-                InventoryType.Inventory4,
-                InventoryType.EquippedItems,
-                InventoryType.ArmoryMainHand,
-                InventoryType.ArmoryOffHand,
-                InventoryType.ArmoryHead,
-                InventoryType.ArmoryBody,
-                InventoryType.ArmoryHands,
-                InventoryType.ArmoryWaist,
-                InventoryType.ArmoryLegs,
-                InventoryType.ArmoryFeets,
-                InventoryType.ArmoryEar,
-                InventoryType.ArmoryNeck,
-                InventoryType.ArmoryWrist,
-                InventoryType.ArmoryRings,
-                InventoryType.ArmorySoulCrystal,
-            ];
-
-            foreach (var cType in activeContainers)
+            void ScanContainer(InventoryType cType)
             {
                 var container = manager->GetInventoryContainer(cType);
                 if (!InventorySafetyEvaluator.IsContainerReadable(container))
                 {
-                    continue;
+                    return;
                 }
 
                 for (var i = 0; i < container->Size; i++)
@@ -544,11 +374,15 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         continue;
                     }
 
-                    var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
+                    var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+                    if (baseId == 0 || (filterBaseId.HasValue && baseId != filterBaseId.Value))
+                    {
+                        continue;
+                    }
+
                     qtyById[baseId] = qtyById.GetValueOrDefault(baseId) + slot->Quantity;
 
-                    var isHq = slot->ItemId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                    if (isHq)
+                    if (ItemIdentity.IsHighQuality(slot))
                     {
                         hasHq.Add(baseId);
                     }
@@ -586,11 +420,39 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     }
                 }
             }
+
+            foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
+            {
+                ScanContainer(bag);
+            }
+
+            ScanContainer(InventoryType.EquippedItems);
+
+            foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
+            {
+                ScanContainer(arm);
+            }
+
+            ScanContainer(InventoryType.ArmorySoulCrystal);
         }
 
         // Also include every item stored across the character's known retainers
         foreach (var ret in retainers)
         {
+            if (filterBaseId.HasValue)
+            {
+                var targetId = filterBaseId.Value;
+                if (ret.Quantities.TryGetValue(targetId, out var targetQty) && targetQty > 0)
+                {
+                    qtyById[targetId] = qtyById.GetValueOrDefault(targetId) + targetQty;
+                    var hqQty = ret.HqQuantities?.GetValueOrDefault(targetId) ?? 0;
+                    if (hqQty > 0) hasHq.Add(targetId);
+                    if (targetQty > hqQty) hasNq.Add(targetId);
+                }
+
+                continue;
+            }
+
             foreach (var (itemId, qty) in ret.Quantities)
             {
                 if (itemId == 0 || qty <= 0)
@@ -759,7 +621,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             return KeepEntry(baseId, name, priceLow, untradable, "In a Gearset");
         }
 
-        if (itemRow.EquipSlotCategory.RowId == 17 || itemRow.ItemUICategory.RowId == 62)
+        if (itemRow.EquipSlotCategory.RowId == 17 || ItemIdentity.IsSoulCrystal(itemRow))
         {
             return KeepEntry(baseId, name, priceLow, untradable, "Job Stone");
         }
@@ -1483,7 +1345,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         return itemRow.IsUntradable
             && itemRow.PriceLow == 0
             && itemRow.EquipSlotCategory.RowId == 0
-            && string.Equals(uiCat, "Other", StringComparison.OrdinalIgnoreCase)
+            && itemRow.ItemUICategory.RowId == ItemIdentity.UiCatOther
             && itemRow.ItemSearchCategory.RowId == 0;
     }
 
@@ -1715,7 +1577,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 var slot = InventorySafetyEvaluator.GetSlot(container, i);
                 if (slot != null && slot->ItemId != 0 && slot->Quantity > 0)
                 {
-                    ids.Add(HoldingsService.NormalizeBaseItemId(slot->ItemId));
+                    ids.Add(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
                 }
             }
         }
@@ -1743,7 +1605,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             var slot = InventorySafetyEvaluator.GetSlot(eq, i);
             if (slot != null && slot->ItemId != 0 && slot->Quantity > 0)
             {
-                ids.Add(HoldingsService.NormalizeBaseItemId(slot->ItemId));
+                ids.Add(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
             }
         }
 

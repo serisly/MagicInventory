@@ -98,7 +98,7 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                var rBaseId = HoldingsService.NormalizeBaseItemId(rSlot->ItemId);
+                var rBaseId = ItemIdentity.NormalizeBaseItemId(rSlot->ItemId);
                 retainerExistingBaseIds.Add(rBaseId);
 
                 var rRow = itemSheet.GetRowOrDefault(rBaseId);
@@ -144,7 +144,7 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                var pBaseId = HoldingsService.NormalizeBaseItemId(pSlot->ItemId);
+                var pBaseId = ItemIdentity.NormalizeBaseItemId(pSlot->ItemId);
                 playerExistingBaseIds.Add(pBaseId);
 
                 var pRow = itemSheet.GetRowOrDefault(pBaseId);
@@ -177,7 +177,7 @@ public sealed unsafe class RetainerSortPlanner
                 var eSlot = equipContainer->GetInventorySlot(i);
                 if (eSlot != null && eSlot->ItemId != 0 && eSlot->Quantity > 0)
                 {
-                    playerExistingBaseIds.Add(HoldingsService.NormalizeBaseItemId(eSlot->ItemId));
+                    playerExistingBaseIds.Add(ItemIdentity.NormalizeBaseItemId(eSlot->ItemId));
                 }
             }
         }
@@ -205,8 +205,8 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {
@@ -214,7 +214,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null || itemRow.Value.ItemUICategory.RowId == 62 || itemRow.Value.Rarity >= 4)
+                if (itemRow is null || ItemIdentity.IsSoulCrystal(itemRow.Value) || itemRow.Value.Rarity >= 4)
                 {
                     continue;
                 }
@@ -225,7 +225,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var stackSize = (int)Math.Max(1, itemRow.Value.StackSize);
-                var isHq = rawId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
+                var isHq = ItemIdentity.IsHighQuality(slot);
 
                 if (manifestEntries.TryGetValue(baseId, out var entry))
                 {
@@ -360,8 +360,8 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {
@@ -384,30 +384,27 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                if (effRoute == null)
-                {
-                    continue;
-                }
-
                 var stackSize = (int)Math.Max(1, itemRow.Value.StackSize);
-                var isHq = rawId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-
+                var isHq = ItemIdentity.IsHighQuality(slot);
                 var shouldWithdraw = false;
-                switch (effRoute)
+
+                // Explicit manual "Keep" override pulls the item out of the retainer into Player Bags
+                if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
                 {
-                    case "Market":
-                    case "Vendor":
-                    case "GrandCompany":
-                    case "GoldSaucer":
-                    case "Materia":
-                    case "Use":
-                    case "Armoire":
-                    case "Glamour":
-                        shouldWithdraw = true;
-                        break;
-                    case "Retainer":
-                        if (entry.TargetRetainerId != 0 && entry.TargetRetainerId != activeId)
+                    shouldWithdraw = safety.HasExplicitKeepOverride(baseId);
+                }
+                else
+                {
+                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
+                    if (effRoute != null)
+                    {
+                        if (RetainerBellEvaluator.IsWithdrawableRoute(effRoute))
+                        {
+                            shouldWithdraw = true;
+                        }
+                        else if (string.Equals(effRoute, "Retainer", StringComparison.OrdinalIgnoreCase)
+                            && entry.TargetRetainerId != 0
+                            && entry.TargetRetainerId != activeId)
                         {
                             var mergesIntoPartial = stackSize > 1
                                 && holdings.HasPartialStackOnRetainer(entry.TargetRetainerId, baseId, isHq);
@@ -429,8 +426,7 @@ public sealed unsafe class RetainerSortPlanner
                                 }
                             }
                         }
-
-                        break;
+                    }
                 }
 
                 if (!shouldWithdraw)
@@ -470,8 +466,8 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var rawId = slot->ItemId;
-                    var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                    if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                    var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                    if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                         || gearsetIds.Contains(baseId)
                         || safety.IsItemTracked(baseId))
                     {
@@ -527,7 +523,7 @@ public sealed unsafe class RetainerSortPlanner
         var trackedWithdrawCandidates = new List<RetainerTransferCandidate>();
         if (missingTracked.Count > 0)
         {
-            foreach (var retBag in HoldingsService.RetainerBagContainers)
+            foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainersWithCrystals)
             {
                 var container = manager->GetInventoryContainer(retBag);
                 if (!InventorySafetyEvaluator.IsContainerReadable(container))
@@ -544,7 +540,7 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var rawId = slot->ItemId;
-                    var baseId = HoldingsService.NormalizeBaseItemId(rawId);
+                    var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                     if (!missingTracked.TryGetValue(baseId, out var neededQty) || neededQty <= 0)
                     {
                         continue;
@@ -624,7 +620,7 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                var isCrystal = cand.BaseItemId is >= 2 and <= 19 || cand.SourceContainer == InventoryType.RetainerCrystals;
+                var isCrystal = ItemIdentity.IsCrystalItemId(cand.BaseItemId) || cand.SourceContainer == InventoryType.RetainerCrystals;
                 if (isCrystal)
                 {
                     var crystalBag = manager->GetInventoryContainer(InventoryType.Crystals);
@@ -1266,9 +1262,5 @@ public sealed unsafe class RetainerSortPlanner
     }
 
     private string ResolveActiveRetainerAddonName()
-    {
-        return NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge")
-            ? "InventoryRetainerLarge"
-            : "InventoryRetainer";
-    }
+        => NativeUiHelpers.GetOpenRetainerAddonName(gameGui) ?? "InventoryRetainerLarge";
 }

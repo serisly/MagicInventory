@@ -21,6 +21,12 @@ public sealed unsafe class InventorySafetyEvaluator
         InventoryType.Inventory4,
     ];
 
+    public static readonly InventoryType[] PlayerBagContainersWithCrystals =
+    [
+        ..PlayerBagContainers,
+        InventoryType.Crystals,
+    ];
+
     public static readonly InventoryType[] RetainerBagContainers =
     [
         InventoryType.RetainerPage1,
@@ -30,6 +36,12 @@ public sealed unsafe class InventorySafetyEvaluator
         InventoryType.RetainerPage5,
         InventoryType.RetainerPage6,
         InventoryType.RetainerPage7,
+    ];
+
+    public static readonly InventoryType[] RetainerBagContainersWithCrystals =
+    [
+        ..RetainerBagContainers,
+        InventoryType.RetainerCrystals,
     ];
 
     public static readonly InventoryType[] ArmouryGearContainers =
@@ -92,7 +104,7 @@ public sealed unsafe class InventorySafetyEvaluator
 
     public bool IsItemLocked(uint rawItemId)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         if (baseId == 0)
         {
             return false;
@@ -104,15 +116,24 @@ public sealed unsafe class InventorySafetyEvaluator
 
     public bool IsItemTracked(uint rawItemId)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         return baseId != 0 && isItemInActiveTracker(baseId);
     }
 
     public int GetMarketPriority(uint baseItemId)
-        => configuration.MarketListingPriorities.GetValueOrDefault(HoldingsService.NormalizeBaseItemId(baseItemId), 0);
+        => configuration.MarketListingPriorities.GetValueOrDefault(ItemIdentity.NormalizeBaseItemId(baseItemId), 0);
 
-    public static bool CanLockOrTagBaseId(uint baseItemId)
-        => ItemIdentity.CanLockOrTagBaseId(baseItemId);
+    /// <summary>
+    /// True ONLY when the user has explicitly pinned this item to "Keep" (Player Bags) via manual override.
+    /// Auto-kept protected items return false so they remain in whichever safe container already holds them.
+    /// </summary>
+    public bool HasExplicitKeepOverride(uint rawItemId)
+    {
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        return baseId != 0
+            && configuration.ManualRouteOverrides.TryGetValue(baseId, out var spec)
+            && string.Equals(spec, "Keep", StringComparison.OrdinalIgnoreCase);
+    }
 
     public static bool IsRetainerContainer(InventoryType? container)
     {
@@ -200,8 +221,8 @@ public sealed unsafe class InventorySafetyEvaluator
         out int dstSlot,
         bool routeCrystalsToCrystalBag = false)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(exactRawItemId);
-        if (routeCrystalsToCrystalBag && baseId is >= 2 and <= 19)
+        var baseId = ItemIdentity.NormalizeBaseItemId(exactRawItemId);
+        if (routeCrystalsToCrystalBag && ItemIdentity.IsCrystalItemId(baseId))
         {
             dstContainer = InventoryType.Crystals;
             dstSlot = (int)(baseId - 2);
@@ -321,7 +342,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 var rawId = entry.Items[s].ItemId;
                 if (rawId != 0)
                 {
-                    ids.Add(HoldingsService.NormalizeBaseItemId(rawId));
+                    ids.Add(ItemIdentity.NormalizeBaseItemId(rawId));
                 }
             }
         }
@@ -407,7 +428,7 @@ public sealed unsafe class InventorySafetyEvaluator
                             continue;
                         }
 
-                        var row = itemSheet.GetRowOrDefault(HoldingsService.NormalizeBaseItemId(rawId));
+                        var row = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(rawId));
                         if (row is not null)
                         {
                             setIlvl = Math.Max(setIlvl, (int)row.Value.LevelItem.RowId);
@@ -435,7 +456,7 @@ public sealed unsafe class InventorySafetyEvaluator
                         continue;
                     }
 
-                    var row = itemSheet.GetRowOrDefault(HoldingsService.NormalizeBaseItemId(slot->ItemId));
+                    var row = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
                     if (row is not null && row.Value.LevelItem.RowId > 0 && !ItemIdentity.IsSoulCrystal(row.Value))
                     {
                         sum += (int)row.Value.LevelItem.RowId;
@@ -525,12 +546,29 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (liveItem == null)
         {
-            if (string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase) && itemRow.IsUntradable)
+            if (IsItemLocked(entry.ItemId) || gearsetIds.Contains(entry.ItemId) || IsItemTracked(entry.ItemId))
             {
                 return null;
             }
 
-            if (entry.Route is "Vendor" or "GrandCompany" && IsLv1GlamourOrStarterGear(itemRow))
+            if (string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase) && !ItemIdentity.IsMarketable(itemRow))
+            {
+                return null;
+            }
+
+            if (string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase)
+                && (itemRow.PriceLow == 0 || itemRow.IsUnique || IsLv1GlamourOrStarterGear(itemRow)))
+            {
+                return null;
+            }
+
+            if (string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase)
+                && IsLv1GlamourOrStarterGear(itemRow))
+            {
+                return null;
+            }
+
+            if (string.Equals(entry.Route, "Use", StringComparison.OrdinalIgnoreCase) && itemRow.ItemAction.RowId == 0)
             {
                 return null;
             }
@@ -582,6 +620,13 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (entry.Route is "Glamour")
         {
+            if (liveItem->GetMateriaCount() > 0
+                || liveItem->Materia[0] != 0
+                || IsMateriaExtractable(itemRow, liveItem))
+            {
+                return null;
+            }
+
             return "Glamour";
         }
 
@@ -621,8 +666,8 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-        if (!CanLockOrTagBaseId(baseId) || IsItemTracked(baseId))
+        var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+        if (!ItemIdentity.CanLockOrTagBaseId(baseId) || IsItemTracked(baseId))
         {
             return false;
         }
@@ -918,8 +963,8 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                var itemRow = itemSheet.GetRowOrDefault(HoldingsService.NormalizeBaseItemId(slot->ItemId));
-                if (itemRow is null || itemRow.Value.ItemUICategory.RowId != 62)
+                var itemRow = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
+                if (itemRow is null || !ItemIdentity.IsSoulCrystal(itemRow.Value))
                 {
                     continue;
                 }

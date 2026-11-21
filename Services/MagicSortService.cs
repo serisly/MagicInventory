@@ -131,9 +131,6 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public int CustomRuleCount => configuration.ManualRouteOverrides.Count;
 
-    public static bool CanLockOrTagBaseId(uint baseItemId)
-        => ItemIdentity.CanLockOrTagBaseId(baseItemId);
-
     public void InvalidateButtonCache()
     {
         retainerButtonCache.Invalidate();
@@ -149,14 +146,14 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public bool IsItemOverwritten(uint rawItemId)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         return baseId != 0 && configuration.ManualRouteOverrides.ContainsKey(baseId);
     }
 
     public void SetItemOverride(uint rawItemId, string routeSpec, int? marketPriority = null)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
-        if (!CanLockOrTagBaseId(baseId))
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        if (!ItemIdentity.CanLockOrTagBaseId(baseId))
         {
             return;
         }
@@ -341,7 +338,7 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public string GetItemDisplayName(uint rawItemId)
     {
-        var baseId = HoldingsService.NormalizeBaseItemId(rawItemId);
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         if (baseId == 0)
         {
             return "Item";
@@ -502,7 +499,7 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public long GetEstimatedMarketUnitPrice(uint baseItemId)
     {
-        var normalized = HoldingsService.NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
         if (normalized == 0)
         {
             return 0;
@@ -594,73 +591,7 @@ public sealed unsafe class MagicSortService : IDisposable
     public int CountPendingBagMarketItems() => CollectBagMarketPlansForPreview().Count;
 
     private List<MarketPlanItem> CollectBagMarketPlansForPreview()
-    {
-        var results = new List<MarketPlanItem>();
-        var entries = GetLatestManifest();
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || entries.Count == 0)
-        {
-            return results;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-
-        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var container = manager->GetInventoryContainer(bag);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < container->Size; i++)
-            {
-                var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!entries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var row = itemSheet.GetRowOrDefault(baseId);
-                if (row is null || !safety.IsSafeToDisposeOrList(slot, row.Value, "Market", entries, gearsetIds, unlockedTop))
-                {
-                    continue;
-                }
-
-                var isHq = rawId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                var unitPrice = isHq
-                    ? entry.TargetPriceHq
-                    : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
-                var minAllowed = Math.Max(2L, row.Value.PriceLow + 1L);
-                if (unitPrice < minAllowed || unitPrice > 999_999_999L)
-                {
-                    continue;
-                }
-
-                results.Add(new MarketPlanItem(
-                    bag,
-                    i,
-                    rawId,
-                    slot->Flags,
-                    baseId,
-                    row.Value.Name.ExtractText(),
-                    slot->Quantity,
-                    unitPrice));
-            }
-        }
-
-        return results;
-    }
+        => marketPlanner.PlanBagMarketPreview(GetLatestManifest());
 
     private static string FormatMarketSellTooltip(IReadOnlyList<MarketPlanItem> plans)
     {
@@ -1002,35 +933,6 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public bool HasPendingBagMarketItems()
         => CollectBagMarketPlansForPreview().Count > 0;
-
-    public bool HasPotentialBellWorkForRetainer(ulong retainerId, bool includeMarketWork)
-    {
-        if (retainerId == 0)
-        {
-            return false;
-        }
-
-        if (includeMarketWork && HasPendingBagMarketItems())
-        {
-            return true;
-        }
-
-        var work = EvaluateAllBellWork();
-        return work.TryGetValue(retainerId, out var summary) && summary.HasAnyWork;
-    }
-
-    public bool HasRetainerMisplacedWithdrawWork(ulong retainerId, out HashSet<ulong> destinationRetainerIds)
-    {
-        var work = EvaluateAllBellWork();
-        if (work.TryGetValue(retainerId, out var summary) && summary.FunnelDestinationIds.Count > 0)
-        {
-            destinationRetainerIds = summary.FunnelDestinationIds;
-            return true;
-        }
-
-        destinationRetainerIds = new HashSet<ulong>();
-        return false;
-    }
 
     public MagicSortButtonState GetMarketSortButtonState()
     {

@@ -80,7 +80,7 @@ public sealed unsafe class SlotRouteResolver
                 return new ResolvedSlotRoute("Materia", 0, string.Empty, null);
             }
 
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
+            return ResolveStayOrBagRoute(container == InventoryType.RetainerEquippedItems, baseId, null);
         }
 
         // Locale-safe crystal/currency check (NEVER FilterGroup == 16!)
@@ -107,7 +107,7 @@ public sealed unsafe class SlotRouteResolver
 
         if (gearsetIds.Contains(baseId) || ItemIdentity.IsSoulCrystal(row) || row.Rarity >= 4)
         {
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
+            return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 
         if (!manifestEntries.TryGetValue(baseId, out var entry))
@@ -128,7 +128,7 @@ public sealed unsafe class SlotRouteResolver
                 return new ResolvedSlotRoute("Armoury", 0, string.Empty, null);
             }
 
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
+            return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
@@ -142,7 +142,7 @@ public sealed unsafe class SlotRouteResolver
                 return new ResolvedSlotRoute("Armoury", 0, string.Empty, entry);
             }
 
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, entry, IsPendingPrice: isPendingPrice, NeedsRetainerVisit: needsVisit);
+            return ResolveStayOrBagRoute(inRetainer, baseId, entry, isPendingPrice, needsVisit);
         }
 
         var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row, liveItem, manifestEntries, gearsetIds, unlockedTop);
@@ -153,7 +153,7 @@ public sealed unsafe class SlotRouteResolver
                 return new ResolvedSlotRoute("Armoury", 0, string.Empty, entry);
             }
 
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, entry);
+            return ResolveStayOrBagRoute(inRetainer, baseId, entry);
         }
 
         if (string.Equals(effectiveRoute, "Retainer", StringComparison.OrdinalIgnoreCase))
@@ -165,6 +165,30 @@ public sealed unsafe class SlotRouteResolver
         return new ResolvedSlotRoute(effectiveRoute, 0, string.Empty, entry);
     }
 
+    /// <summary>
+    /// Auto-protected items sitting inside a retainer stay in that retainer (Route = "Retainer", active retainer),
+    /// whereas an explicit manual "Keep" override always resolves to "Keep" (Player Bags, withdrawn from retainer).
+    /// </summary>
+    private ResolvedSlotRoute ResolveStayOrBagRoute(
+        bool inRetainer,
+        uint baseId,
+        MagicSortEntry? entry,
+        bool isPendingPrice = false,
+        bool needsVisit = false)
+    {
+        if (inRetainer && !isPendingPrice && !needsVisit && !safety.HasExplicitKeepOverride(baseId))
+        {
+            var activeId = HoldingsService.GetActiveRetainerId();
+            var activeName = HoldingsService.GetActiveRetainerName();
+            if (activeId != 0 && !string.IsNullOrWhiteSpace(activeName))
+            {
+                return new ResolvedSlotRoute("Retainer", activeId, activeName, entry);
+            }
+        }
+
+        return new ResolvedSlotRoute("Keep", 0, string.Empty, entry, IsPendingPrice: isPendingPrice, NeedsRetainerVisit: needsVisit);
+    }
+
     public string FormatHoverTooltipLabel(
         ResolvedSlotRoute resolved,
         uint rawItemId,
@@ -172,10 +196,6 @@ public sealed unsafe class SlotRouteResolver
         InventoryItem* liveItem,
         Item itemRow)
     {
-        var inRetainer = InventorySafetyEvaluator.IsRetainerContainer(container)
-            || container == InventoryType.RetainerEquippedItems;
-        var activeRetLabel = HoldingsService.GetActiveRetainerName() ?? "Retainer";
-
         if (resolved.IsPendingPrice)
         {
             return "Magic Sort: Checking price...";
@@ -243,7 +263,7 @@ public sealed unsafe class SlotRouteResolver
                 return "Magic Sort: Armoury";
 
             default:
-                return inRetainer ? $"Magic Sort: {activeRetLabel}" : "Magic Sort: Keep";
+                return "Magic Sort: Keep";
         }
     }
 }

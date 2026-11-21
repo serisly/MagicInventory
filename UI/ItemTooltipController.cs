@@ -95,7 +95,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
 
     private void OnHoveredItemChanged(object? sender, ulong itemId)
     {
-        if (itemId == 0 || itemId >= 2_000_000)
+        if (!ItemIdentity.IsValidItemId(itemId))
         {
             hoveredRawItemId = 0;
             hoveredContainer = null;
@@ -104,7 +104,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
         }
 
         if (hoveredRawItemId != 0
-            && HoldingsService.NormalizeBaseItemId((uint)itemId) != HoldingsService.NormalizeBaseItemId(hoveredRawItemId))
+            && ItemIdentity.NormalizeBaseItemId((uint)itemId) != ItemIdentity.NormalizeBaseItemId(hoveredRawItemId))
         {
             hoveredRawItemId = 0;
             hoveredContainer = null;
@@ -185,60 +185,6 @@ public sealed unsafe class ItemTooltipController : IDisposable
             or DetailKind.LetterView;
     }
 
-    /// <summary>
-    /// AgentItemDetail.TypeOrId reports visual UI bag tab codes 48..51 for Inventory1..4
-    /// (ordered by ItemOrderModule.InventorySorter). Map those back to physical InventoryType + Slot.
-    /// </summary>
-    private static void NormalizeVisualBagSlot(ref InventoryType? container, ref short? slot)
-    {
-        if (!container.HasValue || !slot.HasValue || slot.Value < 0)
-        {
-            return;
-        }
-
-        var rawType = (int)container.Value;
-        if (rawType is < 48 or > 51)
-        {
-            return;
-        }
-
-        var visualTab = rawType - 48;
-        var visualSlot = (int)slot.Value;
-        var orderModule = ItemOrderModule.Instance();
-        var sorter = orderModule != null ? orderModule->InventorySorter : null;
-        if (sorter != null && sorter->Items.Count > 0)
-        {
-            var perPage = sorter->ItemsPerPage > 0 ? sorter->ItemsPerPage : 35;
-            var visualIndex = visualTab * perPage + visualSlot;
-            if (visualIndex >= 0 && visualIndex < sorter->Items.Count)
-            {
-                var entryPtr = sorter->Items[visualIndex].Value;
-                if (entryPtr != null)
-                {
-                    container = entryPtr->Page switch
-                    {
-                        0 => InventoryType.Inventory1,
-                        1 => InventoryType.Inventory2,
-                        2 => InventoryType.Inventory3,
-                        3 => InventoryType.Inventory4,
-                        _ => container,
-                    };
-                    slot = (short)entryPtr->Slot;
-                    return;
-                }
-            }
-        }
-
-        container = visualTab switch
-        {
-            0 => InventoryType.Inventory1,
-            1 => InventoryType.Inventory2,
-            2 => InventoryType.Inventory3,
-            3 => InventoryType.Inventory4,
-            _ => container,
-        };
-    }
-
     private void GenerateItemTooltipDetour(
         AddonItemDetail* addon,
         NumberArrayData* numberArrayData,
@@ -255,11 +201,11 @@ public sealed unsafe class ItemTooltipController : IDisposable
                 && stringArrayData->Size > DescriptionStringIndex)
             {
                 uint rawId = 0;
-                if (agent != null && agent->ItemId is > 0 and < 2_000_000)
+                if (agent != null && ItemIdentity.IsValidItemId(agent->ItemId))
                 {
                     rawId = agent->ItemId;
                 }
-                else if (gameGui.HoveredItem is > 0 and < 2_000_000)
+                else if (ItemIdentity.IsValidItemId(gameGui.HoveredItem))
                 {
                     rawId = (uint)gameGui.HoveredItem;
                 }
@@ -277,7 +223,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     && hoveredSlot.HasValue
                     && hoveredSlot.Value >= 0
                     && hoveredRawItemId != 0
-                    && (rawId == 0 || HoldingsService.NormalizeBaseItemId(hoveredRawItemId) == HoldingsService.NormalizeBaseItemId(rawId));
+                    && (rawId == 0 || ItemIdentity.NormalizeBaseItemId(hoveredRawItemId) == ItemIdentity.NormalizeBaseItemId(rawId));
 
                 if (canAttachHoveredSlot)
                 {
@@ -292,7 +238,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     effectiveSlot = (short)agent->Index;
                 }
 
-                NormalizeVisualBagSlot(ref effectiveContainer, ref effectiveSlot);
+                InventoryGridLayout.NormalizeVisualBagSlot(ref effectiveContainer, ref effectiveSlot);
 
                 if (effectiveContainer.HasValue && effectiveSlot.HasValue && effectiveSlot.Value >= 0)
                 {
@@ -308,8 +254,8 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                 rawId = candidate->ItemId;
                             }
 
-                            if (HoldingsService.NormalizeBaseItemId(candidate->ItemId)
-                                == HoldingsService.NormalizeBaseItemId(rawId))
+                            if (ItemIdentity.NormalizeBaseItemId(candidate->ItemId)
+                                == ItemIdentity.NormalizeBaseItemId(rawId))
                             {
                                 liveItem = candidate;
                             }

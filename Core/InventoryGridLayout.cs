@@ -405,6 +405,60 @@ public static unsafe class InventoryGridLayout
     }
 
     /// <summary>
+    /// Maps AgentItemDetail visual bag tab codes (48..51) back to physical Inventory1..4 + physical slot
+    /// using ItemOrderModule.InventorySorter.
+    /// </summary>
+    public static void NormalizeVisualBagSlot(ref InventoryType? container, ref short? slot)
+    {
+        if (!container.HasValue || !slot.HasValue || slot.Value < 0)
+        {
+            return;
+        }
+
+        var rawType = (int)container.Value;
+        if (rawType is < 48 or > 51)
+        {
+            return;
+        }
+
+        var visualTab = rawType - 48;
+        var visualSlot = (int)slot.Value;
+        var orderModule = ItemOrderModule.Instance();
+        var sorter = orderModule != null ? orderModule->InventorySorter : null;
+        if (sorter != null && sorter->Items.Count > 0)
+        {
+            var perPage = sorter->ItemsPerPage > 0 ? sorter->ItemsPerPage : 35;
+            var visualIndex = visualTab * perPage + visualSlot;
+            if (visualIndex >= 0 && visualIndex < sorter->Items.Count)
+            {
+                var entryPtr = sorter->Items[visualIndex].Value;
+                if (entryPtr != null)
+                {
+                    container = entryPtr->Page switch
+                    {
+                        0 => InventoryType.Inventory1,
+                        1 => InventoryType.Inventory2,
+                        2 => InventoryType.Inventory3,
+                        3 => InventoryType.Inventory4,
+                        _ => container,
+                    };
+                    slot = (short)entryPtr->Slot;
+                    return;
+                }
+            }
+        }
+
+        container = visualTab switch
+        {
+            0 => InventoryType.Inventory1,
+            1 => InventoryType.Inventory2,
+            2 => InventoryType.Inventory3,
+            3 => InventoryType.Inventory4,
+            _ => container,
+        };
+    }
+
+    /// <summary>
     /// Computes accurate screen-space bounding box for an AtkResNode inside an AtkUnitBase,
     /// properly applying each ancestor's scale to accumulated child offsets (NOT the child's own scale to its own X/Y).
     /// </summary>

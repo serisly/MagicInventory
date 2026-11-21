@@ -145,7 +145,7 @@ public sealed unsafe class RecipeNoteController : IDisposable
             trackButton.String = isTracked ? "Untrack" : "Track";
             trackButton.TextTooltip = isTracked
                 ? $"Stop tracking {recipe.Name}."
-                : $"Track materials for {recipe.Name} (replaces current tracked item).";
+                : $"Track materials for {recipe.Name} (use right-click -> Track -> Add to List to stack multiple items).";
         }
 
         var now = DateTime.UtcNow;

@@ -96,7 +96,7 @@ public sealed unsafe class VendorSellPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                 if (!manifestEntries.ContainsKey(baseId))
                 {
                     continue;
@@ -157,7 +157,7 @@ public sealed unsafe class VendorSellPlanner
                     continue;
                 }
 
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
                 if (!manifestEntries.ContainsKey(baseId))
                 {
                     continue;

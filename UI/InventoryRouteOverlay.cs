@@ -213,11 +213,11 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             }
 
             var r = resolved.Value;
-            // Inside a retainer, only badge items that will actually LEAVE this retainer
-            // (tracked withdrawals, sell/use/glamour/armoire routes, or moves to a DIFFERENT retainer)
+            // Inside a retainer, badge items that will actually LEAVE this retainer
+            // (tracked pulls, explicit manual Keep->Bag pulls, sell/use/glamour/armoire routes, or moves to a DIFFERENT retainer)
             if (inRetainer)
             {
-                if (string.Equals(r.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                if (r.IsPendingPrice || r.NeedsRetainerVisit)
                 {
                     continue;
                 }
@@ -233,13 +233,18 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
                 continue;
             }
 
-            var shortLabel = RoutePresentation.GetShortBadgeLabel(r.Route, r.TargetRetainerName);
+            var shortLabel = inRetainer && string.Equals(r.Route, "Keep", StringComparison.OrdinalIgnoreCase)
+                ? "Keep"
+                : RoutePresentation.GetShortBadgeLabel(r.Route, r.TargetRetainerName);
             if (string.IsNullOrEmpty(shortLabel))
             {
                 continue;
             }
 
-            cachedBadges[(vs.AddonName, vs.NodeId)] = new SlotBadge(shortLabel, RoutePresentation.GetRouteColor(r.Route));
+            var badgeColor = inRetainer && string.Equals(r.Route, "Keep", StringComparison.OrdinalIgnoreCase)
+                ? RoutePresentation.ColorTracked
+                : RoutePresentation.GetRouteColor(r.Route);
+            cachedBadges[(vs.AddonName, vs.NodeId)] = new SlotBadge(shortLabel, badgeColor);
         }
     }
 

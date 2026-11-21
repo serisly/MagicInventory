@@ -55,16 +55,25 @@ public sealed unsafe class MarketListingPlanner
 
     public List<MarketPlanItem> PlanListings(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
     {
-        var results = new List<MarketPlanItem>(Math.Max(0, maxItems));
+        var containers = ResolveOpenMarketSourceContainers();
+        return PlanListingsInContainers(containers, maxItems, manifestEntries);
+    }
+
+    public List<MarketPlanItem> PlanBagMarketPreview(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+        => PlanListingsInContainers(InventorySafetyEvaluator.PlayerBagContainers, int.MaxValue, manifestEntries);
+
+    public int CountArmouryMarketItems(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+        => PlanListingsInContainers(InventorySafetyEvaluator.ArmouryGearContainers, maxItems, manifestEntries).Count;
+
+    private List<MarketPlanItem> PlanListingsInContainers(
+        IReadOnlyList<InventoryType> containers,
+        int maxItems,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+    {
+        var results = new List<MarketPlanItem>(Math.Clamp(maxItems, 0, 64));
         var manager = InventoryManager.Instance();
         var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || manifestEntries.Count == 0 || maxItems <= 0)
-        {
-            return results;
-        }
-
-        var containers = ResolveOpenMarketSourceContainers();
-        if (containers.Count == 0)
+        if (manager == null || itemSheet == null || manifestEntries.Count == 0 || maxItems <= 0 || containers.Count == 0)
         {
             return results;
         }
@@ -90,7 +99,7 @@ public sealed unsafe class MarketListingPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
                     || !string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
                 {
@@ -98,12 +107,8 @@ public sealed unsafe class MarketListingPlanner
                 }
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null)
-                {
-                    continue;
-                }
-
-                if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, unlockedTop))
+                if (itemRow is null
+                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, unlockedTop))
                 {
                     continue;
                 }
@@ -150,69 +155,6 @@ public sealed unsafe class MarketListingPlanner
         }
 
         return results;
-    }
-
-    public int CountArmouryMarketItems(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
-    {
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || manifestEntries.Count == 0 || maxItems <= 0)
-        {
-            return 0;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-        var count = 0;
-
-        foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
-        {
-            var container = manager->GetInventoryContainer(armType);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
-            {
-                var slot = container->GetInventorySlot(slotIdx);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!manifestEntries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null
-                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, unlockedTop))
-                {
-                    continue;
-                }
-
-                var isHq = rawId >= 1_000_000 || slot->Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
-                var unitPrice = isHq
-                    ? entry.TargetPriceHq
-                    : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
-                var minAllowed = Math.Max(2L, itemRow.Value.PriceLow + 1L);
-                if (unitPrice >= minAllowed && unitPrice <= 999_999_999L)
-                {
-                    count++;
-                    if (count >= maxItems)
-                    {
-                        return count;
-                    }
-                }
-            }
-        }
-
-        return count;
     }
 
     public List<TransactionStep> BuildListingSteps(

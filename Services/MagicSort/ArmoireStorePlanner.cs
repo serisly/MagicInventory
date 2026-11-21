@@ -84,8 +84,8 @@ public sealed unsafe class ArmoireStorePlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {

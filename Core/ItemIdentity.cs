@@ -121,11 +121,46 @@ public static class ItemIdentity
         UiCatOutfits, // 112
     }.ToFrozenSet();
 
+    public static readonly FrozenSet<uint> CulinaryBotanyDefaultCategoryIds = new uint[]
+    {
+        UiCatIngredient, // 45
+        UiCatSeafood, // 47
+        UiCatMeal, // 46
+        UiCatMedicine, // 44
+        UiCatReagent, // 54
+        UiCatCatalyst, // 60
+        UiCatGardening, // 82
+        UiCatFishingTackle, // 33
+    }.ToFrozenSet();
+
+    public static readonly FrozenSet<uint> MaterialsDefaultCategoryIds = new uint[]
+    {
+        UiCatStone, // 48
+        UiCatMetal, // 49
+        UiCatLumber, // 50
+        UiCatCloth, // 51
+        UiCatLeather, // 52
+        UiCatBone, // 53
+        UiCatPart, // 56
+        UiCatMateria, // 58
+        UiCatDye, // 55
+        UiCatFurnishing, // 57
+        UiCatDemimateria, // 83
+        UiCatMiscellany, // 61
+        UiCatOther, // 63
+    }.ToFrozenSet();
+
     public static readonly FrozenSet<uint> CrafterGathererToolCategoryIds = new uint[]
     {
         12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, // DoH tools
         28, 29, 30, 31, 32, 99, // DoL tools (incl. Fisher's Secondary Tool 99)
     }.ToFrozenSet();
+
+    public static bool IsValidItemId(ulong rawItemId)
+        => rawItemId is > 0 and < EventItemIdThreshold;
+
+    public static bool IsCrystalItemId(uint baseItemId)
+        => baseItemId is >= 2 and <= 19;
 
     /// <summary>
     /// Normalizes a raw FFXIV item ID to its base Item sheet RowId.
@@ -225,12 +260,12 @@ public static class ItemIdentity
 
     /// <summary>
     /// True for actual unlockable items in protected categories (Triple Triad Card, Minion,
-    /// and usable Orchestrion Rolls — excluding Blank Orchestrion Roll crafting mats with ItemAction == 0).
+    /// Outfits, and usable Orchestrion Rolls — excluding Blank Orchestrion Roll crafting mats with ItemAction == 0).
     /// </summary>
     public static bool IsUnlockableCategory(Item itemRow)
     {
         var uiCat = itemRow.ItemUICategory.RowId;
-        if (uiCat is UiCatTripleTriadCard or UiCatMinion)
+        if (uiCat is UiCatTripleTriadCard or UiCatMinion or UiCatOutfits)
         {
             return true;
         }

@@ -14,6 +14,18 @@ public static unsafe class NativeUiHelpers
         return GetReadyAddon(gameGui, addonName) != null;
     }
 
+    public static string? GetOpenRetainerAddonName(IGameGui gameGui)
+    {
+        if (IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge"))
+        {
+            return "InventoryRetainerLarge";
+        }
+
+        return IsAddonOpenAndReady(gameGui, "InventoryRetainer")
+            ? "InventoryRetainer"
+            : null;
+    }
+
     public static AtkUnitBase* GetReadyAddon(IGameGui gameGui, string addonName)
     {
         if (string.IsNullOrWhiteSpace(addonName))

@@ -317,7 +317,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             return new ContextButtonState(false, false, "Magic Buy", string.Empty);
         }
 
-        var baseItemId = HoldingsService.NormalizeBaseItemId(infoProxy->SearchItemId);
+        var baseItemId = ItemIdentity.NormalizeBaseItemId(infoProxy->SearchItemId);
         var missingNeeded = GetTrackedMissingCount(baseItemId);
         if (missingNeeded <= 0)
         {
@@ -365,7 +365,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             return;
         }
 
-        var baseItemId = HoldingsService.NormalizeBaseItemId(infoProxy->SearchItemId);
+        var baseItemId = ItemIdentity.NormalizeBaseItemId(infoProxy->SearchItemId);
         var missingNeeded = GetTrackedMissingCount(baseItemId);
         if (missingNeeded <= 0)
         {
@@ -613,7 +613,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         if (resultReady
             && proxy != null
             && !proxy->WaitingForListings
-            && HoldingsService.NormalizeBaseItemId(proxy->SearchItemId) == activeTarget.ItemId)
+            && ItemIdentity.NormalizeBaseItemId(proxy->SearchItemId) == activeTarget.ItemId)
         {
             TransitionTo(AutoBuyState.SelectingListing, now, SampleJitterMs(550, 950));
             return;
@@ -970,7 +970,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                 continue;
             }
 
-            if (HoldingsService.NormalizeBaseItemId(l.ItemId) != baseItemId)
+            if (ItemIdentity.NormalizeBaseItemId(l.ItemId) != baseItemId)
             {
                 continue;
             }
@@ -1094,7 +1094,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             {
                 var slot = InventorySafetyEvaluator.GetSlot(container, i);
                 if (slot != null
-                    && HoldingsService.NormalizeBaseItemId(slot->ItemId) == candidate.ItemId
+                    && ItemIdentity.NormalizeBaseItemId(slot->ItemId) == candidate.ItemId
                     && slot->Flags == expectedFlags
                     && slot->Quantity > 0
                     && slot->Quantity + candidate.Quantity <= stackSize)
@@ -1109,7 +1109,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 
     private static bool ValidateListingUnchanged(InfoProxyItemSearch* proxy, InventoryManager* inv, MarketBuyCandidate captured)
     {
-        if (HoldingsService.NormalizeBaseItemId(proxy->SearchItemId) != captured.ItemId
+        if (ItemIdentity.NormalizeBaseItemId(proxy->SearchItemId) != captured.ItemId
             || captured.ListingIndex < 0
             || captured.ListingIndex >= (int)proxy->ListingCount
             || inv->GetGil() < captured.TotalCost)
@@ -1134,7 +1134,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             var count = (int)Math.Min(agent->ListingPageItemCount, (uint)pageIds.Length);
             for (var i = 0; i < count; i++)
             {
-                if (HoldingsService.NormalizeBaseItemId(pageIds[i]) == expectedBaseItemId)
+                if (ItemIdentity.NormalizeBaseItemId(pageIds[i]) == expectedBaseItemId)
                 {
                     return i;
                 }

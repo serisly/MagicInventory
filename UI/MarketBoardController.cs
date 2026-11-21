@@ -16,7 +16,6 @@ public sealed unsafe class MarketBoardController : IDisposable
     private const float ButtonWidth = 168f;
     private const float ButtonHeight = 28f;
 
-    private readonly MaterialTrackerService tracker;
     private readonly MarketBoardBuyPlanner buyPlanner;
     private readonly AddonController<AddonItemSearch> controller;
     private readonly AddonController<AddonItemSearchResult> resultController;
@@ -33,9 +32,8 @@ public sealed unsafe class MarketBoardController : IDisposable
     private bool? lastBuyEnabled;
     private bool? lastBuyVisible;
 
-    public MarketBoardController(MaterialTrackerService tracker, MarketBoardBuyPlanner buyPlanner)
+    public MarketBoardController(MarketBoardBuyPlanner buyPlanner)
     {
-        this.tracker = tracker;
         this.buyPlanner = buyPlanner;
 
         controller = new AddonController<AddonItemSearch>

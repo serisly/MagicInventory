@@ -77,6 +77,7 @@ public sealed unsafe class GlamourStorePlanner
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
+        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var data = agent->Data;
         var count = Math.Min((int)data->CrystallizeItemCount, data->CrystallizeItems.Length);
         for (var i = 0; i < count && results.Count < budget; i++)
@@ -93,8 +94,8 @@ public sealed unsafe class GlamourStorePlanner
                 continue;
             }
 
-            var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
-            if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+            var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+            if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                 || gearsetIds.Contains(baseId)
                 || safety.IsItemTracked(baseId))
             {
@@ -108,12 +109,11 @@ public sealed unsafe class GlamourStorePlanner
             }
 
             var row = itemSheet.GetRowOrDefault(baseId);
-            if (row is null || InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
-            {
-                continue;
-            }
-
-            if (slot->GetMateriaCount() > 0 || slot->Materia[0] != 0)
+            if (row is null
+                || !string.Equals(
+                    safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedTop),
+                    "Glamour",
+                    StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
@@ -199,14 +199,16 @@ public sealed unsafe class GlamourStorePlanner
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
                             var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
-                            if (!prompt.Contains("glamour dresser", StringComparison.OrdinalIgnoreCase))
+                            var expectedItem = NativeUiHelpers.NormalizeItemLabel(captured.Name);
+                            if (string.IsNullOrEmpty(expectedItem)
+                                || !prompt.Contains(expectedItem, StringComparison.OrdinalIgnoreCase))
                             {
                                 if (yesNo->NoButton != null)
                                 {
                                     NativeUiHelpers.ClickAddonButton((AtkUnitBase*)yesNo, yesNo->NoButton);
                                 }
 
-                                transactionQueue.Cancel($"Stopped: Unexpected confirmation dialog while storing '{captured.Name}' (saw: '{prompt}').", QueueBatchOutcome.AbortedOnError);
+                                transactionQueue.Cancel($"Stopped: Confirmation dialog did not match '{captured.Name}' (saw: '{prompt}').", QueueBatchOutcome.AbortedOnError);
                                 return false;
                             }
 

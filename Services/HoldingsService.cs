@@ -31,27 +31,6 @@ public sealed unsafe class HoldingsService
     public const int MaxRetainerBagSlots = 175;
     private const ulong SaddlebagPseudoOwnerId = ulong.MaxValue - 1;
 
-    public static readonly InventoryType[] PlayerBagContainers =
-    [
-        InventoryType.Inventory1,
-        InventoryType.Inventory2,
-        InventoryType.Inventory3,
-        InventoryType.Inventory4,
-        InventoryType.Crystals,
-    ];
-
-    public static readonly InventoryType[] RetainerBagContainers =
-    [
-        InventoryType.RetainerPage1,
-        InventoryType.RetainerPage2,
-        InventoryType.RetainerPage3,
-        InventoryType.RetainerPage4,
-        InventoryType.RetainerPage5,
-        InventoryType.RetainerPage6,
-        InventoryType.RetainerPage7,
-        InventoryType.RetainerCrystals,
-    ];
-
     private sealed record LiveRetainerSnapshot(
         ulong CharacterContentId,
         DateTime CapturedUtc,
@@ -129,13 +108,8 @@ public sealed unsafe class HoldingsService
 
         // Verify at least one regular retainer page is actually loaded from the server before snapshotting
         var anyRegularPageLoaded = false;
-        foreach (var containerType in RetainerBagContainers)
+        foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainers)
         {
-            if (containerType == InventoryType.RetainerCrystals)
-            {
-                continue;
-            }
-
             var c = manager->GetInventoryContainer(containerType);
             if (c != null && c->Items != null && c->Size > 0 && c->IsLoaded)
             {
@@ -163,7 +137,7 @@ public sealed unsafe class HoldingsService
         var counts = new Dictionary<uint, int>();
         var hqCounts = new Dictionary<uint, int>();
         var categoryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        foreach (var containerType in RetainerBagContainers)
+        foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainersWithCrystals)
         {
             var container = manager->GetInventoryContainer(containerType);
             if (container == null || container->Items == null || container->Size <= 0 || !container->IsLoaded)
@@ -180,7 +154,7 @@ public sealed unsafe class HoldingsService
                     continue;
                 }
 
-                var normalized = NormalizeBaseItemId(slot->ItemId);
+                var normalized = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
                 if (normalized == 0)
                 {
                     continue;
@@ -378,7 +352,7 @@ public sealed unsafe class HoldingsService
         }
 
         RefreshRetainerCacheIfChanged();
-        var normalized = NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
 
         if (liveRetainerSnapshots.TryGetValue(retainerId, out var snap))
         {
@@ -439,7 +413,7 @@ public sealed unsafe class HoldingsService
         }
 
         RefreshRetainerCacheIfChanged();
-        var normalized = NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
 
         if (liveRetainerSnapshots.TryGetValue(retainerId, out var snap))
         {
@@ -452,7 +426,7 @@ public sealed unsafe class HoldingsService
 
     public ItemHoldingSummary GetHoldingSummary(uint baseItemId)
     {
-        var normalized = NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
         RefreshRetainerCacheIfChanged();
 
         var bagCount = GetLiveBagCount(normalized);
@@ -554,7 +528,7 @@ public sealed unsafe class HoldingsService
                     var s = eq->GetInventorySlot(i);
                     if (s != null && s->ItemId != 0 && s->Quantity > 0)
                     {
-                        equippedIds.Add(NormalizeBaseItemId(s->ItemId));
+                        equippedIds.Add(ItemIdentity.NormalizeBaseItemId(s->ItemId));
                     }
                 }
             }
@@ -572,19 +546,14 @@ public sealed unsafe class HoldingsService
                     var s = c->GetInventorySlot(i);
                     if (s != null && s->ItemId != 0 && s->Quantity > 0)
                     {
-                        var id = NormalizeBaseItemId(s->ItemId);
+                        var id = ItemIdentity.NormalizeBaseItemId(s->ItemId);
                         armouryCounts[id] = armouryCounts.GetValueOrDefault(id) + (int)s->Quantity;
                     }
                 }
             }
 
-            foreach (var bagType in PlayerBagContainers)
+            foreach (var bagType in InventorySafetyEvaluator.PlayerBagContainers)
             {
-                if (bagType == InventoryType.Crystals)
-                {
-                    continue;
-                }
-
                 var c = mgr->GetInventoryContainer(bagType);
                 if (c == null || c->Items == null)
                 {
@@ -596,7 +565,7 @@ public sealed unsafe class HoldingsService
                     var s = c->GetInventorySlot(i);
                     if (s != null && s->ItemId != 0 && s->Quantity > 0)
                     {
-                        var id = NormalizeBaseItemId(s->ItemId);
+                        var id = ItemIdentity.NormalizeBaseItemId(s->ItemId);
                         bagCounts[id] = bagCounts.GetValueOrDefault(id) + (int)s->Quantity;
                     }
                 }
@@ -649,14 +618,11 @@ public sealed unsafe class HoldingsService
         return result;
     }
 
-    public static uint NormalizeBaseItemId(uint rawItemId)
-        => ItemIdentity.NormalizeBaseItemId(rawItemId);
-
     public static int GetLiveBagCount(uint baseItemId)
-        => CountInContainers(baseItemId, PlayerBagContainers);
+        => CountInContainers(baseItemId, InventorySafetyEvaluator.PlayerBagContainersWithCrystals);
 
     public static int GetLiveActiveRetainerCount(uint baseItemId)
-        => CountInContainers(baseItemId, RetainerBagContainers);
+        => CountInContainers(baseItemId, InventorySafetyEvaluator.RetainerBagContainersWithCrystals);
 
     public static string? GetActiveRetainerName()
     {
@@ -696,7 +662,7 @@ public sealed unsafe class HoldingsService
             return 0;
         }
 
-        var normalized = NormalizeBaseItemId(baseItemId);
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
         var total = 0;
         foreach (var containerType in containers)
         {
@@ -709,7 +675,7 @@ public sealed unsafe class HoldingsService
             for (var i = 0; i < container->Size; i++)
             {
                 var slot = container->Items + i;
-                if (slot != null && slot->Quantity > 0 && NormalizeBaseItemId(slot->ItemId) == normalized)
+                if (slot != null && slot->Quantity > 0 && ItemIdentity.NormalizeBaseItemId(slot->ItemId) == normalized)
                 {
                     total += slot->Quantity;
                 }
@@ -843,7 +809,7 @@ public sealed unsafe class HoldingsService
             }
 
             var effectiveOwner = isSaddlebag ? SaddlebagPseudoOwnerId : ownerId;
-            var normalized = NormalizeBaseItemId(itemId);
+            var normalized = ItemIdentity.NormalizeBaseItemId(itemId);
             if (normalized == 0)
             {
                 continue;
@@ -859,7 +825,7 @@ public sealed unsafe class HoldingsService
                     && int.TryParse(cols[6].Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedFlags)
                     ? parsedFlags
                     : 0;
-                var isHq = itemId >= 1_000_000 || (flagsVal & 1) != 0;
+                var isHq = ItemIdentity.IsHighQuality(itemId, (InventoryItem.ItemFlags)flagsVal);
                 if (isHq)
                 {
                     if (!hqByOwner.TryGetValue(ownerId, out var hqDict))

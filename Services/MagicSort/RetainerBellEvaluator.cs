@@ -152,6 +152,14 @@ public sealed unsafe class RetainerBellEvaluator
             }
         }
 
+        // Also include Armoury + Equipped base IDs for FFXIV's character-wide IsUnique conflict check
+        foreach (var equipType in InventorySafetyEvaluator.ArmouryGearContainers)
+        {
+            CollectBaseIds(manager, equipType, playerUniqueBaseIds);
+        }
+
+        CollectBaseIds(manager, InventoryType.EquippedItems, playerUniqueBaseIds);
+
         // Track remaining free slots per retainer (after accounting for validated bag deposits)
         var destFreeBudget = new Dictionary<ulong, int>(knownRetainers.Count);
         foreach (var ret in knownRetainers)
@@ -181,30 +189,59 @@ public sealed unsafe class RetainerBellEvaluator
             }
         }
 
-        // Evaluate withdrawals + tracked pulls per retainer
+        // Evaluate withdrawals + tracked pulls per retainer (capped by actual available player bag space)
         foreach (var ret in knownRetainers)
         {
+            var deposits = depositCountsByRetainer.GetValueOrDefault(ret.RetainerId);
+            // Deposits free player bag slots on the same visit; crystals withdraw directly to the Crystal bag
+            var availableBagSlots = emptyBagSlots + deposits;
+
             var trackedCount = 0;
             if (missingTracked.Count > 0)
             {
                 foreach (var (trackedId, needQty) in missingTracked)
                 {
-                    if (needQty > 0 && ret.Quantities.GetValueOrDefault(trackedId) > 0)
+                    if (needQty <= 0 || ret.Quantities.GetValueOrDefault(trackedId) <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (ItemIdentity.IsCrystalItemId(trackedId))
                     {
                         trackedCount++;
+                        continue;
                     }
+
+                    if (availableBagSlots <= 0)
+                    {
+                        continue;
+                    }
+
+                    var tRow = itemSheet.GetRowOrDefault(trackedId);
+                    if (tRow is not null && tRow.Value.IsUnique && playerUniqueBaseIds.Contains(trackedId))
+                    {
+                        continue;
+                    }
+
+                    trackedCount++;
+                    availableBagSlots--;
                 }
             }
 
             var withdrawCount = 0;
             var funnelDests = new HashSet<ulong>();
 
-            if (emptyBagSlots > 0 && manifestEntries.Count > 0 && ret.Quantities.Count > 0)
+            if (availableBagSlots > 0 && manifestEntries.Count > 0 && ret.Quantities.Count > 0)
             {
                 var localDestBudget = new Dictionary<ulong, int>(destFreeBudget);
 
                 foreach (var (baseId, qty) in ret.Quantities)
                 {
+                    if (availableBagSlots <= 0)
+                    {
+                        break;
+                    }
+
                     if (qty <= 0
                         || !ItemIdentity.CanLockOrTagBaseId(baseId)
                         || gearsetIds.Contains(baseId)
@@ -232,15 +269,35 @@ public sealed unsafe class RetainerBellEvaluator
                         continue;
                     }
 
+                    // Explicit manual "Keep" override pulls the item out of the retainer into Player Bags
+                    if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (safety.HasExplicitKeepOverride(baseId))
+                        {
+                            withdrawCount++;
+                            availableBagSlots--;
+                        }
+
+                        continue;
+                    }
+
+                    // Validate via ResolveEffectiveSlotRoute (liveItem: null) so safety-blocked items never trigger wasted visits
+                    var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, null, manifestEntries, gearsetIds, unlockedTop);
+                    if (string.IsNullOrEmpty(effectiveRoute))
+                    {
+                        continue;
+                    }
+
                     // 1. Any of the 8 action/disposal/storage routes that must leave the retainer -> withdraw!
-                    if (IsWithdrawableRoute(entry.Route))
+                    if (IsWithdrawableRoute(effectiveRoute))
                     {
                         withdrawCount++;
+                        availableBagSlots--;
                         continue;
                     }
 
                     // 2. Misplaced retainer item belonging on a DIFFERENT retainer that has space / partial merge
-                    if (string.Equals(entry.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
+                    if (string.Equals(effectiveRoute, "Retainer", StringComparison.OrdinalIgnoreCase)
                         && entry.TargetRetainerId != 0
                         && entry.TargetRetainerId != ret.RetainerId)
                     {
@@ -251,6 +308,7 @@ public sealed unsafe class RetainerBellEvaluator
                         if (mergesPartial)
                         {
                             withdrawCount++;
+                            availableBagSlots--;
                             funnelDests.Add(entry.TargetRetainerId);
                             continue;
                         }
@@ -260,13 +318,13 @@ public sealed unsafe class RetainerBellEvaluator
                         {
                             localDestBudget[entry.TargetRetainerId] = remSlots - 1;
                             withdrawCount++;
+                            availableBagSlots--;
                             funnelDests.Add(entry.TargetRetainerId);
                         }
                     }
                 }
             }
 
-            var deposits = depositCountsByRetainer.GetValueOrDefault(ret.RetainerId);
             result[ret.RetainerId] = new RetainerBellWorkSummary(
                 ret.RetainerId,
                 deposits,
@@ -276,5 +334,27 @@ public sealed unsafe class RetainerBellEvaluator
         }
 
         return result;
+    }
+
+    private static void CollectBaseIds(InventoryManager* manager, InventoryType containerType, HashSet<uint> target)
+    {
+        var container = manager->GetInventoryContainer(containerType);
+        if (!InventorySafetyEvaluator.IsContainerReadable(container))
+        {
+            return;
+        }
+
+        for (var i = 0; i < container->Size; i++)
+        {
+            var slot = InventorySafetyEvaluator.GetSlot(container, i);
+            if (slot != null && slot->ItemId != 0 && slot->Quantity > 0)
+            {
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+                if (baseId != 0)
+                {
+                    target.Add(baseId);
+                }
+            }
+        }
     }
 }

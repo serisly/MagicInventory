@@ -96,7 +96,7 @@ public sealed unsafe class InventorySortPlanner
                     continue;
                 }
 
-                var baseId = HoldingsService.NormalizeBaseItemId(slot->ItemId);
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
                 var row = itemSheet.GetRowOrDefault(baseId);
                 if (row is null || row.Value.StackSize <= 1 || slot->Quantity >= row.Value.StackSize)
                 {
@@ -188,8 +188,8 @@ public sealed unsafe class InventorySortPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId))
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId))
                 {
                     continue;
                 }
@@ -210,7 +210,7 @@ public sealed unsafe class InventorySortPlanner
                 string effectiveRoute = "Keep";
                 if (!gearsetIds.Contains(baseId)
                     && !safety.IsItemTracked(baseId)
-                    && row.Value.ItemUICategory.RowId != 62
+                    && !ItemIdentity.IsSoulCrystal(row.Value)
                     && row.Value.Rarity < 4
                     && manifestEntries.TryGetValue(baseId, out var entry)
                     && !string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
@@ -261,8 +261,8 @@ public sealed unsafe class InventorySortPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || gearsetIds.Contains(baseId)
                     || safety.IsItemTracked(baseId))
                 {

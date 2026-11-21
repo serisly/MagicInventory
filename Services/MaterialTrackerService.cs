@@ -104,14 +104,6 @@ public sealed unsafe class MaterialTrackerService
 
     public int TrackedItemCount => ActiveProfile.TrackedItems.Count;
 
-    public bool IsItemInActiveTracker(uint baseItemId)
-    {
-        var normalized = HoldingsService.NormalizeBaseItemId(baseItemId);
-        return normalized != 0
-            && ActiveProfile.TrackedItems.TryGetValue(normalized, out var needed)
-            && needed > 0;
-    }
-
     public bool IsRecipeTracked(uint recipeId)
         => recipeId != 0 && ActiveProfile.TrackedRecipeId == recipeId && ActiveProfile.TrackedItems.Count > 0;
 
@@ -171,7 +163,7 @@ public sealed unsafe class MaterialTrackerService
 
         foreach (var (rawId, baseNeeded) in profile.TrackedItems)
         {
-            var baseId = HoldingsService.NormalizeBaseItemId(rawId);
+            var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
             if (baseId == 0 || baseNeeded <= 0)
             {
                 continue;
@@ -240,7 +232,7 @@ public sealed unsafe class MaterialTrackerService
                         continue;
                     }
 
-                    var baseId = HoldingsService.NormalizeBaseItemId(ing.ItemId);
+                    var baseId = ItemIdentity.NormalizeBaseItemId(ing.ItemId);
                     var ingName = itemSheet.TryGetRow(baseId, out var itemRow)
                         ? itemRow.Name.ExtractText()
                         : ing.Name.ToString();
@@ -250,7 +242,7 @@ public sealed unsafe class MaterialTrackerService
 
                 if (entryIngredients.Count > 0)
                 {
-                    var resultId = HoldingsService.NormalizeBaseItemId(entry->ItemId);
+                    var resultId = ItemIdentity.NormalizeBaseItemId(entry->ItemId);
                     var recipeName = itemSheet.TryGetRow(resultId, out var resRow)
                         ? resRow.Name.ExtractText()
                         : entry->ItemName.ToString();
@@ -1127,19 +1119,7 @@ public sealed unsafe class MaterialTrackerService
     }
 
     public string? GetOpenRetainerAddonName()
-    {
-        if (IsAddonOpenAndReady("InventoryRetainerLarge"))
-        {
-            return "InventoryRetainerLarge";
-        }
-
-        if (IsAddonOpenAndReady("InventoryRetainer"))
-        {
-            return "InventoryRetainer";
-        }
-
-        return null;
-    }
+        => NativeUiHelpers.GetOpenRetainerAddonName(gameGui);
 
     public bool IsAddonOpenAndReady(string addonName)
         => NativeUiHelpers.IsAddonOpenAndReady(gameGui, addonName);

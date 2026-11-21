@@ -83,8 +83,8 @@ public sealed unsafe class UseItemsPlanner
                 }
 
                 var rawId = slot->ItemId;
-                var baseId = HoldingsService.NormalizeBaseItemId(rawId);
-                if (!InventorySafetyEvaluator.CanLockOrTagBaseId(baseId)
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || safety.IsItemTracked(baseId))
                 {
                     continue;
