@@ -1,4 +1,5 @@
-﻿using Dalamud.Plugin;
+﻿using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
@@ -29,6 +30,7 @@ public sealed record TrackedMaterialLine(
     int OpenRetainerCount)
 {
     public int MissingCount => Math.Max(0, NeededCount - OwnedCount);
+    public int UnownedMissingCount => Math.Max(0, MissingCount - ExternalOwnedCount);
     public bool IsComplete => OwnedCount >= NeededCount;
     public bool IsCoveredByHoldings => (OwnedCount + ExternalOwnedCount) >= NeededCount;
 }
@@ -66,11 +68,14 @@ public sealed unsafe class MaterialTrackerService
     private readonly HoldingsService holdings;
     private readonly IDataManager dataManager;
     private readonly IGameGui gameGui;
+    private readonly ICondition condition;
+    private readonly IChatGui chatGui;
 
     // CraftType 0..7 -> ClassJob RowId (CRP=8, BSM=9, ARM=10, GSM=11, LTW=12, WVR=13, ALC=14, CUL=15)
     private static readonly uint[] CraftTypeToClassJobId = [8, 9, 10, 11, 12, 13, 14, 15];
 
     private DateTime lastSnapshotUtc = DateTime.MinValue;
+    private ulong lastSnapshotCharId;
     private TrackerSnapshot cachedSnapshot = new(string.Empty, Array.Empty<TrackedMaterialLine>());
     private bool dirty = true;
     private Dictionary<uint, List<uint>>? recipesByResultItemId;
@@ -88,17 +93,43 @@ public sealed unsafe class MaterialTrackerService
         Configuration config,
         HoldingsService holdings,
         IDataManager dataManager,
-        IGameGui gameGui)
+        IGameGui gameGui,
+        ICondition condition,
+        IChatGui chatGui)
     {
         this.pluginInterface = pluginInterface;
         this.config = config;
         this.holdings = holdings;
         this.dataManager = dataManager;
         this.gameGui = gameGui;
+        this.condition = condition;
+        this.chatGui = chatGui;
     }
+
+    public event System.Action? TrackerChanged;
+
+    public bool HasPendingCraft => pendingCraftStage != PendingCraftStage.None;
 
     private CharacterProfile ActiveProfile
         => config.GetOrCreateCharacter(InventorySafetyEvaluator.GetCurrentContentId());
+
+    private void NotifyTrackerChanged()
+    {
+        pendingCraftStage = PendingCraftStage.None;
+        dirty = true;
+        TrackerChanged?.Invoke();
+    }
+
+    private bool IsNonCrystalCurrency(uint baseItemId)
+    {
+        if (baseItemId is >= 2 and <= 19)
+        {
+            return false;
+        }
+
+        var row = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId);
+        return row is not null && ItemIdentity.IsCurrencyOrCrystal(baseItemId, row.Value);
+    }
 
     public bool HasTrackedItems => ActiveProfile.TrackedItems.Count > 0;
 
@@ -106,6 +137,21 @@ public sealed unsafe class MaterialTrackerService
 
     public bool IsRecipeTracked(uint recipeId)
         => recipeId != 0 && ActiveProfile.TrackedRecipeId == recipeId && ActiveProfile.TrackedItems.Count > 0;
+
+    public bool IsTrackedRecipeResultItem(uint rawItemId)
+    {
+        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
+        var recipeId = ActiveProfile.TrackedRecipeId;
+        if (baseId == 0 || recipeId == 0 || ActiveProfile.TrackedItems.Count == 0)
+        {
+            return false;
+        }
+
+        var recipeSheet = dataManager.GetExcelSheet<Recipe>();
+        return recipeSheet != null
+            && recipeSheet.TryGetRow(recipeId, out var row)
+            && row.ItemResult.RowId == baseId;
+    }
 
     public bool IsItemTracked(uint baseItemId)
     {
@@ -141,12 +187,13 @@ public sealed unsafe class MaterialTrackerService
                     break;
                 default:
                     profile.TrackWithdrawAllStacks = true;
+                    profile.TrackedCraftCount = 1;
                     break;
             }
         }
 
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
     }
 
     public Dictionary<uint, int> GetMissingTrackedForRetainerWithdraw()
@@ -189,9 +236,16 @@ public sealed unsafe class MaterialTrackerService
 
     public void MarkDirty() => dirty = true;
 
-    public string GetIngredientOwnershipLabel(uint baseItemId)
+    public void RefreshActiveRetainerSnapshot()
+        => holdings.CaptureActiveRetainerIfOpen(GetOpenRetainerAddonName() != null);
+
+    public string GetIngredientOwnershipLabel(uint baseItemId, bool captureRetainer = true)
     {
-        holdings.CaptureActiveRetainerIfOpen(GetOpenRetainerAddonName() != null);
+        if (captureRetainer)
+        {
+            RefreshActiveRetainerSnapshot();
+        }
+
         return holdings.FormatExternalOwnership(baseItemId, maxChars: 26);
     }
 
@@ -252,19 +306,6 @@ public sealed unsafe class MaterialTrackerService
             }
         }
 
-        if (recipeId == 0)
-        {
-            var agent = AgentRecipeNote.Instance();
-            if (agent != null && agent->ActiveCraftRecipeId != 0)
-            {
-                recipeId = agent->ActiveCraftRecipeId;
-            }
-            else if (nativeRecipeNote != null && nativeRecipeNote->ActiveCraftRecipeId != 0)
-            {
-                recipeId = nativeRecipeNote->ActiveCraftRecipeId;
-            }
-        }
-
         if (recipeId == 0 || !recipeSheet.TryGetRow(recipeId, out var row))
         {
             return null;
@@ -317,8 +358,10 @@ public sealed unsafe class MaterialTrackerService
 
         profile.TrackedRecipeId = recipe.RecipeId;
         profile.TrackedTitle = recipe.Name;
+        profile.TrackedCraftCount = 1;
+        profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
     }
 
     private Dictionary<uint, List<uint>> GetRecipeLookup()
@@ -360,10 +403,45 @@ public sealed unsafe class MaterialTrackerService
         return baseId != 0 && GetRecipeLookup().ContainsKey(baseId);
     }
 
+    private int GetRecipeJobPriorityRank(Recipe row, PlayerState* ps, Lumina.Excel.ExcelSheet<ClassJob>? classJobSheet, uint currentJobId, out int jobLevel)
+    {
+        jobLevel = 0;
+        if (row.CraftType.RowId >= CraftTypeToClassJobId.Length)
+        {
+            return 4;
+        }
+
+        var reqJobId = CraftTypeToClassJobId[row.CraftType.RowId];
+        var reqLv = row.RecipeLevelTable.ValueNullable?.ClassJobLevel ?? 1;
+        if (ps != null && classJobSheet != null && classJobSheet.TryGetRow(reqJobId, out var jobRow)
+            && jobRow.ExpArrayIndex >= 0 && jobRow.ExpArrayIndex < ps->ClassJobLevels.Length)
+        {
+            jobLevel = ps->ClassJobLevels[jobRow.ExpArrayIndex];
+        }
+
+        if (reqJobId == currentJobId && jobLevel >= reqLv)
+        {
+            return 0;
+        }
+
+        if (jobLevel >= reqLv && jobLevel > 0)
+        {
+            return 1;
+        }
+
+        if (reqJobId == currentJobId)
+        {
+            return 2;
+        }
+
+        return jobLevel > 0 ? 3 : 4;
+    }
+
     private bool TryResolveBestRecipeForItem(uint baseId, out Recipe recipe)
     {
         recipe = default;
         var recipeSheet = dataManager.GetExcelSheet<Recipe>();
+        var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
         if (baseId == 0 || recipeSheet == null || !GetRecipeLookup().TryGetValue(baseId, out var recipeIds))
         {
             return false;
@@ -372,6 +450,7 @@ public sealed unsafe class MaterialTrackerService
         var ps = PlayerState.Instance();
         var currentJobId = ps != null ? (uint)ps->CurrentClassJobId : 0u;
         Recipe? chosen = null;
+        var bestKey = (Rank: int.MaxValue, NegLevel: int.MaxValue, RowId: uint.MaxValue);
 
         foreach (var rid in recipeIds)
         {
@@ -380,13 +459,12 @@ public sealed unsafe class MaterialTrackerService
                 continue;
             }
 
-            if (chosen == null || CraftTypeToClassJobId[row.CraftType.RowId] == currentJobId)
+            var rank = GetRecipeJobPriorityRank(row, ps, classJobSheet, currentJobId, out var jobLevel);
+            var key = (rank, -jobLevel, row.RowId);
+            if (chosen == null || key.CompareTo(bestKey) < 0)
             {
                 chosen = row;
-                if (CraftTypeToClassJobId[row.CraftType.RowId] == currentJobId)
-                {
-                    break;
-                }
+                bestKey = key;
             }
         }
 
@@ -399,9 +477,10 @@ public sealed unsafe class MaterialTrackerService
         return true;
     }
 
-    private void FlattenCraftMultiplierIntoItems(CharacterProfile profile)
+    private static void FlattenCraftMultiplierIntoItems(CharacterProfile profile)
     {
-        var mult = Math.Max(1, profile.TrackedCraftCount);
+        // In "All" mode, TrackedCraftCount is not an explicit multiplier — never multiply existing targets!
+        var mult = profile.TrackWithdrawAllStacks ? 1 : Math.Max(1, profile.TrackedCraftCount);
         if (mult > 1 && profile.TrackedItems.Count > 0)
         {
             foreach (var key in profile.TrackedItems.Keys.ToArray())
@@ -411,6 +490,7 @@ public sealed unsafe class MaterialTrackerService
         }
 
         profile.TrackedCraftCount = 1;
+        profile.TrackWithdrawAllStacks = false;
     }
 
     public bool TrackRecipeForResultItem(uint rawItemId, out string statusMessage)
@@ -472,7 +552,7 @@ public sealed unsafe class MaterialTrackerService
             profile.TrackedTitle = $"Tracked List ({profile.TrackedItems.Count} items)";
             profile.TrackWithdrawAllStacks = false;
             config.Save(pluginInterface);
-            dirty = true;
+            NotifyTrackerChanged();
             statusMessage = $"Added {recipeName} ingredients to tracked list ({profile.TrackedItems.Count} items).";
             return true;
         }
@@ -488,7 +568,7 @@ public sealed unsafe class MaterialTrackerService
         profile.TrackedCraftCount = 1;
         profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
 
         var reqJobId = CraftTypeToClassJobId[recipe.CraftType.RowId];
         var jobAbbr = classJobSheet != null && classJobSheet.TryGetRow(reqJobId, out var jobRow)
@@ -502,9 +582,9 @@ public sealed unsafe class MaterialTrackerService
     public void AddItemToList(uint rawItemId, out string statusMessage)
     {
         var baseItemId = ItemIdentity.NormalizeBaseItemId(rawItemId);
-        if (baseItemId == 0)
+        if (baseItemId == 0 || IsNonCrystalCurrency(baseItemId))
         {
-            statusMessage = string.Empty;
+            statusMessage = "Currencies cannot be tracked in the Material Tracker.";
             return;
         }
 
@@ -521,14 +601,15 @@ public sealed unsafe class MaterialTrackerService
         }
 
         FlattenCraftMultiplierIntoItems(profile);
-        var summary = holdings.GetHoldingSummary(baseItemId);
         if (profile.TrackedItems.TryGetValue(baseItemId, out var existing))
         {
-            profile.TrackedItems[baseItemId] = Math.Max(existing + 1, summary.BagCount + 1);
+            // Increment existing target by +1 cleanly (never jump to BagCount + 1!)
+            profile.TrackedItems[baseItemId] = Math.Max(1, existing) + 1;
             statusMessage = $"Updated {itemName} in tracked list (target: {profile.TrackedItems[baseItemId]}).";
         }
         else
         {
+            var summary = holdings.GetHoldingSummary(baseItemId);
             profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
             statusMessage = $"Added {itemName} to tracked list ({profile.TrackedItems.Count} items).";
         }
@@ -539,15 +620,15 @@ public sealed unsafe class MaterialTrackerService
             : $"Tracked List ({profile.TrackedItems.Count} items)";
         profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
     }
 
     public void TrackItemOnly(uint rawItemId, out string statusMessage)
     {
         var baseItemId = ItemIdentity.NormalizeBaseItemId(rawItemId);
-        if (baseItemId == 0)
+        if (baseItemId == 0 || IsNonCrystalCurrency(baseItemId))
         {
-            statusMessage = string.Empty;
+            statusMessage = "Currencies cannot be tracked in the Material Tracker.";
             return;
         }
 
@@ -565,7 +646,7 @@ public sealed unsafe class MaterialTrackerService
         profile.TrackWithdrawAllStacks = false;
         profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
         statusMessage = $"Tracking only: {itemName}.";
     }
 
@@ -588,6 +669,8 @@ public sealed unsafe class MaterialTrackerService
         {
             profile.TrackedRecipeId = 0;
             profile.TrackedTitle = string.Empty;
+            profile.TrackedCraftCount = 1;
+            profile.TrackWithdrawAllStacks = false;
             statusMessage = $"Removed {itemName}; tracked list is now empty.";
         }
         else
@@ -609,7 +692,7 @@ public sealed unsafe class MaterialTrackerService
         }
 
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
     }
 
     public void ToggleSingleItem(uint rawItemId)
@@ -625,18 +708,24 @@ public sealed unsafe class MaterialTrackerService
 
     public void ClearAll()
     {
-        pendingCraftStage = PendingCraftStage.None;
         var profile = ActiveProfile;
-        if (profile.TrackedItems.Count == 0 && profile.TrackedRecipeId == 0 && string.IsNullOrEmpty(profile.TrackedTitle))
+        if (profile.TrackedItems.Count == 0
+            && profile.TrackedRecipeId == 0
+            && string.IsNullOrEmpty(profile.TrackedTitle)
+            && profile.TrackedCraftCount == 1
+            && !profile.TrackWithdrawAllStacks)
         {
+            pendingCraftStage = PendingCraftStage.None;
             return;
         }
 
         profile.TrackedItems.Clear();
         profile.TrackedRecipeId = 0;
         profile.TrackedTitle = string.Empty;
+        profile.TrackedCraftCount = 1;
+        profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
     }
 
     public bool TrackRecipeByQuery(string rawArgs, out string statusMessage)
@@ -689,9 +778,8 @@ public sealed unsafe class MaterialTrackerService
         var ps = PlayerState.Instance();
         var currentJobId = ps != null ? (uint)ps->CurrentClassJobId : 0u;
 
-        Recipe? bestExact = null;
-        Recipe? bestPrefix = null;
-        Recipe? bestContains = null;
+        Recipe? bestRecipe = null;
+        var bestKey = (Tier: int.MaxValue, JobRank: int.MaxValue, NameLen: int.MaxValue, NegLevel: int.MaxValue, RowId: uint.MaxValue);
 
         foreach (var row in recipeSheet)
         {
@@ -712,46 +800,41 @@ public sealed unsafe class MaterialTrackerService
                 continue;
             }
 
-            var jobMatches = CraftTypeToClassJobId[row.CraftType.RowId] == currentJobId;
-
+            int tier;
             if (string.Equals(resName, query, StringComparison.OrdinalIgnoreCase))
             {
-                if (bestExact == null || jobMatches)
-                {
-                    bestExact = row;
-                    if (jobMatches)
-                    {
-                        break;
-                    }
-                }
+                tier = 0;
             }
             else if (resName.StartsWith(query, StringComparison.OrdinalIgnoreCase))
             {
-                if (bestPrefix == null || jobMatches || resName.Length < itemSheet.GetRow(bestPrefix.Value.ItemResult.RowId).Name.ExtractText().Length)
-                {
-                    bestPrefix = row;
-                }
+                tier = 1;
             }
             else if (resName.Contains(query, StringComparison.OrdinalIgnoreCase))
             {
-                if (bestContains == null || jobMatches)
-                {
-                    bestContains = row;
-                }
+                tier = 2;
+            }
+            else
+            {
+                continue;
+            }
+
+            var jobRank = GetRecipeJobPriorityRank(row, ps, classJobSheet, currentJobId, out var jobLevel);
+            var key = (tier, jobRank, resName.Length, -jobLevel, row.RowId);
+            if (bestRecipe == null || key.CompareTo(bestKey) < 0)
+            {
+                bestRecipe = row;
+                bestKey = key;
             }
         }
 
-        var chosen = bestExact ?? bestPrefix ?? bestContains;
-        if (chosen is null)
+        if (bestRecipe is null)
         {
             statusMessage = $"No crafting recipe found matching \"{query}\".";
             return false;
         }
 
-        var recipe = chosen.Value;
-        var profile = ActiveProfile;
-        profile.TrackedItems.Clear();
-
+        var recipe = bestRecipe.Value;
+        var ingredients = new Dictionary<uint, int>();
         var ingCount = Math.Min(6, Math.Min(recipe.Ingredient.Count, recipe.AmountIngredient.Count));
         for (var i = 0; i < ingCount; i++)
         {
@@ -762,13 +845,20 @@ public sealed unsafe class MaterialTrackerService
                 continue;
             }
 
-            profile.TrackedItems[ingId] = profile.TrackedItems.GetValueOrDefault(ingId) + amt;
+            ingredients[ingId] = ingredients.GetValueOrDefault(ingId) + amt;
         }
 
-        if (profile.TrackedItems.Count == 0)
+        if (ingredients.Count == 0)
         {
             statusMessage = $"Recipe #{recipe.RowId} has no trackable ingredients.";
             return false;
+        }
+
+        var profile = ActiveProfile;
+        profile.TrackedItems.Clear();
+        foreach (var (ingId, amt) in ingredients)
+        {
+            profile.TrackedItems[ingId] = amt;
         }
 
         var recipeName = itemSheet.TryGetRow(recipe.ItemResult.RowId, out var chosenItem)
@@ -779,7 +869,7 @@ public sealed unsafe class MaterialTrackerService
         profile.TrackedCraftCount = craftCount;
         profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
-        dirty = true;
+        NotifyTrackerChanged();
 
         var reqJobId = CraftTypeToClassJobId[recipe.CraftType.RowId];
         var jobAbbr = classJobSheet != null && classJobSheet.TryGetRow(reqJobId, out var jobRow)
@@ -792,6 +882,12 @@ public sealed unsafe class MaterialTrackerService
 
     public bool SwitchToTrackedJob(out string message)
     {
+        if (!IsCraftConditionSafe(out var condReason))
+        {
+            message = condReason;
+            return false;
+        }
+
         var snap = GetSnapshot();
         if (snap.MatchingGearsetId < 0)
         {
@@ -806,14 +902,62 @@ public sealed unsafe class MaterialTrackerService
             return false;
         }
 
-        gm->EquipGearset(snap.MatchingGearsetId);
+        var res = gm->EquipGearset(snap.MatchingGearsetId);
+        if (res != 0)
+        {
+            message = $"Cannot switch to {snap.RequiredJobAbbr} right now.";
+            return false;
+        }
+
         dirty = true;
         message = $"Switched to {snap.RequiredJobAbbr}.";
         return true;
     }
 
+    private bool IsCraftConditionSafe(out string reason)
+    {
+        if (condition[ConditionFlag.Crafting]
+            || condition[ConditionFlag.ExecutingCraftingAction]
+            || condition[ConditionFlag.PreparingToCraft])
+        {
+            reason = "Already crafting.";
+            return false;
+        }
+
+        if (condition[ConditionFlag.InCombat])
+        {
+            reason = "Cannot craft while in combat.";
+            return false;
+        }
+
+        if (condition[ConditionFlag.Mounted] || condition[ConditionFlag.RidingPillion])
+        {
+            reason = "Dismount before crafting.";
+            return false;
+        }
+
+        if (condition[ConditionFlag.BetweenAreas]
+            || condition[ConditionFlag.BetweenAreas51]
+            || condition[ConditionFlag.OccupiedInEvent]
+            || condition[ConditionFlag.OccupiedInQuestEvent]
+            || condition[ConditionFlag.OccupiedInCutSceneEvent])
+        {
+            reason = "Cannot craft while busy or zoning.";
+            return false;
+        }
+
+        reason = string.Empty;
+        return true;
+    }
+
     public bool StartCraftTracked(out string message)
     {
+        if (!IsCraftConditionSafe(out var condReason))
+        {
+            message = condReason;
+            return false;
+        }
+
         var snap = GetSnapshot();
         if (snap.RecipeId == 0)
         {
@@ -865,7 +1009,12 @@ public sealed unsafe class MaterialTrackerService
         return true;
     }
 
-    public void StopPendingCraft() => pendingCraftStage = PendingCraftStage.None;
+    public bool StopPendingCraft()
+    {
+        var wasActive = pendingCraftStage != PendingCraftStage.None;
+        pendingCraftStage = PendingCraftStage.None;
+        return wasActive;
+    }
 
     public void TickPendingCraft()
     {
@@ -874,10 +1023,17 @@ public sealed unsafe class MaterialTrackerService
             return;
         }
 
+        if (!IsCraftConditionSafe(out _))
+        {
+            pendingCraftStage = PendingCraftStage.None;
+            return;
+        }
+
         var now = DateTime.UtcNow;
         if (now > pendingCraftDeadlineUtc)
         {
             pendingCraftStage = PendingCraftStage.None;
+            chatGui.PrintError("Quick Synthesis timed out waiting for the Crafting Log.");
             return;
         }
 
@@ -895,11 +1051,20 @@ public sealed unsafe class MaterialTrackerService
                 return;
             }
 
+            // Fail-closed: verify RecipeNote actually selected the intended recipe before clicking Quick Synthesis!
+            var activeRecipe = GetActiveRecipe((AddonRecipeNote*)rn);
+            if (activeRecipe == null || activeRecipe.RecipeId != pendingCraftRecipeId)
+            {
+                pendingCraftNextTickUtc = now.AddMilliseconds(250);
+                return;
+            }
+
             // Native Quick Synthesis button on RecipeNote is NodeId 103
             var qsNode = rn->GetNodeById(103);
             if (qsNode == null || !qsNode->IsVisible())
             {
                 pendingCraftStage = PendingCraftStage.None;
+                chatGui.PrintError("Quick Synthesis is not available for this recipe — craft it from the open Crafting Log.");
                 return;
             }
 
@@ -908,6 +1073,7 @@ public sealed unsafe class MaterialTrackerService
             {
                 // Quick Synthesis locked/unavailable for this recipe; leave Crafting Log cleanly open on the recipe
                 pendingCraftStage = PendingCraftStage.None;
+                chatGui.PrintError("Quick Synthesis is unavailable (unlock Quick Synthesis or craft manually from the Crafting Log).");
                 return;
             }
 
@@ -944,13 +1110,15 @@ public sealed unsafe class MaterialTrackerService
     public TrackerSnapshot GetSnapshot()
     {
         var now = DateTime.UtcNow;
-        if (!dirty && (now - lastSnapshotUtc).TotalMilliseconds < 180)
+        var cid = InventorySafetyEvaluator.GetCurrentContentId();
+        if (!dirty && cid == lastSnapshotCharId && (now - lastSnapshotUtc).TotalMilliseconds < 180)
         {
             return cachedSnapshot;
         }
 
         dirty = false;
         lastSnapshotUtc = now;
+        lastSnapshotCharId = cid;
 
         var profile = ActiveProfile;
         if (profile.TrackedItems.Count == 0)
@@ -966,7 +1134,8 @@ public sealed unsafe class MaterialTrackerService
         var itemSheet = dataManager.GetExcelSheet<Item>();
         var lines = new List<TrackedMaterialLine>(profile.TrackedItems.Count);
         var withdrawAll = profile.TrackWithdrawAllStacks;
-        var craftMult = Math.Max(1, profile.TrackedCraftCount);
+        var craftMult = withdrawAll ? 1 : Math.Max(1, profile.TrackedCraftCount);
+        var maxCraftableFromBags = int.MaxValue;
 
         foreach (var (itemId, baseNeeded) in profile.TrackedItems)
         {
@@ -985,9 +1154,18 @@ public sealed unsafe class MaterialTrackerService
                 ? Math.Max(baseNeeded, summary.BagCount + summary.TotalRetainerCount)
                 : baseNeeded * craftMult;
 
-            var retainerNote = summary.BagCount < effectiveNeeded && summary.Retainers.Count > 0
-                ? string.Join(", ", summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}"))
-                : string.Empty;
+            var bagCraftable = summary.BagCount / baseNeeded;
+            if (bagCraftable < maxCraftableFromBags)
+            {
+                maxCraftableFromBags = bagCraftable;
+            }
+
+            var retainerNote = string.Empty;
+            if (summary.BagCount < effectiveNeeded && summary.Retainers.Count > 0)
+            {
+                var rawNote = string.Join(", ", summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}"));
+                retainerNote = rawNote.Length > 38 ? rawNote[..35] + "..." : rawNote;
+            }
 
             lines.Add(new TrackedMaterialLine(
                 itemId,
@@ -999,10 +1177,17 @@ public sealed unsafe class MaterialTrackerService
                 openRetainerQty));
         }
 
+        var effectiveCraftCount = withdrawAll
+            ? (maxCraftableFromBags == int.MaxValue ? 1 : Math.Clamp(maxCraftableFromBags, 1, 99))
+            : craftMult;
+        var hasCraftableMats = withdrawAll
+            ? (lines.Count > 0 && maxCraftableFromBags >= 1 && maxCraftableFromBags != int.MaxValue)
+            : (lines.Count > 0 && lines.All(l => l.IsComplete));
+
         var title = ResolveTrackedTitle(lines);
         ResolveRecipeMetadata(
             profile.TrackedRecipeId,
-            lines,
+            hasCraftableMats,
             out var reqJobAbbr,
             out var reqLevel,
             out var playerJobLevel,
@@ -1017,7 +1202,7 @@ public sealed unsafe class MaterialTrackerService
             CraftCountModeLabel,
             withdrawAll,
             profile.TrackedRecipeId,
-            craftMult,
+            effectiveCraftCount,
             reqJobAbbr,
             reqLevel,
             playerJobLevel,
@@ -1030,7 +1215,7 @@ public sealed unsafe class MaterialTrackerService
 
     private void ResolveRecipeMetadata(
         uint recipeId,
-        List<TrackedMaterialLine> lines,
+        bool hasCraftableMats,
         out string requiredJobAbbr,
         out int requiredLevel,
         out int playerJobLevel,
@@ -1043,7 +1228,7 @@ public sealed unsafe class MaterialTrackerService
         requiredLevel = 0;
         playerJobLevel = 0;
         isOnRequiredJob = true;
-        hasAllMaterialsInBag = lines.Count > 0 && lines.All(l => l.IsComplete);
+        hasAllMaterialsInBag = hasCraftableMats;
         matchingGearsetId = -1;
         canQuickSynth = false;
 
@@ -1082,13 +1267,17 @@ public sealed unsafe class MaterialTrackerService
             var gm = RaptureGearsetModule.Instance();
             if (gm != null)
             {
+                var bestIlvl = -1;
                 for (var i = 0; i < gm->Entries.Length; i++)
                 {
                     var entry = gm->GetGearset(i);
-                    if (entry != null && entry->Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists) && entry->ClassJob == reqJobId)
+                    if (entry != null
+                        && entry->Flags.HasFlag(RaptureGearsetModule.GearsetFlag.Exists)
+                        && entry->ClassJob == reqJobId
+                        && entry->ItemLevel > bestIlvl)
                     {
+                        bestIlvl = entry->ItemLevel;
                         matchingGearsetId = i;
-                        break;
                     }
                 }
             }

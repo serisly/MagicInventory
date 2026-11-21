@@ -58,6 +58,7 @@ public sealed class UniversalisClient : IDisposable
 
     private readonly object diskSaveGate = new();
     private readonly ConcurrentDictionary<(string World, uint ItemId), MarketPriceSnapshot> cache = new();
+    private readonly ConcurrentDictionary<(string World, uint ItemId), DateTime> negativeCooldowns = new();
     private readonly ConcurrentDictionary<(string World, uint ItemId), byte> queuedKeys = new();
     private readonly ConcurrentQueue<(string World, uint ItemId)> pendingQueue = new();
     private readonly SemaphoreSlim wakeSignal = new(0);
@@ -68,6 +69,8 @@ public sealed class UniversalisClient : IDisposable
     private volatile bool isScanning;
     private string lastError = string.Empty;
     private DateTime lastScanUtc = DateTime.MinValue;
+    private DateTime nextBatchAllowedUtc = DateTime.MinValue;
+    private int consecutiveBatchFailures;
     private volatile bool cacheDirty;
 
     public UniversalisClient(IDalamudPluginInterface pluginInterface, IPluginLog log)
@@ -137,21 +140,37 @@ public sealed class UniversalisClient : IDisposable
         }
 
         var now = DateTime.UtcNow;
+        if (!forceRefresh && now < nextBatchAllowedUtc)
+        {
+            return 0;
+        }
+
         var added = 0;
         foreach (var id in baseItemIds)
         {
-            if (id <= 20)
+            if (id < 2)
             {
                 continue;
             }
 
             var key = (world, id);
-            if (!forceRefresh
-                && cache.TryGetValue(key, out var existing)
-                && existing.SchemaVersion >= CurrentSnapshotSchemaVersion
-                && (now - existing.FetchedUtc) <= CacheTtl)
+            if (!forceRefresh)
             {
-                continue;
+                if (negativeCooldowns.TryGetValue(key, out var negUntil) && now < negUntil)
+                {
+                    continue;
+                }
+
+                if (cache.TryGetValue(key, out var existing)
+                    && existing.SchemaVersion >= CurrentSnapshotSchemaVersion
+                    && (now - existing.FetchedUtc) <= CacheTtl)
+                {
+                    continue;
+                }
+            }
+            else
+            {
+                negativeCooldowns.TryRemove(key, out _);
             }
 
             if (queuedKeys.TryAdd(key, 0))
@@ -191,13 +210,13 @@ public sealed class UniversalisClient : IDisposable
         string? excludeWorld = null,
         CancellationToken externalCt = default)
     {
-        if (string.IsNullOrWhiteSpace(dataCenterName) || baseItemId <= 20)
+        if (string.IsNullOrWhiteSpace(dataCenterName) || baseItemId < 2)
         {
             return null;
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, externalCt);
-        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(dataCenterName)}/{baseItemId}?listings=10&entries=0";
+        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(dataCenterName)}/{baseItemId}?listings=25&entries=0";
         try
         {
             using var resp = await httpClient.GetAsync(url, linked.Token).ConfigureAwait(false);
@@ -217,6 +236,11 @@ public sealed class UniversalisClient : IDisposable
             DcCheapestListing? best = null;
             foreach (var item in listingsEl.EnumerateArray())
             {
+                if (item.TryGetProperty("onMannequin", out var manEl) && manEl.ValueKind == JsonValueKind.True)
+                {
+                    continue;
+                }
+
                 var worldName = item.TryGetProperty("worldName", out var wEl) ? wEl.GetString() ?? string.Empty : string.Empty;
                 if (string.IsNullOrWhiteSpace(worldName))
                 {
@@ -350,7 +374,7 @@ public sealed class UniversalisClient : IDisposable
     private async Task<int> FetchBatchWithBackoffAsync(string world, List<uint> itemIds, CancellationToken ct)
     {
         var idsJoined = string.Join(',', itemIds);
-        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=10&entries=10";
+        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=10&entries=40";
 
         for (var attempt = 0; attempt < 3; attempt++)
         {
@@ -370,15 +394,14 @@ public sealed class UniversalisClient : IDisposable
 
                 if (resp.StatusCode == HttpStatusCode.NotFound)
                 {
-                    // Short 15-minute cooldown instead of infinite 1.5s re-poll loop or 6-hour poisoning
-                    var shortExpiryFetch = DateTime.UtcNow - CacheTtl + TimeSpan.FromMinutes(15);
+                    // Dedicated negative cooldown (never poisons cache or disk with zero-sentinels!)
+                    var negUntil = DateTime.UtcNow.AddMinutes(15);
                     foreach (var requestedId in itemIds)
                     {
-                        cache.TryAdd(
-                            (world, requestedId),
-                            new MarketPriceSnapshot(requestedId, 0, 0, 0, 0, 0f, shortExpiryFetch, -1, SchemaVersion: CurrentSnapshotSchemaVersion));
+                        negativeCooldowns[(world, requestedId)] = negUntil;
                     }
 
+                    consecutiveBatchFailures = 0;
                     lastError = string.Empty;
                     return 0;
                 }
@@ -386,6 +409,7 @@ public sealed class UniversalisClient : IDisposable
                 if (!resp.IsSuccessStatusCode)
                 {
                     lastError = $"Universalis returned HTTP {(int)resp.StatusCode}.";
+                    RecordBatchFailureCircuitBreaker();
                     return 0;
                 }
 
@@ -403,6 +427,7 @@ public sealed class UniversalisClient : IDisposable
                         if (uint.TryParse(prop.Name, out var id) && ParseItemSnapshot(id, prop.Value, now, out var snap))
                         {
                             cache[(world, id)] = snap;
+                            negativeCooldowns.TryRemove((world, id), out _);
                             returnedIds.Add(id);
                             updated++;
                         }
@@ -413,22 +438,23 @@ public sealed class UniversalisClient : IDisposable
                     && ParseItemSnapshot(singleId, doc.RootElement, now, out var singleSnap))
                 {
                     cache[(world, singleId)] = singleSnap;
+                    negativeCooldowns.TryRemove((world, singleId), out _);
                     returnedIds.Add(singleId);
                     updated++;
                 }
 
-                // Short 15-minute cooldown for unreturned batch IDs (ListingCount = -1 unknown, NOT 6-hour poisoned 0-listing)
-                var missingFetchUtc = now - CacheTtl + TimeSpan.FromMinutes(15);
+                // Put unreturned batch IDs on a clean 15-minute negative cooldown without poisoning cache
+                var missingCooldownUntil = now.AddMinutes(15);
                 foreach (var requestedId in itemIds)
                 {
                     if (!returnedIds.Contains(requestedId))
                     {
-                        cache[(world, requestedId)] = new MarketPriceSnapshot(
-                            requestedId, 0, 0, 0, 0, 0f, missingFetchUtc, -1, SchemaVersion: CurrentSnapshotSchemaVersion);
-                        updated++;
+                        negativeCooldowns[(world, requestedId)] = missingCooldownUntil;
                     }
                 }
 
+                consecutiveBatchFailures = 0;
+                nextBatchAllowedUtc = DateTime.MinValue;
                 lastError = string.Empty;
                 return updated;
             }
@@ -446,7 +472,15 @@ public sealed class UniversalisClient : IDisposable
             }
         }
 
+        RecordBatchFailureCircuitBreaker();
         return 0;
+    }
+
+    private void RecordBatchFailureCircuitBreaker()
+    {
+        consecutiveBatchFailures = Math.Min(consecutiveBatchFailures + 1, 4);
+        var backoffSeconds = 30 * (1 << (consecutiveBatchFailures - 1)); // 30s -> 60s -> 120s -> 240s
+        nextBatchAllowedUtc = DateTime.UtcNow.AddSeconds(Math.Min(300, backoffSeconds));
     }
 
     private static bool ParseItemSnapshot(uint itemId, JsonElement el, DateTime fetchedUtc, out MarketPriceSnapshot snapshot)

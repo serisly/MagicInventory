@@ -72,9 +72,51 @@ public sealed unsafe class RetainerSortPlanner
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
 
+        var knownRetainers = holdings.GetKnownRetainersForCurrentCharacter();
+
         var simulatedRetainerEmpty = 0;
         var retainerExistingBaseIds = new HashSet<uint>();
-        var retainerPartialRoom = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), int>();
+        var retainerPartialSlots = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<int>>();
+
+        static void AddPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key, int room)
+        {
+            if (room <= 0)
+            {
+                return;
+            }
+
+            if (!map.TryGetValue(key, out var list))
+            {
+                list = new List<int>(2);
+                map[key] = list;
+            }
+
+            list.Add(room);
+        }
+
+        static int PeekFirstPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key)
+            => map.TryGetValue(key, out var list) && list.Count > 0 ? list[0] : 0;
+
+        static void ConsumeFirstPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key, int qty, out bool completelyMerged)
+        {
+            completelyMerged = false;
+            if (!map.TryGetValue(key, out var list) || list.Count == 0)
+            {
+                return;
+            }
+
+            var room = list[0];
+            if (qty < room)
+            {
+                list[0] = room - qty;
+                completelyMerged = true;
+            }
+            else
+            {
+                list.RemoveAt(0);
+                completelyMerged = qty == room;
+            }
+        }
 
         foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
         {
@@ -112,15 +154,14 @@ public sealed unsafe class RetainerSortPlanner
                     && (rSlot->Flags & InventoryItem.ItemFlags.Collectable) == 0
                     && rSlot->Quantity < rStackSize)
                 {
-                    var key = (rSlot->ItemId, rSlot->Flags);
-                    retainerPartialRoom[key] = retainerPartialRoom.GetValueOrDefault(key) + (rStackSize - rSlot->Quantity);
+                    AddPartialRoom(retainerPartialSlots, (rSlot->ItemId, rSlot->Flags), rStackSize - rSlot->Quantity);
                 }
             }
         }
 
         var simulatedPlayerEmpty = 0;
         var playerExistingBaseIds = new HashSet<uint>();
-        var playerPartialRoom = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), int>();
+        var playerPartialSlots = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<int>>();
 
         foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
         {
@@ -158,8 +199,7 @@ public sealed unsafe class RetainerSortPlanner
                     && (pSlot->Flags & InventoryItem.ItemFlags.Collectable) == 0
                     && pSlot->Quantity < pStackSize)
                 {
-                    var key = (pSlot->ItemId, pSlot->Flags);
-                    playerPartialRoom[key] = playerPartialRoom.GetValueOrDefault(key) + (pStackSize - pSlot->Quantity);
+                    AddPartialRoom(playerPartialSlots, (pSlot->ItemId, pSlot->Flags), pStackSize - pSlot->Quantity);
                 }
             }
         }
@@ -236,9 +276,37 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var isPrimaryTarget = entry.TargetRetainerId == activeId;
-                    var isOverflowTarget = entry.TargetRetainerId != 0
-                        && entry.TargetRetainerId != activeId
-                        && holdings.IsRetainerKnownFullFor(entry.TargetRetainerId, baseId, isHq, stackSize);
+                    var isOverflowTarget = false;
+                    if (!isPrimaryTarget
+                        && entry.TargetRetainerId != 0
+                        && holdings.IsRetainerKnownFullFor(entry.TargetRetainerId, baseId, isHq, stackSize))
+                    {
+                        // Deterministic overflow selection matching RetainerBellEvaluator (prevents cross-retainer ping-pong):
+                        // only accept overflow if this retainer is the first non-full eligible retainer (or has a partial merge).
+                        ulong chosenOverflowId = 0;
+                        foreach (var kr in knownRetainers)
+                        {
+                            if (kr.RetainerId == entry.TargetRetainerId)
+                            {
+                                continue;
+                            }
+
+                            if (itemRow.Value.IsUnique && kr.Quantities.GetValueOrDefault(baseId) > 0)
+                            {
+                                continue;
+                            }
+
+                            var hasPartial = stackSize > 1 && holdings.HasPartialStackOnRetainer(kr.RetainerId, baseId, isHq);
+                            if (hasPartial || !holdings.IsRetainerKnownFullFor(kr.RetainerId, baseId, isHq, stackSize))
+                            {
+                                chosenOverflowId = kr.RetainerId;
+                                break;
+                            }
+                        }
+
+                        isOverflowTarget = chosenOverflowId == activeId || chosenOverflowId == 0;
+                    }
+
                     if (!isPrimaryTarget && !isOverflowTarget)
                     {
                         continue;
@@ -269,8 +337,8 @@ public sealed unsafe class RetainerSortPlanner
 
         depositCandidates.Sort((a, b) =>
         {
-            var aMerges = retainerPartialRoom.GetValueOrDefault((a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-            var bMerges = retainerPartialRoom.GetValueOrDefault((b.RawItemId, b.Flags)) > 0 ? 1 : 0;
+            var aMerges = PeekFirstPartialRoom(retainerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
+            var bMerges = PeekFirstPartialRoom(retainerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
             return bMerges.CompareTo(aMerges);
         });
 
@@ -374,7 +442,9 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null)
+                if (itemRow is null
+                    || ItemIdentity.IsSoulCrystal(itemRow.Value)
+                    || itemRow.Value.Rarity >= 4)
                 {
                     continue;
                 }
@@ -480,13 +550,16 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var itemRow = itemSheet.GetRowOrDefault(baseId);
-                    if (itemRow is null)
+                    if (itemRow is null
+                        || ItemIdentity.IsSoulCrystal(itemRow.Value)
+                        || itemRow.Value.Rarity >= 4)
                     {
                         continue;
                     }
 
                     var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                    if (effRoute is not ("Market" or "Armoire" or "Glamour"))
+                    // Only pull Market gear from Armoury at a Summoning Bell (Armoire/Glamour scan Armoury directly!)
+                    if (effRoute != "Market")
                     {
                         continue;
                     }
@@ -507,8 +580,8 @@ public sealed unsafe class RetainerSortPlanner
 
         withdrawCandidates.Sort((a, b) =>
         {
-            var aMerges = playerPartialRoom.GetValueOrDefault((a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-            var bMerges = playerPartialRoom.GetValueOrDefault((b.RawItemId, b.Flags)) > 0 ? 1 : 0;
+            var aMerges = PeekFirstPartialRoom(playerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
+            var bMerges = PeekFirstPartialRoom(playerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
             if (aMerges != bMerges)
             {
                 return bMerges.CompareTo(aMerges);
@@ -572,8 +645,8 @@ public sealed unsafe class RetainerSortPlanner
 
             trackedWithdrawCandidates.Sort((a, b) =>
             {
-                var aMerges = playerPartialRoom.GetValueOrDefault((a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-                var bMerges = playerPartialRoom.GetValueOrDefault((b.RawItemId, b.Flags)) > 0 ? 1 : 0;
+                var aMerges = PeekFirstPartialRoom(playerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
+                var bMerges = PeekFirstPartialRoom(playerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
                 if (aMerges != bMerges)
                 {
                     return bMerges.CompareTo(aMerges);
@@ -688,7 +761,7 @@ public sealed unsafe class RetainerSortPlanner
                             var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot) : null;
                             if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
                             {
-                                holdings.CaptureActiveRetainerIfOpen(true);
+                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
                                 onStepCompleted();
                                 return true;
                             }
@@ -707,9 +780,9 @@ public sealed unsafe class RetainerSortPlanner
                 var effectiveQty = canSplit ? takeQty : cand.Quantity;
 
                 var roomKey = (cand.RawItemId, cand.Flags);
-                var freeInPartials = canStack ? playerPartialRoom.GetValueOrDefault(roomKey) : 0;
-                var fitsCompletelyInPartial = freeInPartials >= effectiveQty;
-                var fitsAnyPartial = freeInPartials > 0;
+                var firstPartialRoom = canStack ? PeekFirstPartialRoom(playerPartialSlots, roomKey) : 0;
+                var fitsCompletelyInPartial = firstPartialRoom >= effectiveQty;
+                var fitsAnyPartial = firstPartialRoom > 0;
                 if (!fitsCompletelyInPartial && simulatedPlayerEmpty <= 0 && (!fitsAnyPartial || canSplit))
                 {
                     blockedByFullBag++;
@@ -723,24 +796,25 @@ public sealed unsafe class RetainerSortPlanner
                     break;
                 }
 
+                var splitTargetsEmptySlot = canSplit && !fitsCompletelyInPartial;
                 if (fitsCompletelyInPartial)
                 {
-                    playerPartialRoom[roomKey] = freeInPartials - effectiveQty;
+                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, effectiveQty, out _);
                 }
                 else if (fitsAnyPartial && !canSplit)
                 {
-                    playerPartialRoom[roomKey] = 0;
+                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, effectiveQty, out _);
                 }
                 else
                 {
                     simulatedPlayerEmpty--;
                     if (canStack && effectiveQty < cand.StackSize)
                     {
-                        playerPartialRoom[roomKey] = cand.StackSize - effectiveQty;
+                        AddPartialRoom(playerPartialSlots, roomKey, cand.StackSize - effectiveQty);
                     }
                 }
 
-                if (!canSplit && fitsCompletelyInPartial || (!canSplit && !fitsAnyPartial))
+                if ((!canSplit && fitsCompletelyInPartial) || (!canSplit && !fitsAnyPartial))
                 {
                     simulatedRetainerEmpty++;
                 }
@@ -751,7 +825,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var movedQty = (!canSplit && fitsAnyPartial && !fitsCompletelyInPartial)
-                    ? Math.Min(effectiveQty, freeInPartials)
+                    ? Math.Min(effectiveQty, firstPartialRoom)
                     : effectiveQty;
 
                 if (!withdrawAll)
@@ -872,8 +946,10 @@ public sealed unsafe class RetainerSortPlanner
 
                             return false;
                         },
-                        PacingProfile.StandardSlot));
+                        PacingProfile.StandardSlot,
+                        SkipOnFailureCount: 1));
 
+                    var allowPartialMergeForSplit = !splitTargetsEmptySlot;
                     steps.Add(new TransactionStep(
                         $"Withdraw tracked {cand.ItemName} (x{splitQty})",
                         ResolveActiveRetainerAddonName(),
@@ -891,6 +967,8 @@ public sealed unsafe class RetainerSortPlanner
                                 return false;
                             }
 
+                            // When moving a split stack that won't fit completely into an existing partial stack,
+                            // target an empty bag slot directly so the remainder isn't orphaned in the retainer.
                             if (!InventorySafetyEvaluator.FindDestinationSlot(
                                     mgr,
                                     InventorySafetyEvaluator.PlayerBagContainers,
@@ -898,7 +976,8 @@ public sealed unsafe class RetainerSortPlanner
                                     capturedItemFlags,
                                     capturedStackSize,
                                     out var dstBag,
-                                    out var dstSlot))
+                                    out var dstSlot,
+                                    allowPartialMerge: allowPartialMergeForSplit))
                             {
                                 return false;
                             }
@@ -913,7 +992,7 @@ public sealed unsafe class RetainerSortPlanner
                             var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, splitContainer, splitSlot) : null;
                             if (src == null || src->ItemId == 0 || src->ItemId != capturedRaw || src->Quantity < preSplitQty)
                             {
-                                holdings.CaptureActiveRetainerIfOpen(true);
+                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
                                 onStepCompleted();
                                 return true;
                             }
@@ -964,7 +1043,7 @@ public sealed unsafe class RetainerSortPlanner
                             var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx) : null;
                             if (src == null || src->ItemId == 0 || src->ItemId != capturedRaw || src->Quantity < preQty)
                             {
-                                holdings.CaptureActiveRetainerIfOpen(true);
+                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
                                 onStepCompleted();
                                 return true;
                             }
@@ -987,8 +1066,8 @@ public sealed unsafe class RetainerSortPlanner
 
                 var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
                 var roomKey = (cand.RawItemId, cand.Flags);
-                var freeInPartials = canStack ? retainerPartialRoom.GetValueOrDefault(roomKey) : 0;
-                var fitsPartial = freeInPartials > 0;
+                var firstPartialRoom = canStack ? PeekFirstPartialRoom(retainerPartialSlots, roomKey) : 0;
+                var fitsPartial = firstPartialRoom > 0;
                 if (!fitsPartial && simulatedRetainerEmpty <= 0)
                 {
                     blockedByFullRetainer++;
@@ -1004,15 +1083,7 @@ public sealed unsafe class RetainerSortPlanner
                 var freedPlayerSlot = false;
                 if (fitsPartial)
                 {
-                    if (cand.Quantity <= freeInPartials)
-                    {
-                        retainerPartialRoom[roomKey] = freeInPartials - cand.Quantity;
-                        freedPlayerSlot = true;
-                    }
-                    else
-                    {
-                        retainerPartialRoom[roomKey] = 0;
-                    }
+                    ConsumeFirstPartialRoom(retainerPartialSlots, roomKey, cand.Quantity, out freedPlayerSlot);
                 }
                 else
                 {
@@ -1020,7 +1091,7 @@ public sealed unsafe class RetainerSortPlanner
                     freedPlayerSlot = true;
                     if (canStack && cand.Quantity < cand.StackSize)
                     {
-                        retainerPartialRoom[roomKey] = cand.StackSize - cand.Quantity;
+                        AddPartialRoom(retainerPartialSlots, roomKey, cand.StackSize - cand.Quantity);
                     }
                 }
 
@@ -1089,7 +1160,7 @@ public sealed unsafe class RetainerSortPlanner
                         var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedBag, capturedSlot) : null;
                         if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
                         {
-                            holdings.CaptureActiveRetainerIfOpen(true);
+                            holdings.CaptureActiveRetainerIfOpen(true, force: true);
                             onStepCompleted();
                             return true;
                         }
@@ -1113,8 +1184,8 @@ public sealed unsafe class RetainerSortPlanner
 
                 var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
                 var roomKey = (cand.RawItemId, cand.Flags);
-                var freeInPartials = canStack ? playerPartialRoom.GetValueOrDefault(roomKey) : 0;
-                var fitsPartial = freeInPartials > 0;
+                var firstPartialRoom = canStack ? PeekFirstPartialRoom(playerPartialSlots, roomKey) : 0;
+                var fitsPartial = firstPartialRoom > 0;
                 if (!fitsPartial && simulatedPlayerEmpty <= 0)
                 {
                     blockedByFullBag++;
@@ -1130,15 +1201,7 @@ public sealed unsafe class RetainerSortPlanner
                 var freedRetainerSlot = false;
                 if (fitsPartial)
                 {
-                    if (cand.Quantity <= freeInPartials)
-                    {
-                        playerPartialRoom[roomKey] = freeInPartials - cand.Quantity;
-                        freedRetainerSlot = true;
-                    }
-                    else
-                    {
-                        playerPartialRoom[roomKey] = 0;
-                    }
+                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, cand.Quantity, out freedRetainerSlot);
                 }
                 else
                 {
@@ -1146,7 +1209,7 @@ public sealed unsafe class RetainerSortPlanner
                     freedRetainerSlot = true;
                     if (canStack && cand.Quantity < cand.StackSize)
                     {
-                        playerPartialRoom[roomKey] = cand.StackSize - cand.Quantity;
+                        AddPartialRoom(playerPartialSlots, roomKey, cand.StackSize - cand.Quantity);
                     }
                 }
 
@@ -1218,7 +1281,7 @@ public sealed unsafe class RetainerSortPlanner
                         var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot) : null;
                         if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
                         {
-                            holdings.CaptureActiveRetainerIfOpen(true);
+                            holdings.CaptureActiveRetainerIfOpen(true, force: true);
                             onStepCompleted();
                             return true;
                         }
@@ -1229,21 +1292,32 @@ public sealed unsafe class RetainerSortPlanner
             }
         }
 
-        QueueTrackedWithdrawals();
-
-        var runWithdrawalsFirst = simulatedRetainerEmpty < depositCandidates.Count
-            && simulatedPlayerEmpty > 0
-            && withdrawCandidates.Count > 0;
-
-        if (runWithdrawalsFirst)
+        // When player bags are completely full (140/140) and we have deposits + retainer space,
+        // deposit FIRST to free bag slots so non-crystal tracked withdrawals aren't blocked!
+        if (simulatedPlayerEmpty == 0 && depositCandidates.Count > 0 && simulatedRetainerEmpty > 0)
         {
-            QueueWithdrawals();
             QueueDeposits();
+            QueueTrackedWithdrawals();
+            QueueWithdrawals();
         }
         else
         {
-            QueueDeposits();
-            QueueWithdrawals();
+            QueueTrackedWithdrawals();
+
+            var runWithdrawalsFirst = simulatedRetainerEmpty < depositCandidates.Count
+                && simulatedPlayerEmpty > 0
+                && withdrawCandidates.Count > 0;
+
+            if (runWithdrawalsFirst)
+            {
+                QueueWithdrawals();
+                QueueDeposits();
+            }
+            else
+            {
+                QueueDeposits();
+                QueueWithdrawals();
+            }
         }
 
         return new RetainerSortPlan(

@@ -129,7 +129,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetInventorySortButtonState,
             magicSort.ExecuteInventorySort,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            ResolveInventorySortPosition,
             hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryExpansion", hovered));
 
         inventoryLargeSortController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -137,7 +137,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetInventorySortButtonState,
             magicSort.ExecuteInventorySort,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            ResolveInventorySortPosition,
             hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryLarge", hovered));
 
         inventoryNormalSortController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -145,7 +145,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetInventorySortButtonState,
             magicSort.ExecuteInventorySort,
             addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false),
+            ResolveInventorySortPosition,
             hovered => routeOverlay.SetHoveredInventorySortAddon("Inventory", hovered));
 
         inventoryExpansionUseController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -153,7 +153,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => ResolveInventoryUsePosition(addon),
+            ResolveInventoryUsePosition,
             hovered => highlightController.SetHoveredSellAddon("InventoryExpansion", hovered));
 
         inventoryLargeUseController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -161,7 +161,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => ResolveInventoryUsePosition(addon),
+            ResolveInventoryUsePosition,
             hovered => highlightController.SetHoveredSellAddon("InventoryLarge", hovered));
 
         inventoryNormalUseController = new MagicSortAddonBinding<AtkUnitBase>(
@@ -169,14 +169,23 @@ public sealed unsafe class MagicSortControllers : IDisposable
             magicSort.GetUseAllButtonState,
             magicSort.ExecuteUseAll,
             addon => addon->RootNode,
-            addon => ResolveInventoryUsePosition(addon),
+            ResolveInventoryUsePosition,
             hovered => highlightController.SetHoveredSellAddon("Inventory", hovered));
+    }
+
+    private static (Vector2 Position, Vector2 Size) ResolveInventorySortPosition(AtkUnitBase* addon)
+    {
+        // Reserve combined 224px span (114px Sort + 6px gap + 104px Use All) so both buttons stay clear of native footer buttons
+        var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 224f, 26f, preferRightSide: false);
+        return (basePos, new Vector2(114f, 26f));
     }
 
     private static (Vector2 Position, Vector2 Size) ResolveInventoryUsePosition(AtkUnitBase* addon)
     {
-        var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 114f, 26f, preferRightSide: false);
-        return (new Vector2(basePos.X + 120f, basePos.Y), new Vector2(104f, 26f));
+        var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 224f, 26f, preferRightSide: false);
+        var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
+        var useX = Math.Clamp(basePos.X + 120f, 12f, Math.Max(12f, rootW - 104f - 12f));
+        return (new Vector2(useX, basePos.Y), new Vector2(104f, 26f));
     }
 
     public void Enable()
@@ -259,6 +268,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
         private string lastTooltip = string.Empty;
         private bool? lastEnabled;
         private bool? lastVisible;
+        private float lastRootWidth;
+        private float lastRootHeight;
 
         public MagicSortAddonBinding(
             string addonName,
@@ -278,7 +289,7 @@ public sealed unsafe class MagicSortControllers : IDisposable
             {
                 AddonName = addonName,
                 OnSetup = OnSetup,
-                OnRefresh = SyncState,
+                OnRefresh = OnRefresh,
                 OnUpdate = SyncState,
                 OnFinalize = OnFinalize,
             };
@@ -301,6 +312,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
                 return;
             }
 
+            lastRootWidth = rootNode->Width;
+            lastRootHeight = rootNode->Height;
             var (pos, size) = resolvePlacement(addon);
             button = new TextButtonNode
             {
@@ -308,7 +321,11 @@ public sealed unsafe class MagicSortControllers : IDisposable
                 Size = size,
                 String = "Magic Sort",
                 IsVisible = false,
-                OnClick = onClick,
+                OnClick = () =>
+                {
+                    onHoverChanged?.Invoke(false);
+                    onClick();
+                },
             };
             if (onHoverChanged != null)
             {
@@ -319,6 +336,26 @@ public sealed unsafe class MagicSortControllers : IDisposable
             button.AttachNode(rootNode, NodePosition.AsLastChild);
 
             ResetCache();
+            SyncState(addon);
+        }
+
+        private void OnRefresh(TAddon* addon)
+        {
+            if (addon != null && button != null)
+            {
+                var rootNode = getRootNode(addon);
+                if (rootNode != null
+                    && (MathF.Abs(rootNode->Width - lastRootWidth) > 1f
+                        || MathF.Abs(rootNode->Height - lastRootHeight) > 1f))
+                {
+                    lastRootWidth = rootNode->Width;
+                    lastRootHeight = rootNode->Height;
+                    var (pos, size) = resolvePlacement(addon);
+                    button.Position = pos;
+                    button.Size = size;
+                }
+            }
+
             SyncState(addon);
         }
 
@@ -356,6 +393,10 @@ public sealed unsafe class MagicSortControllers : IDisposable
             {
                 lastEnabled = state.IsEnabled;
                 button.IsEnabled = state.IsEnabled;
+                if (!state.IsEnabled)
+                {
+                    onHoverChanged?.Invoke(false);
+                }
             }
 
             if (lastLabel != state.Label)

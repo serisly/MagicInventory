@@ -166,9 +166,7 @@ public static unsafe class NativeUiHelpers
             evt = evt->NextEvent;
         }
 
-        var target = matched != null
-            ? matched
-            : (fallbackClick != null ? fallbackClick : owner->AtkResNode.AtkEventManager.Event);
+        var target = matched != null ? matched : fallbackClick;
         if (target == null)
         {
             return false;

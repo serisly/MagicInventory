@@ -36,6 +36,8 @@ public sealed unsafe class MateriaExtractPlanner
         this.onStepCompleted = onStepCompleted;
     }
 
+    public bool IsBlockedByMount => condition[ConditionFlag.Mounted] || condition[ConditionFlag.RidingPillion];
+
     public List<MateriaExtractPlanItem> PlanExtractions(int maxItems, out int blockedByFullBag)
     {
         blockedByFullBag = 0;
@@ -148,9 +150,14 @@ public sealed unsafe class MateriaExtractPlanner
                 "Materialize",
                 Dispatch: () =>
                 {
+                    if (condition[ConditionFlag.Mounted] || condition[ConditionFlag.RidingPillion])
+                    {
+                        transactionQueue.Cancel("Dismount before extracting materia.", QueueBatchOutcome.AbortedOnError);
+                        return false;
+                    }
+
                     if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Materialize")
                         || condition[ConditionFlag.Occupied39]
-                        || condition[ConditionFlag.Mounted]
                         || condition[ConditionFlag.InCombat]
                         || condition[ConditionFlag.Casting]
                         || condition[ConditionFlag.BoundByDuty])

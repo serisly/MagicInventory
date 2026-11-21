@@ -56,6 +56,7 @@ public sealed unsafe class HoldingsService
 
     private Dictionary<ulong, string> ownerNames = new();
     private Dictionary<uint, List<RetainerHolding>> cachedExternalHoldings = new();
+    private Dictionary<(ulong CharacterId, uint ItemId), int> cachedSaddlebagByChar = new();
     private Dictionary<ulong, Dictionary<uint, int>> cachedRetainerHqQuantities = new();
     private Dictionary<ulong, int> cachedRetainerUsedSlots = new();
     private Dictionary<ulong, HashSet<(uint BaseItemId, bool IsHq)>> cachedRetainerPartialStacks = new();
@@ -106,21 +107,15 @@ public sealed unsafe class HoldingsService
             return;
         }
 
-        // Verify at least one regular retainer page is actually loaded from the server before snapshotting
-        var anyRegularPageLoaded = false;
+        // Verify ALL 7 regular retainer pages are actually loaded from the server before snapshotting
+        // so an early frame with only Page 1 loaded never wipes pages 2..7 from the retainer cache.
         foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainers)
         {
             var c = manager->GetInventoryContainer(containerType);
-            if (c != null && c->Items != null && c->Size > 0 && c->IsLoaded)
+            if (c == null || c->Items == null || c->Size <= 0 || !c->IsLoaded)
             {
-                anyRegularPageLoaded = true;
-                break;
+                return;
             }
-        }
-
-        if (!anyRegularPageLoaded)
-        {
-            return;
         }
 
         lastLiveCaptureUtc = now;
@@ -432,8 +427,9 @@ public sealed unsafe class HoldingsService
         var bagCount = GetLiveBagCount(normalized);
         var currentCid = InventorySafetyEvaluator.GetCurrentContentId();
 
-        // Restrict strictly to retainers belonging to the active character (prevents cross-alt bleed!)
+        // Restrict strictly to available retainers belonging to the active character (prevents cross-alt bleed & expired retainers!)
         var currentCharRetainerIds = new HashSet<ulong>();
+        var unavailableRetainerIds = new HashSet<ulong>();
         var rm = RetainerManager.Instance();
         if (rm != null && rm->IsReady)
         {
@@ -441,15 +437,29 @@ public sealed unsafe class HoldingsService
             for (uint i = 0; i < count; i++)
             {
                 var ret = rm->GetRetainerBySortedIndex(i);
-                if (ret != null && ret->RetainerId != 0 && ret->Available)
+                if (ret == null || ret->RetainerId == 0)
+                {
+                    continue;
+                }
+
+                if (ret->Available)
                 {
                     currentCharRetainerIds.Add(ret->RetainerId);
+                }
+                else
+                {
+                    unavailableRetainerIds.Add(ret->RetainerId);
                 }
             }
         }
 
         foreach (var (retId, snap) in liveRetainerSnapshots)
         {
+            if (unavailableRetainerIds.Contains(retId))
+            {
+                continue;
+            }
+
             if (currentCid == 0 || snap.CharacterContentId == 0 || snap.CharacterContentId == currentCid)
             {
                 currentCharRetainerIds.Add(retId);
@@ -461,14 +471,13 @@ public sealed unsafe class HoldingsService
         {
             foreach (var entry in cachedList)
             {
-                if (liveRetainerSnapshots.ContainsKey(entry.RetainerId))
+                if (liveRetainerSnapshots.ContainsKey(entry.RetainerId)
+                    || unavailableRetainerIds.Contains(entry.RetainerId))
                 {
                     continue;
                 }
 
-                if (entry.RetainerId != SaddlebagPseudoOwnerId
-                    && currentCharRetainerIds.Count > 0
-                    && !currentCharRetainerIds.Contains(entry.RetainerId))
+                if (currentCharRetainerIds.Count > 0 && !currentCharRetainerIds.Contains(entry.RetainerId))
                 {
                     continue;
                 }
@@ -477,8 +486,18 @@ public sealed unsafe class HoldingsService
             }
         }
 
+        if (currentCid != 0 && cachedSaddlebagByChar.TryGetValue((currentCid, normalized), out var sbQty) && sbQty > 0)
+        {
+            merged.Add(new RetainerHolding(SaddlebagPseudoOwnerId, "Saddlebag", sbQty));
+        }
+
         foreach (var (retainerId, snap) in liveRetainerSnapshots)
         {
+            if (unavailableRetainerIds.Contains(retainerId))
+            {
+                continue;
+            }
+
             if (currentCid != 0 && snap.CharacterContentId != 0 && snap.CharacterContentId != currentCid)
             {
                 continue;
@@ -667,7 +686,12 @@ public sealed unsafe class HoldingsService
         foreach (var containerType in containers)
         {
             var container = manager->GetInventoryContainer(containerType);
-            if (container == null || container->Items == null || container->Size <= 0)
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            if (InventorySafetyEvaluator.IsRetainerContainer(containerType) && !container->IsLoaded)
             {
                 continue;
             }
@@ -760,6 +784,7 @@ public sealed unsafe class HoldingsService
     {
         var itemSheet = dataManager.GetExcelSheet<Item>();
         var totalsByItemAndOwner = new Dictionary<(uint ItemId, ulong OwnerId), int>();
+        var nextSaddlebagByChar = new Dictionary<(ulong CharacterId, uint ItemId), int>();
         var hqByOwner = new Dictionary<ulong, Dictionary<uint, int>>();
         var usedSlotsByOwner = new Dictionary<ulong, int>();
         var partialsByOwner = new Dictionary<ulong, HashSet<(uint BaseItemId, bool IsHq)>>();
@@ -808,14 +833,21 @@ public sealed unsafe class HoldingsService
                 continue;
             }
 
-            var effectiveOwner = isSaddlebag ? SaddlebagPseudoOwnerId : ownerId;
             var normalized = ItemIdentity.NormalizeBaseItemId(itemId);
             if (normalized == 0)
             {
                 continue;
             }
 
-            var key = (normalized, effectiveOwner);
+            if (isSaddlebag)
+            {
+                // Scope Saddlebag holdings strictly to their owning character ContentId (prevents cross-alt bleed!)
+                var sbKey = (ownerId, normalized);
+                nextSaddlebagByChar[sbKey] = nextSaddlebagByChar.GetValueOrDefault(sbKey) + qty;
+                continue;
+            }
+
+            var key = (normalized, ownerId);
             totalsByItemAndOwner[key] = totalsByItemAndOwner.GetValueOrDefault(key) + qty;
 
             if (isRegularRetainerPage)
@@ -869,6 +901,7 @@ public sealed unsafe class HoldingsService
         }
 
         cachedExternalHoldings = nextHoldings;
+        cachedSaddlebagByChar = nextSaddlebagByChar;
         cachedRetainerHqQuantities = hqByOwner;
         cachedRetainerUsedSlots = usedSlotsByOwner;
         cachedRetainerPartialStacks = partialsByOwner;

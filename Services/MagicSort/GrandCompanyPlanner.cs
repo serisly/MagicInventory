@@ -35,8 +35,13 @@ public sealed unsafe class GrandCompanyPlanner
         this.safety = safety;
     }
 
-    public int CountEligibleItemsInBagsAndArmoury(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+    public int CountEligibleItemsInBagsAndArmoury(
+        int maxItems,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        int selectedFilter,
+        out bool atSealCap)
     {
+        atSealCap = false;
         var manager = InventoryManager.Instance();
         var itemSheet = dataManager.GetExcelSheet<Item>();
         if (manager == null || itemSheet == null || manifestEntries.Count == 0 || maxItems <= 0)
@@ -44,11 +49,27 @@ public sealed unsafe class GrandCompanyPlanner
             return 0;
         }
 
+        var ps = PlayerState.Instance();
+        if (ps != null && ps->GrandCompany != 0)
+        {
+            var cur = manager->GetCompanySeals(ps->GrandCompany);
+            var max = manager->GetMaxCompanySeals(ps->GrandCompany);
+            if (max > 0 && cur >= max)
+            {
+                atSealCap = true;
+            }
+        }
+
         var gearsetIds = safety.BuildGearsetItemIds();
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var count = 0;
 
-        foreach (var containerType in InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers))
+        // Filter 2 = "Hide Armoury Chest Items" -> match Expert Delivery tab behavior
+        var containers = selectedFilter == 2
+            ? InventorySafetyEvaluator.PlayerBagContainers
+            : InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers);
+
+        foreach (var containerType in containers)
         {
             var container = manager->GetInventoryContainer(containerType);
             if (!InventorySafetyEvaluator.IsContainerReadable(container))
@@ -187,6 +208,7 @@ public sealed unsafe class GrandCompanyPlanner
         {
             var captured = plan;
             var slotClearedAtUtc = DateTime.MinValue;
+            var preTotalBaseCount = 0;
 
             steps.Add(new TransactionStep(
                 $"Select {captured.Name}",
@@ -211,7 +233,7 @@ public sealed unsafe class GrandCompanyPlanner
                     var maxSeals = manager->GetMaxCompanySeals(grandCompany);
                     if (currentSeals + (uint)Math.Max(0, captured.SealReward) > maxSeals)
                     {
-                        transactionQueue.Cancel("Stopped before Grand Company seal cap.");
+                        transactionQueue.Cancel("Stopped before Grand Company seal cap.", QueueBatchOutcome.Succeeded);
                         return false;
                     }
 
@@ -264,7 +286,7 @@ public sealed unsafe class GrandCompanyPlanner
                     if (currentSeals + (uint)Math.Max(0, captured.SealReward) > maxSeals)
                     {
                         CloseRewardModal(rewardAddon);
-                        transactionQueue.Cancel("Stopped before Grand Company seal cap.");
+                        transactionQueue.Cancel("Stopped before Grand Company seal cap.", QueueBatchOutcome.Succeeded);
                         return false;
                     }
 
@@ -281,7 +303,7 @@ public sealed unsafe class GrandCompanyPlanner
                     if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", getManifest(), gearsetIds, unlockedTop))
                     {
                         CloseRewardModal(rewardAddon);
-                        transactionQueue.Cancel("Item no longer satisfies safety checks.");
+                        transactionQueue.Cancel("Item no longer satisfies safety checks.", QueueBatchOutcome.AbortedOnError);
                         return false;
                     }
 
@@ -294,10 +316,17 @@ public sealed unsafe class GrandCompanyPlanner
                         return false;
                     }
 
+                    preTotalBaseCount = CountBaseItemInBagsAndArmoury(manager, captured.BaseItemId);
                     var deliverButton = rewardAddon->DeliverButton != null
                         ? rewardAddon->DeliverButton
                         : rewardAddon->AtkUnitBase.GetComponentButtonById(38);
-                    return NativeUiHelpers.ClickAddonButton((AtkUnitBase*)rewardAddon, deliverButton);
+                    if (!NativeUiHelpers.ClickAddonButton((AtkUnitBase*)rewardAddon, deliverButton))
+                    {
+                        CloseRewardModal(rewardAddon);
+                        return false;
+                    }
+
+                    return true;
                 },
                 HasServerAck: () =>
                 {
@@ -332,7 +361,8 @@ public sealed unsafe class GrandCompanyPlanner
 
                     var slot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
                     var slotGone = slot == null || slot->ItemId != captured.RawItemId || slot->Quantity <= 0;
-                    if (!slotGone)
+                    var totalReduced = preTotalBaseCount > 0 && CountBaseItemInBagsAndArmoury(manager, captured.BaseItemId) < preTotalBaseCount;
+                    if (!slotGone && !totalReduced)
                     {
                         return false;
                     }
@@ -419,6 +449,30 @@ public sealed unsafe class GrandCompanyPlanner
         return unsafeIds;
     }
 
+    private static int CountBaseItemInBagsAndArmoury(InventoryManager* manager, uint baseItemId)
+    {
+        var total = 0;
+        foreach (var containerType in InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers))
+        {
+            var c = manager->GetInventoryContainer(containerType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(c))
+            {
+                continue;
+            }
+
+            for (var i = 0; i < c->Size; i++)
+            {
+                var s = InventorySafetyEvaluator.GetSlot(c, i);
+                if (s != null && s->Quantity > 0 && ItemIdentity.NormalizeBaseItemId(s->ItemId) == baseItemId)
+                {
+                    total += s->Quantity;
+                }
+            }
+        }
+
+        return total;
+    }
+
     private int ResolveExpertDeliveryRowIndex(
         AddonGrandCompanySupplyList* supplyAddon,
         InventoryManager* manager,
@@ -439,10 +493,58 @@ public sealed unsafe class GrandCompanyPlanner
         var sealText = expectedSealReward.ToString(CultureInfo.InvariantCulture);
         var sealTextFormatted = expectedSealReward.ToString("N0", CultureInfo.InvariantCulture);
 
-        // 1. Primary: Read currently visible AtkComponentListItemRenderer rows (elision-safe + seal-verified)
+        // 1. Primary (on deterministic iLvl sorts 0/1): resolve exact (Inventory, Slot, BaseId) from live agent list,
+        //    and cross-check against the visible renderer if currently scrolled into view!
+        if (supplyAddon->SelectedSortBy is 0 or 1)
+        {
+            var gearsetIds = safety.BuildGearsetItemIds();
+            var orderedIndices = BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, manager, gearsetIds);
+            var targetBaseId = ItemIdentity.NormalizeBaseItemId(targetRawItemId);
+
+            for (var visibleRow = 0; visibleRow < orderedIndices.Count && visibleRow < list->ListLength; visibleRow++)
+            {
+                var gcItem = agent->ItemArray + orderedIndices[visibleRow];
+                if (gcItem->Inventory != targetContainer
+                    || gcItem->Slot != targetSlot
+                    || ItemIdentity.NormalizeBaseItemId(gcItem->ItemId) != targetBaseId)
+                {
+                    continue;
+                }
+
+                // If a visible renderer is allocated for this exact row index, verify it matches the expected name!
+                var rendererMatchesOrOffscreen = true;
+                if (list->ItemRendererList != null && list->AllocatedItemRendererListLength > 0 && !string.IsNullOrEmpty(cleanExpected))
+                {
+                    for (var r = 0; r < list->AllocatedItemRendererListLength; r++)
+                    {
+                        var renderer = list->ItemRendererList[r].AtkComponentListItemRenderer;
+                        if (renderer != null
+                            && renderer->ListItemIndex == visibleRow
+                            && renderer->AtkComponentButton.AtkComponentBase.OwnerNode != null
+                            && renderer->AtkComponentButton.AtkComponentBase.OwnerNode->IsVisible())
+                        {
+                            rendererMatchesOrOffscreen = DoesRendererMatchItemName(renderer, cleanExpected);
+                            break;
+                        }
+                    }
+                }
+
+                if (rendererMatchesOrOffscreen)
+                {
+                    return visibleRow;
+                }
+            }
+        }
+
+        // 2. Fallback: Read currently visible AtkComponentListItemRenderer rows (elision-safe + seal-verified,
+        //    rejecting ambiguous matches when multiple visible rows match the same elided prefix & seal count).
         if (list->ItemRendererList != null && list->AllocatedItemRendererListLength > 0 && !string.IsNullOrEmpty(cleanExpected))
         {
+            var sealMatch = -1;
+            var sealMatchCount = 0;
             var nameOnlyMatch = -1;
+            var nameOnlyCount = 0;
+
             for (var r = 0; r < list->AllocatedItemRendererListLength; r++)
             {
                 var renderer = list->ItemRendererList[r].AtkComponentListItemRenderer;
@@ -462,40 +564,24 @@ public sealed unsafe class GrandCompanyPlanner
 
                 if (DoesRendererContainExactText(renderer, sealText) || DoesRendererContainExactText(renderer, sealTextFormatted))
                 {
-                    return renderer->ListItemIndex;
+                    sealMatch = renderer->ListItemIndex;
+                    sealMatchCount++;
                 }
-
-                if (nameOnlyMatch < 0)
+                else
                 {
                     nameOnlyMatch = renderer->ListItemIndex;
+                    nameOnlyCount++;
                 }
             }
 
-            if (nameOnlyMatch >= 0)
+            if (sealMatchCount == 1)
+            {
+                return sealMatch;
+            }
+
+            if (sealMatchCount == 0 && nameOnlyCount == 1)
             {
                 return nameOnlyMatch;
-            }
-        }
-
-        // 2. Fallback: Only when SelectedSortBy is one of the two known iLvl sorts (0 = Desc, 1 = Asc),
-        //    and strictly filtered against live InventoryManager slots so delivered items never shift rows.
-        if (supplyAddon->SelectedSortBy is not (0 or 1))
-        {
-            return -1;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var orderedIndices = BuildOrderedExpertDeliveryAgentIndices(agent, supplyAddon, manager, gearsetIds);
-        var targetBaseId = ItemIdentity.NormalizeBaseItemId(targetRawItemId);
-
-        for (var visibleRow = 0; visibleRow < orderedIndices.Count && visibleRow < list->ListLength; visibleRow++)
-        {
-            var gcItem = agent->ItemArray + orderedIndices[visibleRow];
-            if (gcItem->Inventory == targetContainer
-                && gcItem->Slot == targetSlot
-                && ItemIdentity.NormalizeBaseItemId(gcItem->ItemId) == targetBaseId)
-            {
-                return visibleRow;
             }
         }
 

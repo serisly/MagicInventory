@@ -1,5 +1,7 @@
 ﻿using System;
+using System.Numerics;
 using System.Runtime.InteropServices;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Hooking;
 using Dalamud.Memory;
@@ -103,8 +105,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
             return;
         }
 
-        if (hoveredRawItemId != 0
-            && ItemIdentity.NormalizeBaseItemId((uint)itemId) != ItemIdentity.NormalizeBaseItemId(hoveredRawItemId))
+        if (hoveredRawItemId != 0 && (uint)itemId != hoveredRawItemId)
         {
             hoveredRawItemId = 0;
             hoveredContainer = null;
@@ -164,25 +165,33 @@ public sealed unsafe class ItemTooltipController : IDisposable
         return result;
     }
 
-    private static bool IsNonOwnedTooltipKind(DetailKind kind)
+    private static bool IsOwnedInventoryTooltipKind(DetailKind kind)
+        => kind is DetailKind.InventoryItem or DetailKind.InventoryContext;
+
+    private bool IsCursorOverAnyAddon(ReadOnlySpan<string> addonNames)
     {
-        if (kind >= DetailKind.Action)
+        var mouse = ImGui.GetMousePos();
+        var vpPos = ImGui.GetMainViewport().Pos;
+        foreach (var name in addonNames)
         {
-            return true;
+            var addon = NativeUiHelpers.GetReadyAddon(gameGui, name);
+            if (addon == null || addon->RootNode == null || !addon->IsVisible)
+            {
+                continue;
+            }
+
+            var scale = addon->Scale > 0.01f ? addon->Scale : 1f;
+            var x = vpPos.X + addon->X;
+            var y = vpPos.Y + addon->Y;
+            var w = addon->RootNode->Width * scale;
+            var h = addon->RootNode->Height * scale;
+            if (mouse.X >= x && mouse.X <= x + w && mouse.Y >= y && mouse.Y <= y + h)
+            {
+                return true;
+            }
         }
 
-        return kind is DetailKind.ItemSearchResult
-            or DetailKind.ShopBuyback
-            or DetailKind.ShopItem
-            or DetailKind.KeyItem
-            or DetailKind.ItemId
-            or DetailKind.MiragePrismPlateItem
-            or DetailKind.MiragePrismBoxItemSetPreview
-            or DetailKind.MerchantSetting
-            or DetailKind.MJIKeyItem
-            or DetailKind.Cabinet
-            or DetailKind.TradeRemote
-            or DetailKind.LetterView;
+        return false;
     }
 
     private void GenerateItemTooltipDetour(
@@ -193,7 +202,8 @@ public sealed unsafe class ItemTooltipController : IDisposable
         try
         {
             var agent = AgentItemDetail.Instance();
-            var skipTooltip = agent != null && IsNonOwnedTooltipKind(agent->DetailKind);
+            // Strict allowlist: ONLY annotate owned inventory/armoury/retainer tooltips (never chat links, MB, shops, recipes, quests, glamour plates)
+            var skipTooltip = agent == null || !IsOwnedInventoryTooltipKind(agent->DetailKind);
 
             if (!skipTooltip
                 && stringArrayData != null
@@ -209,8 +219,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
                 {
                     rawId = (uint)gameGui.HoveredItem;
                 }
-                else if (hoveredRawItemId != 0
-                    && (agent == null || agent->DetailKind is DetailKind.InventoryItem or DetailKind.InventoryContext))
+                else if (hoveredRawItemId != 0)
                 {
                     rawId = hoveredRawItemId;
                 }
@@ -219,20 +228,21 @@ public sealed unsafe class ItemTooltipController : IDisposable
                 short? effectiveSlot = null;
                 InventoryItem* liveItem = null;
 
+                var targetIsHq = rawId >= ItemIdentity.HighQualityIdOffset && rawId < ItemIdentity.EventItemIdThreshold;
+                var targetIsCollectable = rawId >= ItemIdentity.CollectableIdOffset && rawId < ItemIdentity.HighQualityIdOffset;
+
                 var canAttachHoveredSlot = hoveredContainer.HasValue
                     && hoveredSlot.HasValue
                     && hoveredSlot.Value >= 0
                     && hoveredRawItemId != 0
-                    && (rawId == 0 || ItemIdentity.NormalizeBaseItemId(hoveredRawItemId) == ItemIdentity.NormalizeBaseItemId(rawId));
+                    && (rawId == 0 || hoveredRawItemId == rawId);
 
                 if (canAttachHoveredSlot)
                 {
                     effectiveContainer = hoveredContainer;
                     effectiveSlot = hoveredSlot;
                 }
-                else if (agent != null
-                    && (agent->DetailKind is DetailKind.InventoryItem or DetailKind.InventoryContext)
-                    && agent->Index < 250)
+                else if (agent != null && agent->Index < 250)
                 {
                     effectiveContainer = (InventoryType)agent->TypeOrId;
                     effectiveSlot = (short)agent->Index;
@@ -252,10 +262,13 @@ public sealed unsafe class ItemTooltipController : IDisposable
                             if (rawId == 0)
                             {
                                 rawId = candidate->ItemId;
+                                targetIsHq = ItemIdentity.IsHighQuality(candidate);
+                                targetIsCollectable = ItemIdentity.IsCollectable(candidate);
                             }
 
-                            if (ItemIdentity.NormalizeBaseItemId(candidate->ItemId)
-                                == ItemIdentity.NormalizeBaseItemId(rawId))
+                            if (ItemIdentity.NormalizeBaseItemId(candidate->ItemId) == ItemIdentity.NormalizeBaseItemId(rawId)
+                                && ItemIdentity.IsHighQuality(candidate) == targetIsHq
+                                && ItemIdentity.IsCollectable(candidate) == targetIsCollectable)
                             {
                                 liveItem = candidate;
                             }
@@ -263,8 +276,8 @@ public sealed unsafe class ItemTooltipController : IDisposable
                     }
                 }
 
-                // Fallback when hoveredContainer didn't bind a live InventoryItem* (e.g. ArmouryBoard visual codes or RetainerGrid):
-                // Resolve in strict priority: Bags -> Armoury -> Active Retainer (never letting a Bag hover fall into Retainer!).
+                // Fallback when hoveredContainer didn't bind a live InventoryItem*:
+                // Hit-test cursor against Retainer / Armoury / Bags first, and require exact (BaseId + HQ + Collectable) match!
                 if (liveItem == null && rawId != 0)
                 {
                     var targetBase = ItemIdentity.NormalizeBaseItemId(rawId);
@@ -280,40 +293,61 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                 return null;
                             }
 
-                            InventoryItem* baseFallback = null;
-                            short baseFallbackSlot = -1;
                             for (var i = 0; i < c->Size; i++)
                             {
                                 var s = c->GetInventorySlot(i);
-                                if (s == null || s->ItemId == 0)
+                                if (s == null || s->ItemId == 0 || s->Quantity <= 0)
                                 {
                                     continue;
                                 }
 
-                                if (s->ItemId == rawId)
+                                if (ItemIdentity.NormalizeBaseItemId(s->ItemId) == targetBase
+                                    && ItemIdentity.IsHighQuality(s) == targetIsHq
+                                    && ItemIdentity.IsCollectable(s) == targetIsCollectable)
                                 {
                                     foundSlot = (short)i;
                                     return s;
                                 }
+                            }
 
-                                if (baseFallback == null && ItemIdentity.NormalizeBaseItemId(s->ItemId) == targetBase)
+                            return null;
+                        }
+
+                        bool TryScanRetainer()
+                        {
+                            foreach (var retType in Core.InventorySafetyEvaluator.RetainerBagContainers)
+                            {
+                                var hit = TryFindInContainer(retType, out var hitSlot);
+                                if (hit != null)
                                 {
-                                    baseFallback = s;
-                                    baseFallbackSlot = (short)i;
+                                    effectiveContainer = retType;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
+                                    return true;
                                 }
                             }
 
-                            foundSlot = baseFallbackSlot;
-                            return baseFallback;
+                            return false;
                         }
 
-                        var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
-                        var retainerOpen = HoldingsService.GetActiveRetainerId() != 0
-                            && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge")
-                                || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"));
+                        bool TryScanBags()
+                        {
+                            foreach (var bagType in Core.InventorySafetyEvaluator.PlayerBagContainers)
+                            {
+                                var hit = TryFindInContainer(bagType, out var hitSlot);
+                                if (hit != null)
+                                {
+                                    effectiveContainer = bagType;
+                                    effectiveSlot = hitSlot;
+                                    liveItem = hit;
+                                    return true;
+                                }
+                            }
 
-                        // 1. Check active Armoury tab first if ArmouryBoard is open
-                        if (armouryOpen)
+                            return false;
+                        }
+
+                        bool TryScanArmoury()
                         {
                             var activeTabContainer = InventoryGridLayout.GetActiveArmouryTabContainer(gameGui);
                             if (activeTabContainer.HasValue)
@@ -324,47 +358,10 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                     effectiveContainer = activeTabContainer.Value;
                                     effectiveSlot = hitSlot;
                                     liveItem = hit;
+                                    return true;
                                 }
                             }
-                        }
 
-                        // 2. Check Player Bags (and bind liveItem/effectiveContainer so bag items never leak into retainer scan!)
-                        var inBags = false;
-                        if (liveItem == null)
-                        {
-                            foreach (var bagType in Core.InventorySafetyEvaluator.PlayerBagContainers)
-                            {
-                                var hit = TryFindInContainer(bagType, out var hitSlot);
-                                if (hit != null)
-                                {
-                                    effectiveContainer = bagType;
-                                    effectiveSlot = hitSlot;
-                                    liveItem = hit;
-                                    inBags = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 3. Check Active Retainer BEFORE remaining Armoury tabs when a retainer window is open and item wasn't in bags
-                        if (liveItem == null && !inBags && retainerOpen)
-                        {
-                            foreach (var retType in Core.InventorySafetyEvaluator.RetainerBagContainers)
-                            {
-                                var hit = TryFindInContainer(retType, out var hitSlot);
-                                if (hit != null)
-                                {
-                                    effectiveContainer = retType;
-                                    effectiveSlot = hitSlot;
-                                    liveItem = hit;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // 4. Remaining Armoury tabs + Soul Crystal
-                        if (liveItem == null)
-                        {
                             foreach (var armType in Core.InventorySafetyEvaluator.ArmouryGearContainers)
                             {
                                 var hit = TryFindInContainer(armType, out var hitSlot);
@@ -373,19 +370,47 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                     effectiveContainer = armType;
                                     effectiveSlot = hitSlot;
                                     liveItem = hit;
-                                    break;
+                                    return true;
                                 }
                             }
-                        }
 
-                        if (liveItem == null)
-                        {
-                            var hit = TryFindInContainer(InventoryType.ArmorySoulCrystal, out var hitSlot);
-                            if (hit != null)
+                            var scHit = TryFindInContainer(InventoryType.ArmorySoulCrystal, out var scSlot);
+                            if (scHit != null)
                             {
                                 effectiveContainer = InventoryType.ArmorySoulCrystal;
-                                effectiveSlot = hitSlot;
-                                liveItem = hit;
+                                effectiveSlot = scSlot;
+                                liveItem = scHit;
+                                return true;
+                            }
+
+                            return false;
+                        }
+
+                        var retainerOpen = HoldingsService.GetActiveRetainerId() != 0
+                            && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge")
+                                || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"));
+                        var overRetainer = retainerOpen && IsCursorOverAnyAddon(["InventoryRetainerLarge", "InventoryRetainer", "RetainerGrid0", "RetainerGrid1", "RetainerGrid2", "RetainerGrid3", "RetainerGrid4", "RetainerGrid"]);
+                        var overArmoury = IsCursorOverAnyAddon(["ArmouryBoard"]);
+
+                        if (overRetainer)
+                        {
+                            if (!TryScanRetainer() && !TryScanBags())
+                            {
+                                TryScanArmoury();
+                            }
+                        }
+                        else if (overArmoury)
+                        {
+                            if (!TryScanArmoury() && !TryScanBags() && retainerOpen)
+                            {
+                                TryScanRetainer();
+                            }
+                        }
+                        else
+                        {
+                            if (!TryScanBags() && (!retainerOpen || !TryScanRetainer()))
+                            {
+                                TryScanArmoury();
                             }
                         }
                     }
@@ -467,7 +492,7 @@ public sealed unsafe class ItemTooltipController : IDisposable
                                 encoded,
                                 readBeforeWrite: false,
                                 managed: true,
-                                suppressUpdates: false);
+                                suppressUpdates: true);
                         }
                     }
                 }

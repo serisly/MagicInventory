@@ -19,28 +19,28 @@ namespace MagicInventory.UI;
 /// </summary>
 public sealed class SettingsWindow : Window
 {
-    private static readonly string[] SpecialtyCategories =
+    private static readonly (uint RowId, string FallbackName)[] SpecialtyCategoryDefs =
     [
-        "Ingredient",
-        "Seafood",
-        "Meal",
-        "Medicine",
-        "Reagent",
-        "Catalyst",
-        "Gardening",
-        "Fishing Tackle",
-        "Stone",
-        "Metal",
-        "Lumber",
-        "Cloth",
-        "Leather",
-        "Bone",
-        "Part",
-        "Materia",
-        "Dye",
-        "Furnishing",
-        "Demimateria",
-        "Miscellany",
+        (ItemIdentity.UiCatIngredient, "Ingredient"),
+        (ItemIdentity.UiCatSeafood, "Seafood"),
+        (ItemIdentity.UiCatMeal, "Meal"),
+        (ItemIdentity.UiCatMedicine, "Medicine"),
+        (ItemIdentity.UiCatReagent, "Reagent"),
+        (ItemIdentity.UiCatCatalyst, "Catalyst"),
+        (ItemIdentity.UiCatGardening, "Gardening"),
+        (ItemIdentity.UiCatFishingTackle, "Fishing Tackle"),
+        (ItemIdentity.UiCatStone, "Stone"),
+        (ItemIdentity.UiCatMetal, "Metal"),
+        (ItemIdentity.UiCatLumber, "Lumber"),
+        (ItemIdentity.UiCatCloth, "Cloth"),
+        (ItemIdentity.UiCatLeather, "Leather"),
+        (ItemIdentity.UiCatBone, "Bone"),
+        (ItemIdentity.UiCatPart, "Part"),
+        (ItemIdentity.UiCatMateria, "Materia"),
+        (ItemIdentity.UiCatDye, "Dye"),
+        (ItemIdentity.UiCatFurnishing, "Furnishing"),
+        (ItemIdentity.UiCatDemimateria, "Demimateria"),
+        (ItemIdentity.UiCatMiscellany, "Miscellany"),
     ];
 
     private static readonly string[] FilterOptions =
@@ -72,6 +72,9 @@ public sealed class SettingsWindow : Window
     private readonly UniversalisClient universalis;
     private readonly ItemTriageEngine triageEngine;
     private readonly MagicSortService magicSort;
+    private readonly MaterialTrackerService materialTracker;
+    private readonly System.Action? onResetTrackerPosition;
+    private readonly (uint RowId, string Name)[] specialtyCategories;
 
     private string searchQuery = string.Empty;
     private int selectedFilterIndex;
@@ -79,8 +82,12 @@ public sealed class SettingsWindow : Window
     private List<uint> cachedGameSearchIds = new();
     private List<MagicSortEntry> cachedGameSearchResults = new();
     private DateTime lastGameSearchClassifiedUtc = DateTime.MinValue;
+    private List<MagicSortEntry> cachedUnownedCustomRuleEntries = new();
+    private DateTime lastUnownedCustomRulesUtc = DateTime.MinValue;
+    private int lastCustomRuleCount = -1;
     private DateTime lastLocationsMapUtc = DateTime.MinValue;
     private Dictionary<uint, string> cachedLocationsMap = new();
+    private ulong lastContentId;
     private int sortColumnIndex;
     private bool sortDescending;
 
@@ -91,7 +98,9 @@ public sealed class SettingsWindow : Window
         HoldingsService holdings,
         UniversalisClient universalis,
         ItemTriageEngine triageEngine,
-        MagicSortService magicSort)
+        MagicSortService magicSort,
+        MaterialTrackerService materialTracker,
+        System.Action? onResetTrackerPosition = null)
         : base("Magic Inventory###MagicInventorySettings")
     {
         this.pluginInterface = pluginInterface;
@@ -101,6 +110,9 @@ public sealed class SettingsWindow : Window
         this.universalis = universalis;
         this.triageEngine = triageEngine;
         this.magicSort = magicSort;
+        this.materialTracker = materialTracker;
+        this.onResetTrackerPosition = onResetTrackerPosition;
+        specialtyCategories = BuildLocalizedSpecialtyCategories(dataManager);
 
         SizeConstraints = new WindowSizeConstraints
         {
@@ -111,8 +123,40 @@ public sealed class SettingsWindow : Window
         SizeCondition = ImGuiCond.FirstUseEver;
     }
 
+    private static (uint RowId, string Name)[] BuildLocalizedSpecialtyCategories(IDataManager dataManager)
+    {
+        var sheet = dataManager.GetExcelSheet<ItemUICategory>();
+        var list = new (uint RowId, string Name)[SpecialtyCategoryDefs.Length];
+        for (var i = 0; i < SpecialtyCategoryDefs.Length; i++)
+        {
+            var (rowId, fallback) = SpecialtyCategoryDefs[i];
+            var localized = sheet?.GetRowOrDefault(rowId)?.Name.ExtractText();
+            list[i] = (rowId, string.IsNullOrWhiteSpace(localized) ? fallback : localized);
+        }
+
+        return list;
+    }
+
+    private void InvalidateLocalCaches()
+    {
+        lastLocationsMapUtc = DateTime.MinValue;
+        lastGameSearchClassifiedUtc = DateTime.MinValue;
+        lastUnownedCustomRulesUtc = DateTime.MinValue;
+        lastCustomRuleCount = -1;
+    }
+
     public override void Draw()
     {
+        var cid = InventorySafetyEvaluator.GetCurrentContentId();
+        if (cid != lastContentId)
+        {
+            lastContentId = cid;
+            cachedLocationsMap.Clear();
+            cachedGameSearchResults.Clear();
+            cachedUnownedCustomRuleEntries.Clear();
+            InvalidateLocalCaches();
+        }
+
         if (!ImGui.BeginTabBar("MagicInventoryTabs"))
         {
             return;
@@ -195,6 +239,7 @@ public sealed class SettingsWindow : Window
             {
                 triageEngine.Invalidate();
                 magicSort.InvalidateButtonCache();
+                InvalidateLocalCaches();
             }
         }
 
@@ -260,6 +305,13 @@ public sealed class SettingsWindow : Window
             ImGui.EndTable();
         }
 
+        if (materialTracker.TrackedItemCount > 0)
+        {
+            ImGui.TextColored(
+                RoutePresentation.ColorTracked,
+                $"Tracked materials: {materialTracker.TrackedItemCount} item(s) protected from selling and pulled from retainers.");
+        }
+
         if (triageEngine.PendingPriceCount > 0)
         {
             ImGui.TextColored(ColorGold, $"{triageEngine.PendingPriceCount} item(s) waiting for Market Board prices (kept safe until checked).");
@@ -278,6 +330,7 @@ public sealed class SettingsWindow : Window
         ImGui.BulletText("/m use                  - Use unlockables & coffers in your bags");
         ImGui.BulletText("/m stop                 - Cancel any running sort, sell, buy, or use action");
         ImGui.BulletText("/m scan                 - Refresh Market Board prices");
+        ImGui.BulletText("/m status               - Print current inventory, rule, and tracker counts");
     }
 
     private static string FormatSellModeName(SellMode mode) => mode switch
@@ -311,19 +364,15 @@ public sealed class SettingsWindow : Window
         var world = triageEngine.ActiveWorldName;
         var retainers = holdings.GetKnownRetainersForCurrentCharacter();
         var entries = triageEngine.GetCurrentEntries();
+        var q = searchQuery.Trim();
 
         List<MagicSortEntry> rows;
         if (filter == "All Game Items")
         {
             rows = BuildAllGameItemsResults(searchQuery);
-            if (searchQuery.Trim().Length < 2)
-            {
-                ImGui.TextColored(ColorMuted, "Type at least 2 characters (or an item ID) to search all FFXIV items.");
-            }
         }
         else
         {
-            var q = searchQuery.Trim();
             rows = new List<MagicSortEntry>(entries.Count);
             foreach (var entry in entries.Values)
             {
@@ -332,14 +381,23 @@ public sealed class SettingsWindow : Window
                     continue;
                 }
 
-                if (!string.IsNullOrEmpty(q)
-                    && !entry.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
-                    && !entry.ItemId.ToString().Contains(q, StringComparison.OrdinalIgnoreCase))
+                if (!MatchesSearchQuery(entry, q))
                 {
                     continue;
                 }
 
                 rows.Add(entry);
+            }
+
+            if (filter == "Custom Rules")
+            {
+                foreach (var unownedEntry in BuildUnownedCustomRuleEntries(entries))
+                {
+                    if (MatchesSearchQuery(unownedEntry, q))
+                    {
+                        rows.Add(unownedEntry);
+                    }
+                }
             }
 
             rows.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
@@ -354,6 +412,11 @@ public sealed class SettingsWindow : Window
 
         ImGui.SameLine();
         ImGui.TextColored(ColorMuted, $"{rows.Count} shown");
+
+        if (filter == "All Game Items" && q.Length < 2 && !uint.TryParse(q, out _))
+        {
+            ImGui.TextColored(ColorMuted, "Type at least 2 characters (or an item ID) to search all FFXIV items.");
+        }
 
         ImGui.Spacing();
 
@@ -398,6 +461,11 @@ public sealed class SettingsWindow : Window
 
             ImGui.TableSetColumnIndex(0);
             ImGui.TextUnformatted(entry.Name);
+            if (materialTracker.IsItemTracked(entry.ItemId))
+            {
+                ImGui.SameLine(0f, 6f);
+                ImGui.TextColored(RoutePresentation.ColorTracked, "[Tracked]");
+            }
 
             ImGui.TableSetColumnIndex(1);
             var whereText = cachedLocationsMap.GetValueOrDefault(entry.ItemId, "Not owned");
@@ -408,7 +476,7 @@ public sealed class SettingsWindow : Window
             }
 
             ImGui.TableSetColumnIndex(2);
-            var routeDisplay = FormatDestinationLabel(entry);
+            var routeDisplay = RoutePresentation.FormatDestinationLabel(entry);
             ImGui.TextColored(GetRouteColor(entry.Route), routeDisplay);
 
             ImGui.TableSetColumnIndex(3);
@@ -449,21 +517,42 @@ public sealed class SettingsWindow : Window
         ImGui.EndTable();
     }
 
-    private static string FormatDestinationLabel(MagicSortEntry entry)
+    private static bool MatchesSearchQuery(MagicSortEntry entry, string trimmedQuery)
     {
-        if (entry.Route == "Retainer" && !string.IsNullOrEmpty(entry.TargetRetainerName))
+        if (string.IsNullOrEmpty(trimmedQuery))
         {
-            return entry.TargetRetainerName;
+            return true;
         }
 
-        return entry.Route switch
+        return entry.Name.Contains(trimmedQuery, StringComparison.OrdinalIgnoreCase)
+            || entry.ItemId.ToString().Contains(trimmedQuery, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private List<MagicSortEntry> BuildUnownedCustomRuleEntries(IReadOnlyDictionary<uint, MagicSortEntry> ownedEntries)
+    {
+        var now = DateTime.UtcNow;
+        if (config.ManualRouteOverrides.Count != lastCustomRuleCount
+            || (now - lastUnownedCustomRulesUtc).TotalMilliseconds >= 1500.0)
         {
-            "GrandCompany" => "GC Seals",
-            "GoldSaucer" => "Gold Saucer",
-            "Materia" => "Extract Materia",
-            "Glamour" => "Glamour Dresser",
-            _ => entry.Route,
-        };
+            lastCustomRuleCount = config.ManualRouteOverrides.Count;
+            lastUnownedCustomRulesUtc = now;
+            cachedUnownedCustomRuleEntries = new List<MagicSortEntry>();
+            foreach (var itemId in config.ManualRouteOverrides.Keys)
+            {
+                if (ownedEntries.ContainsKey(itemId))
+                {
+                    continue;
+                }
+
+                var classified = triageEngine.ClassifySingleItemOnDemand(itemId, queuePriceIfMissing: false);
+                if (classified != null)
+                {
+                    cachedUnownedCustomRuleEntries.Add(classified);
+                }
+            }
+        }
+
+        return cachedUnownedCustomRuleEntries;
     }
 
     private void SortItemRows(List<MagicSortEntry> rows, string world, IReadOnlyList<KnownRetainerInfo> retainers)
@@ -476,7 +565,7 @@ public sealed class SettingsWindow : Window
                     cachedLocationsMap.GetValueOrDefault(a.ItemId, string.Empty),
                     cachedLocationsMap.GetValueOrDefault(b.ItemId, string.Empty),
                     StringComparison.OrdinalIgnoreCase),
-                2 => string.Compare(FormatDestinationLabel(a), FormatDestinationLabel(b), StringComparison.OrdinalIgnoreCase),
+                2 => string.Compare(RoutePresentation.FormatDestinationLabel(a), RoutePresentation.FormatDestinationLabel(b), StringComparison.OrdinalIgnoreCase),
                 3 => GetSortableMarketPrice(a, world).CompareTo(GetSortableMarketPrice(b, world)),
                 4 => string.Compare(a.Reason, b.Reason, StringComparison.OrdinalIgnoreCase),
                 5 => string.Compare(
@@ -661,10 +750,13 @@ public sealed class SettingsWindow : Window
     {
         var selected = string.Equals(value, currentVal, StringComparison.OrdinalIgnoreCase)
             && (!marketPriority.HasValue || marketPriority.Value == currentPrio);
-        if (ImGui.Selectable(label, selected))
+        var optionId = marketPriority.HasValue ? $"{value}_{marketPriority.Value}" : value;
+        if (ImGui.Selectable($"{label}##ov_{optionId}", selected))
         {
             magicSort.SetItemOverride(itemId, value, marketPriority);
             lastGameSearchClassifiedUtc = DateTime.MinValue;
+            lastUnownedCustomRulesUtc = DateTime.MinValue;
+            lastCustomRuleCount = -1;
         }
     }
 
@@ -737,7 +829,7 @@ public sealed class SettingsWindow : Window
                 var cols = 4;
                 if (ImGui.BeginTable($"SpecTable_{ret.RetainerId}", cols, ImGuiTableFlags.SizingStretchSame))
                 {
-                    for (var i = 0; i < SpecialtyCategories.Length; i++)
+                    for (var i = 0; i < specialtyCategories.Length; i++)
                     {
                         if (i % cols == 0)
                         {
@@ -745,24 +837,20 @@ public sealed class SettingsWindow : Window
                         }
 
                         ImGui.TableSetColumnIndex(i % cols);
-                        var cat = SpecialtyCategories[i];
-                        var isChecked = assigned != null && assigned.Contains(cat);
-                        if (ImGui.Checkbox(cat, ref isChecked))
+                        var (catId, cat) = specialtyCategories[i];
+                        var isChecked = assigned != null && assigned.Contains(cat, StringComparer.OrdinalIgnoreCase);
+                        if (ImGui.Checkbox($"{cat}##spec_{catId}", ref isChecked))
                         {
-                            if (!profile.RetainerSpecialties.TryGetValue(ret.RetainerId, out var set))
-                            {
-                                set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                                profile.RetainerSpecialties[ret.RetainerId] = set;
-                            }
+                            var set = Configuration.GetOrCreateRetainerSpecialtySet(profile, ret.RetainerId);
 
                             if (isChecked)
                             {
                                 // Enforce exclusive category ownership across retainers so two retainers never conflict
-                                foreach (var (otherRetId, otherSet) in profile.RetainerSpecialties)
+                                foreach (var otherRetId in profile.RetainerSpecialties.Keys.ToList())
                                 {
                                     if (otherRetId != ret.RetainerId)
                                     {
-                                        otherSet.Remove(cat);
+                                        Configuration.GetOrCreateRetainerSpecialtySet(profile, otherRetId).Remove(cat);
                                     }
                                 }
 
@@ -862,6 +950,19 @@ public sealed class SettingsWindow : Window
 
         ImGui.TextColored(ColorMuted, "    Opens Retainer Sell and sets the undercut price so you inspect and click Confirm yourself.");
 
+        ImGui.BeginDisabled(!config.MarketReviewBeforeConfirm);
+        ImGui.Indent(18f);
+        var autoCompareInReview = config.MarketAutoComparePricesInReview;
+        if (ImGui.Checkbox("Auto-open Compare Prices in Review Mode", ref autoCompareInReview))
+        {
+            config.MarketAutoComparePricesInReview = autoCompareInReview;
+            changed = true;
+        }
+
+        ImGui.TextColored(ColorMuted, "    Pulls live server prices automatically when Prep Sell opens Retainer Sell, then waits for Confirm.");
+        ImGui.Unindent(18f);
+        ImGui.EndDisabled();
+
         var autoFillSell = config.MarketAutoFillRetainerSell;
         if (ImGui.Checkbox("Auto-fill undercut price when opening Retainer Sell / Compare Prices", ref autoFillSell))
         {
@@ -870,6 +971,13 @@ public sealed class SettingsWindow : Window
         }
 
         ImGui.TextColored(ColorMuted, "    Sets the asking price from live Compare Prices (excluding your own retainers) or world history.");
+
+        var hasPennyPincher = pluginInterface.InstalledPlugins.Any(p =>
+            string.Equals(p.InternalName, "PennyPincher", StringComparison.OrdinalIgnoreCase) && p.IsLoaded);
+        if (hasPennyPincher && config.MarketAutoFillRetainerSell)
+        {
+            ImGui.TextColored(ColorGold, "    PennyPincher is also loaded — disable auto-fill in one of them to avoid competing price edits.");
+        }
 
         var promptStale = config.MarketPromptStaleListings;
         if (ImGui.Checkbox("Prompt to remove or reprice stale / unrealistic active listings", ref promptStale))
@@ -894,13 +1002,17 @@ public sealed class SettingsWindow : Window
 
         ImGui.SetNextItemWidth(160f);
         var dailyLimit = config.MarketDailyActionLimit;
-        if (ImGui.InputInt("Daily Market Board limit (Magic Buy + Magic Sell)", ref dailyLimit, 5, 10))
+        if (ImGui.InputInt("Daily Market Board limit (0 = Unlimited)", ref dailyLimit, 5, 10))
         {
             config.MarketDailyActionLimit = Math.Clamp(dailyLimit, 0, 200);
             changed = true;
         }
 
-        ImGui.TextColored(ColorMuted, $"    Used today: {config.MarketDailyActionLimit - config.GetRemainingMarketActionsToday()}/{config.MarketDailyActionLimit}. Anything past the limit is up to you to do manually.");
+        var usedToday = config.GetUsedMarketActionsToday();
+        var dailyLimitNote = config.MarketDailyActionLimit <= 0
+            ? $"    Used today: {usedToday} (Unlimited). Review Mode always waits for your manual Confirm."
+            : $"    Used today: {usedToday}/{config.MarketDailyActionLimit}. Anything past the limit is up to you to do manually.";
+        ImGui.TextColored(ColorMuted, dailyLimitNote);
 
         var hasLifestream = pluginInterface.InstalledPlugins.Any(p =>
             string.Equals(p.InternalName, "Lifestream", StringComparison.OrdinalIgnoreCase) && p.IsLoaded);
@@ -917,6 +1029,19 @@ public sealed class SettingsWindow : Window
                 ? "    Lifestream installed — only travels after you click Travel."
                 : "    Lifestream not installed — shows the cheapest DC world in chat instead.");
 
+        ImGui.BeginDisabled(!config.EnableLifestreamWorldHopPrompt);
+        ImGui.Indent(18f);
+        ImGui.SetNextItemWidth(160f);
+        var minWorldHopSavings = config.WorldHopMinSavingsGil;
+        if (ImGui.InputInt("Min Gil savings to suggest world travel", ref minWorldHopSavings, 1_000, 5_000))
+        {
+            config.WorldHopMinSavingsGil = Math.Clamp(minWorldHopSavings, 0, 1_000_000);
+            changed = true;
+        }
+
+        ImGui.Unindent(18f);
+        ImGui.EndDisabled();
+
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
@@ -929,9 +1054,24 @@ public sealed class SettingsWindow : Window
             changed = true;
         }
 
+        if (ImGui.Button("Reset Tracker Position"))
+        {
+            config.TrackerX = 24f;
+            config.TrackerY = 120f;
+            onResetTrackerPosition?.Invoke();
+            changed = true;
+        }
+
+        ImGui.SameLine();
+        ImGui.TextColored(ColorMuted, "Moves the Material Tracker back onto the screen.");
+
         ImGui.Spacing();
         if (ImGui.CollapsingHeader("Advanced price thresholds"))
         {
+            ImGui.TextColored(
+                ColorMuted,
+                "High-value items scale liquidity automatically: 10k-50k stacks allow slower sales (up to 21d); 50k+ allow 0.10/day (up to 30d).");
+            ImGui.Spacing();
             ImGui.SetNextItemWidth(160f);
             var minStack = config.MarketMinStackValue;
             if (ImGui.InputInt("Min stack value for Market (Gil)", ref minStack, 100, 500))
@@ -1005,8 +1145,10 @@ public sealed class SettingsWindow : Window
             config.BuyMaxGilPerPurchase = 50_000;
             config.BuyOutlierMultiplier = 2.5f;
             config.EnableLifestreamWorldHopPrompt = false;
+            config.WorldHopMinSavingsGil = 5_000;
             config.EnableHoverHighlights = true;
             config.MarketReviewBeforeConfirm = true;
+            config.MarketAutoComparePricesInReview = true;
             config.MarketAutoFillRetainerSell = true;
             config.MarketPromptStaleListings = true;
             config.StaleListingUndercutPct = 25;
@@ -1023,6 +1165,7 @@ public sealed class SettingsWindow : Window
             config.Save(pluginInterface);
             triageEngine.Invalidate();
             magicSort.InvalidateButtonCache();
+            InvalidateLocalCaches();
         }
     }
 }

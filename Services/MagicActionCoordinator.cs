@@ -56,6 +56,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     {
         SummoningBell,
         Armoire,
+        GlamourDresser,
         MarketBoard,
         VendorNpc,
         GrandCompanyNpc,
@@ -70,6 +71,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         public required DateTime StartedUtc { get; set; }
         public DateTime ReadyAtUtc { get; set; } = DateTime.MinValue;
         public bool ClickedSubMenu { get; set; }
+        public bool SwitchedGcTab { get; set; }
     }
 
     public MagicActionCoordinator(
@@ -134,9 +136,15 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             return;
         }
 
-        if (IsAnythingActive)
+        if (IsAnyOrchestratorActive || transactionQueue.IsExecuting)
         {
             StopAll("Stopped active Magic action.");
+            return;
+        }
+
+        if (transactionQueue.IsCoolingDown)
+        {
+            chatGui.Print("Finishing previous action, try again in a moment.");
             return;
         }
 
@@ -343,6 +351,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                         {
                             req.ClickedSubMenu = true;
                             req.ReadyAtUtc = DateTime.MinValue;
+                            req.StartedUtc = now;
                         }
                         else
                         {
@@ -350,6 +359,23 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                             chatGui.Print("Select 'Place items in the armoire' and click Magic Store.");
                         }
                     }
+                }
+
+                break;
+
+            case StationKind.GlamourDresser:
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
+                {
+                    if (WaitHumanBeat(req, now))
+                    {
+                        pendingStation = null;
+                        magicSort.ExecuteGlamourDresserStore();
+                    }
+                }
+                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBox"))
+                {
+                    pendingStation = null;
+                    chatGui.Print("Open the Glamour Creation list inside the Glamour Dresser, then click Magic Store.");
                 }
 
                 break;
@@ -375,6 +401,15 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                         magicSort.ExecuteVendorSort();
                     }
                 }
+                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Talk"))
+                {
+                    if (WaitHumanBeat(req, now))
+                    {
+                        TryAdvanceTalkDialog();
+                        req.ReadyAtUtc = DateTime.MinValue;
+                        req.StartedUtc = now;
+                    }
+                }
                 else if (!req.ClickedSubMenu
                     && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectIconString")
                         || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString")))
@@ -385,6 +420,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                         {
                             req.ClickedSubMenu = true;
                             req.ReadyAtUtc = DateTime.MinValue;
+                            req.StartedUtc = now;
                         }
                         else
                         {
@@ -404,16 +440,34 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                         var gcAddon = (FFXIVClientStructs.FFXIV.Client.UI.AddonGrandCompanySupplyList*)NativeUiHelpers.GetReadyAddon(gameGui, "GrandCompanySupplyList");
                         if (gcAddon != null && gcAddon->SelectedTab != 2)
                         {
-                            // Switch to Expert Delivery tab first, then wait a beat and deliver automatically
-                            magicSort.ExecuteGrandCompanySort();
-                            req.ReadyAtUtc = DateTime.MinValue;
-                            req.StartedUtc = now;
+                            if (req.SwitchedGcTab)
+                            {
+                                pendingStation = null;
+                                chatGui.Print("Expert Delivery tab is unavailable or locked on this character.");
+                            }
+                            else
+                            {
+                                // One-shot switch to Expert Delivery tab, then wait a beat and deliver automatically
+                                req.SwitchedGcTab = true;
+                                magicSort.ExecuteGrandCompanySort();
+                                req.ReadyAtUtc = DateTime.MinValue;
+                                req.StartedUtc = now;
+                            }
                         }
                         else
                         {
                             pendingStation = null;
                             magicSort.ExecuteGrandCompanySort();
                         }
+                    }
+                }
+                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Talk"))
+                {
+                    if (WaitHumanBeat(req, now))
+                    {
+                        TryAdvanceTalkDialog();
+                        req.ReadyAtUtc = DateTime.MinValue;
+                        req.StartedUtc = now;
                     }
                 }
                 else if (!req.ClickedSubMenu
@@ -450,6 +504,27 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         return now >= req.ReadyAtUtc;
     }
 
+    private bool TryAdvanceTalkDialog()
+    {
+        var talk = NativeUiHelpers.GetReadyAddon(gameGui, "Talk");
+        if (talk == null)
+        {
+            return false;
+        }
+
+        var args = stackalloc AtkValue[1];
+        args[0] = NativeUiHelpers.IntValue(0);
+        return NativeUiHelpers.FireCallback(talk, true, new ReadOnlySpan<AtkValue>(args, 1));
+    }
+
+    private static bool MatchesShopSubMenu(string text)
+        => text.Contains("Purchase", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Shop", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Buy", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Kaufen", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Acheter", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("購入", StringComparison.Ordinal);
+
     private bool TryClickShopPurchaseSubMenu()
     {
         var iconSelect = (AddonSelectIconString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectIconString");
@@ -465,8 +540,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 }
 
                 var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-                if (text.Contains("Purchase", StringComparison.OrdinalIgnoreCase)
-                    || text.Contains("Shop", StringComparison.OrdinalIgnoreCase))
+                if (MatchesShopSubMenu(text))
                 {
                     var args = stackalloc AtkValue[1];
                     args[0] = NativeUiHelpers.IntValue(i);
@@ -488,8 +562,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 }
 
                 var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-                if (text.Contains("Purchase", StringComparison.OrdinalIgnoreCase)
-                    || text.Contains("Shop", StringComparison.OrdinalIgnoreCase))
+                if (MatchesShopSubMenu(text))
                 {
                     var args = stackalloc AtkValue[1];
                     args[0] = NativeUiHelpers.IntValue(i);
@@ -520,7 +593,10 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
             var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
             if (text.Contains("Place items in the armoire", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("Place", StringComparison.OrdinalIgnoreCase))
+                || text.Contains("Place", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("einlagern", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Déposer", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("しまう", StringComparison.Ordinal))
             {
                 var args = stackalloc AtkValue[1];
                 args[0] = NativeUiHelpers.IntValue(i);
@@ -549,7 +625,10 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             }
 
             var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-            if (text.Contains("supply and provisioning", StringComparison.OrdinalIgnoreCase))
+            if (text.Contains("supply and provisioning", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Liefereinsätze", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("ravitaillement", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("調達任務", StringComparison.Ordinal))
             {
                 var args = stackalloc AtkValue[1];
                 args[0] = NativeUiHelpers.IntValue(i);
@@ -570,6 +649,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         }
 
         if (condition[ConditionFlag.InCombat]
+            || condition[ConditionFlag.BoundByDuty]
             || condition[ConditionFlag.BetweenAreas]
             || condition[ConditionFlag.BetweenAreas51]
             || condition[ConditionFlag.OccupiedInCutSceneEvent]
@@ -579,12 +659,28 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             || condition[ConditionFlag.Mounted]
             || condition[ConditionFlag.Unconscious])
         {
-            reason = "Cannot interact right now (busy, mounted, casting, or in combat).";
+            reason = "Cannot interact right now (busy, in duty, mounted, casting, or in combat).";
             return false;
         }
 
         reason = string.Empty;
         return true;
+    }
+
+    private bool HasEligibleWorkForStation(StationKind kind, MagicActionIntent intent)
+    {
+        if (intent != MagicActionIntent.Sell)
+        {
+            return true;
+        }
+
+        return kind switch
+        {
+            StationKind.SummoningBell => magicSort.CountBagMarketItems() > 0,
+            StationKind.VendorNpc => magicSort.CountBagVendorItems() > 0,
+            StationKind.GrandCompanyNpc => magicSort.CountBagGcItems() > 0,
+            _ => true,
+        };
     }
 
     private bool TryFindNearestInRangeStation(
@@ -595,6 +691,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     {
         bestObject = null;
         bestKind = default;
+        var bestHasWork = false;
         var bestDistSq = float.MaxValue;
         var playerPos = player.Position;
 
@@ -611,8 +708,17 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             }
 
             var distSq = Vector3.DistanceSquared(playerPos, obj.Position);
-            if (distSq <= maxRange * maxRange && distSq < bestDistSq)
+            if (distSq > maxRange * maxRange)
             {
+                continue;
+            }
+
+            var hasWork = HasEligibleWorkForStation(kind, intent);
+            if (bestObject == null
+                || (hasWork && !bestHasWork)
+                || (hasWork == bestHasWork && distSq < bestDistSq))
+            {
+                bestHasWork = hasWork;
                 bestDistSq = distSq;
                 bestObject = obj;
                 bestKind = kind;
@@ -650,6 +756,14 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 && (obj.BaseId == 2001407 || string.Equals(name, "Armoire", StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.Armoire;
+                maxRange = EventObjectInteractRangeYalms;
+                return true;
+            }
+
+            if (intent == MagicActionIntent.Sort
+                && (obj.BaseId is 2009184 or 2009185 || name.Contains("Glamour Dresser", StringComparison.OrdinalIgnoreCase)))
+            {
+                kind = StationKind.GlamourDresser;
                 maxRange = EventObjectInteractRangeYalms;
                 return true;
             }

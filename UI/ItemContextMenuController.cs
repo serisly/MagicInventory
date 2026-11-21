@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Frozen;
 using System.Collections.Generic;
 using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Plugin.Services;
@@ -55,6 +56,31 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         this.contextMenu.OnMenuOpened += OnContextMenuOpened;
     }
 
+    private static readonly FrozenSet<string> NonItemContextAddons = new string[]
+    {
+        "RetainerList",
+        "PartyList",
+        "FriendList",
+        "FreeCompany",
+        "LinkShell",
+        "CrossWorldLinkshell",
+        "SocialList",
+        "BlackList",
+        "HudLayout",
+        "Macro",
+        "ActionBar",
+        "ActionBar01",
+        "ActionBar02",
+        "ActionBar03",
+        "ActionBar04",
+        "ActionBar05",
+        "ActionBar06",
+        "ActionBar07",
+        "ActionBar08",
+        "ActionBar09",
+        "ActionBar10",
+    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+
     private void OnContextMenuOpened(IMenuOpenedArgs args)
     {
         uint baseItemId = 0;
@@ -62,31 +88,33 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         if (args.Target is MenuTargetInventory invTarget && invTarget.TargetItem is { } invItem)
         {
             baseItemId = ItemIdentity.NormalizeBaseItemId(invItem.ItemId);
-            if (baseItemId == 0)
-            {
-                baseItemId = invItem.BaseItemId;
-            }
         }
         else if (args.Target is MenuTargetDefault defaultTarget)
         {
-            // Never attach item menus to right-clicks on players, NPCs, or world objects
+            // Never attach item menus to right-clicks on players, NPCs, world objects, or known non-item UI addons
             var isActorTarget = defaultTarget.TargetObjectId != 0
                 || defaultTarget.TargetContentId != 0
                 || !string.IsNullOrEmpty(defaultTarget.TargetName);
+            var isNonItemAddon = !string.IsNullOrEmpty(args.AddonName)
+                && NonItemContextAddons.Contains(args.AddonName);
 
-            if (!isActorTarget)
+            if (!isActorTarget && !isNonItemAddon)
             {
                 uint rawId = 0;
-                var detail = AgentItemDetail.Instance();
-                if (detail != null
-                    && detail->ItemId != 0
-                    && detail->DetailKind < DetailKind.Action)
-                {
-                    rawId = detail->ItemId;
-                }
-                else if (ItemIdentity.IsValidItemId(gameGui.HoveredItem))
+                if (ItemIdentity.IsValidItemId(gameGui.HoveredItem))
                 {
                     rawId = (uint)gameGui.HoveredItem;
+                }
+                else
+                {
+                    var detail = AgentItemDetail.Instance();
+                    if (detail != null
+                        && detail->IsAddonShown()
+                        && ItemIdentity.IsValidItemId(detail->ItemId)
+                        && detail->DetailKind < DetailKind.Action)
+                    {
+                        rawId = detail->ItemId;
+                    }
                 }
 
                 if (rawId != 0)
@@ -101,6 +129,14 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         }
 
         if (baseItemId == 0)
+        {
+            return;
+        }
+
+        // Reject non-crystal currencies (Gil, Tomestones, GC Seals, MGP) from item menus
+        var rowCheck = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId);
+        if (rowCheck is null
+            || (!(baseItemId is >= 2 and <= 19) && ItemIdentity.IsCurrencyOrCrystal(baseItemId, rowCheck.Value)))
         {
             return;
         }
@@ -137,7 +173,13 @@ public sealed unsafe class ItemContextMenuController : IDisposable
 
             var currentRoute = currentEntry?.Route ?? "Keep";
             var autoLabel = RoutePresentation.FormatAutoPredictedLabel(autoEntry, out var autoRouteFilter);
-            if (openedFromRetainer && string.Equals(autoRouteFilter, "Keep", StringComparison.OrdinalIgnoreCase))
+            if (openedFromRetainer && materialTracker.IsItemTracked(baseItemId)
+                && materialTracker.GetMissingTrackedForRetainerWithdraw().GetValueOrDefault(baseItemId) > 0)
+            {
+                autoLabel = "Withdraw (Tracked)";
+                autoRouteFilter = "Tracked";
+            }
+            else if (openedFromRetainer && string.Equals(autoRouteFilter, "Keep", StringComparison.OrdinalIgnoreCase))
             {
                 var activeRetId = HoldingsService.GetActiveRetainerId();
                 var activeRetName = HoldingsService.GetActiveRetainerName();
@@ -396,19 +438,34 @@ public sealed unsafe class ItemContextMenuController : IDisposable
 
         if (materialTracker.HasRecipeForItem(baseItemId))
         {
-            items.Add(new MenuItem
-            {
-                Name = hasTrackedList ? "Add Recipe to List" : "Track Recipe",
-                OnClicked = _ => PrintIfNonEmpty(() => { materialTracker.AddRecipeToList(baseItemId, out var msg); return msg; }),
-            });
-
-            if (hasTrackedList)
+            if (materialTracker.IsTrackedRecipeResultItem(baseItemId))
             {
                 items.Add(new MenuItem
                 {
-                    Name = "Track Recipe Only",
-                    OnClicked = _ => PrintIfNonEmpty(() => { materialTracker.TrackRecipeForResultItem(baseItemId, out var msg); return msg; }),
+                    Name = "Untrack Recipe",
+                    OnClicked = _ =>
+                    {
+                        materialTracker.ClearAll();
+                        chatGui.Print("Cleared tracked recipe.");
+                    },
                 });
+            }
+            else
+            {
+                items.Add(new MenuItem
+                {
+                    Name = hasTrackedList ? "Add Recipe to List" : "Track Recipe",
+                    OnClicked = _ => PrintIfNonEmpty(() => { materialTracker.AddRecipeToList(baseItemId, out var msg); return msg; }),
+                });
+
+                if (hasTrackedList)
+                {
+                    items.Add(new MenuItem
+                    {
+                        Name = "Track Recipe Only",
+                        OnClicked = _ => PrintIfNonEmpty(() => { materialTracker.TrackRecipeForResultItem(baseItemId, out var msg); return msg; }),
+                    });
+                }
             }
         }
 

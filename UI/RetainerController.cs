@@ -90,11 +90,11 @@ public sealed unsafe class RetainerController : IDisposable
 
             footerBounds = ResolveFooterBounds(addon);
             var available = footerBounds.RightLimit - footerBounds.LeftX;
-            var pos = available >= 112f
+            var pos = available >= 96f
                 ? new Vector2(footerBounds.LeftX, footerBounds.Y)
                 : new Vector2(12f, 30f);
-            var size = available >= 112f
-                ? new Vector2(MathF.Floor(Math.Clamp(available, 112f, 138f)), footerBounds.Height)
+            var size = available >= 96f
+                ? new Vector2(MathF.Floor(Math.Clamp(available, 96f, 138f)), footerBounds.Height)
                 : new Vector2(120f, 24f);
 
             magicSortButton = new TextButtonNode
@@ -103,7 +103,12 @@ public sealed unsafe class RetainerController : IDisposable
                 Size = size,
                 String = "Magic Sort",
                 IsVisible = false,
-                OnClick = magicSort.ExecuteRetainerSort,
+                OnClick = () =>
+                {
+                    highlightController.SetHoveredRetainerSortAddon(addonName, false);
+                    routeOverlay.SetHoveredInventorySortAddon(addonName, false);
+                    magicSort.ExecuteRetainerSort();
+                },
             };
             magicSortButton.AddEvent(AtkEventType.MouseOver, () =>
             {
@@ -195,7 +200,7 @@ public sealed unsafe class RetainerController : IDisposable
                 }
             }
 
-            return new FooterBounds(leftX, Math.Max(leftX + 80f, rightLimit), footerY, buttonH);
+            return new FooterBounds(leftX, rightLimit, footerY, buttonH);
         }
 
         private void SyncState(AtkUnitBase* addon)
@@ -208,10 +213,7 @@ public sealed unsafe class RetainerController : IDisposable
             if (magicSortButton == null)
             {
                 OnSetup(addon);
-                if (magicSortButton == null)
-                {
-                    return;
-                }
+                return;
             }
 
             var sortState = magicSort.GetRetainerSortButtonState();
@@ -236,6 +238,11 @@ public sealed unsafe class RetainerController : IDisposable
             {
                 lastSortEnabled = sortState.IsEnabled;
                 magicSortButton.IsEnabled = sortState.IsEnabled;
+                if (!sortState.IsEnabled)
+                {
+                    highlightController.SetHoveredRetainerSortAddon(addonName, false);
+                    routeOverlay.SetHoveredInventorySortAddon(addonName, false);
+                }
             }
 
             if (lastSortLabel != sortState.Label)

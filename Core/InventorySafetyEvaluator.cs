@@ -8,6 +8,7 @@ using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using Lumina.Excel.Sheets;
 using MagicInventory.Services;
 using MagicInventory.Services.MagicSort;
+using MagicInventory.Services.Triage;
 
 namespace MagicInventory.Core;
 
@@ -219,7 +220,8 @@ public sealed unsafe class InventorySafetyEvaluator
         int stackSize,
         out InventoryType dstContainer,
         out int dstSlot,
-        bool routeCrystalsToCrystalBag = false)
+        bool routeCrystalsToCrystalBag = false,
+        bool allowPartialMerge = true)
     {
         var baseId = ItemIdentity.NormalizeBaseItemId(exactRawItemId);
         if (routeCrystalsToCrystalBag && ItemIdentity.IsCrystalItemId(baseId))
@@ -229,7 +231,7 @@ public sealed unsafe class InventorySafetyEvaluator
             return true;
         }
 
-        var canStack = stackSize > 1 && (exactFlags & InventoryItem.ItemFlags.Collectable) == 0;
+        var canStack = allowPartialMerge && stackSize > 1 && (exactFlags & InventoryItem.ItemFlags.Collectable) == 0;
         if (canStack)
         {
             foreach (var type in containers)
@@ -537,12 +539,16 @@ public sealed unsafe class InventorySafetyEvaluator
         InventoryItem* liveItem,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
         HashSet<uint> gearsetIds,
-        Dictionary<uint, int> unlockedJobTopIlvl)
+        Dictionary<uint, int> unlockedJobTopIlvl,
+        bool isRetainerHqOnly = false)
     {
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
+
+        var hasManualRouteOverride = configuration.ManualRouteOverrides.TryGetValue(entry.ItemId, out var manualSpec)
+            && string.Equals(manualSpec, entry.Route, StringComparison.OrdinalIgnoreCase);
 
         if (liveItem == null)
         {
@@ -551,21 +557,51 @@ public sealed unsafe class InventorySafetyEvaluator
                 return null;
             }
 
-            if (string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase) && !ItemIdentity.IsMarketable(itemRow))
+            // Retainer snapshots do not track live spiritbond -> never trigger phantom Bell visits for Materia
+            if (string.Equals(entry.Route, "Materia", StringComparison.OrdinalIgnoreCase))
             {
                 return null;
+            }
+
+            if (!hasManualRouteOverride
+                && entry.Route is "Market" or "Vendor" or "GrandCompany"
+                && ItemIdentity.IsHousingItem(itemRow))
+            {
+                return null;
+            }
+
+            if (string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!ItemIdentity.IsMarketable(itemRow))
+                {
+                    return null;
+                }
+
+                var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.PriceLow);
+                var expectedPrice = isRetainerHqOnly ? entry.TargetPriceHq : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
+                if (expectedPrice < breakeven)
+                {
+                    return null;
+                }
             }
 
             if (string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase)
-                && (itemRow.PriceLow == 0 || itemRow.IsUnique || IsLv1GlamourOrStarterGear(itemRow)))
+                && (itemRow.PriceLow == 0
+                    || itemRow.IsUnique
+                    || (!hasManualRouteOverride && isRetainerHqOnly)
+                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow))))
             {
                 return null;
             }
 
-            if (string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase)
-                && IsLv1GlamourOrStarterGear(itemRow))
+            if (string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
             {
-                return null;
+                if (isRetainerHqOnly
+                    || (!hasManualRouteOverride && !itemRow.IsUntradable)
+                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow)))
+                {
+                    return null;
+                }
             }
 
             if (string.Equals(entry.Route, "Use", StringComparison.OrdinalIgnoreCase) && itemRow.ItemAction.RowId == 0)
@@ -580,7 +616,15 @@ public sealed unsafe class InventorySafetyEvaluator
         {
             if (IsSafeToDisposeOrList(liveItem, itemRow, "Market", manifestEntries, gearsetIds, unlockedJobTopIlvl))
             {
-                return "Market";
+                var isHq = ItemIdentity.IsHighQuality(liveItem);
+                var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
+                var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.PriceLow);
+                if (unitPrice >= breakeven && unitPrice <= 999_999_999L)
+                {
+                    return "Market";
+                }
+
+                return null;
             }
 
             if (itemRow.EquipSlotCategory.RowId > 0
@@ -606,6 +650,13 @@ public sealed unsafe class InventorySafetyEvaluator
             if (liveItem->GetMateriaCount() > 0
                 || liveItem->Materia[0] != 0
                 || IsMateriaExtractable(itemRow, liveItem))
+            {
+                return null;
+            }
+
+            // Storing in the Armoire permanently strips dyes & glamour projections — protect unless explicitly overridden
+            if (!hasManualRouteOverride
+                && (liveItem->GlamourId != 0 || liveItem->GetStain(0) != 0 || liveItem->GetStain(1) != 0))
             {
                 return null;
             }
@@ -711,9 +762,9 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        // Protect HQ crafted equipment from NPC vendor disposal (matching GC HQ protection)
+        // Protect ALL HQ items (materials AND equipment) from automatic NPC vendor disposal unless explicitly overridden
         var isHq = ItemIdentity.IsHighQuality(slot);
-        if (!hasManualDisposalOverride && targetRoute == "Vendor" && itemRow.EquipSlotCategory.RowId > 0 && isHq)
+        if (!hasManualDisposalOverride && targetRoute == "Vendor" && isHq)
         {
             return false;
         }
@@ -763,8 +814,9 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
 
                 // Protect near-future leveling gear (up to +4 levels ahead) and current upgrades/BiS (within 5 iLvl)
-                if ((itemRow.LevelEquip > jobLevel && itemRow.LevelEquip <= jobLevel + 4)
-                    || (itemRow.LevelEquip <= jobLevel && topIlvl > 0 && (int)itemRow.LevelItem.RowId >= topIlvl - 5))
+                if (!hasManualDisposalOverride
+                    && ((itemRow.LevelEquip > jobLevel && itemRow.LevelEquip <= jobLevel + 4)
+                        || (itemRow.LevelEquip <= jobLevel && topIlvl > 0 && (int)itemRow.LevelItem.RowId >= topIlvl - 5)))
                 {
                     return false;
                 }
@@ -872,56 +924,6 @@ public sealed unsafe class InventorySafetyEvaluator
             40 => category.SGE,
             41 => category.VPR,
             42 => category.PCT,
-            _ => false,
-        };
-    }
-
-    public static bool CanJobUseCategory(ClassJobCategory category, string abbr)
-    {
-        return abbr switch
-        {
-            "GLA" => category.GLA,
-            "PGL" => category.PGL,
-            "MRD" => category.MRD,
-            "LNC" => category.LNC,
-            "ARC" => category.ARC,
-            "CNJ" => category.CNJ,
-            "THM" => category.THM,
-            "CRP" => category.CRP,
-            "BSM" => category.BSM,
-            "ARM" => category.ARM,
-            "GSM" => category.GSM,
-            "LTW" => category.LTW,
-            "WVR" => category.WVR,
-            "ALC" => category.ALC,
-            "CUL" => category.CUL,
-            "MIN" => category.MIN,
-            "BTN" => category.BTN,
-            "FSH" => category.FSH,
-            "PLD" => category.PLD,
-            "MNK" => category.MNK,
-            "WAR" => category.WAR,
-            "DRG" => category.DRG,
-            "BRD" => category.BRD,
-            "WHM" => category.WHM,
-            "BLM" => category.BLM,
-            "ACN" => category.ACN,
-            "SMN" => category.SMN,
-            "SCH" => category.SCH,
-            "ROG" => category.ROG,
-            "NIN" => category.NIN,
-            "MCH" => category.MCH,
-            "DRK" => category.DRK,
-            "AST" => category.AST,
-            "SAM" => category.SAM,
-            "RDM" => category.RDM,
-            "BLU" => category.BLU,
-            "GNB" => category.GNB,
-            "DNC" => category.DNC,
-            "RPR" => category.RPR,
-            "SGE" => category.SGE,
-            "VPR" => category.VPR,
-            "PCT" => category.PCT,
             _ => false,
         };
     }

@@ -33,11 +33,13 @@ public sealed class Plugin : IDalamudPlugin
     private readonly ActiveListingAuditor activeListingAuditor;
     private readonly RetainerSellPriceController retainerSellPriceController;
     private readonly StaleListingsOverlay staleListingsOverlay;
+    private readonly object nativeUiGate = new();
     private RecipeNoteController? recipeNoteController;
     private RetainerController? retainerController;
     private MarketBoardController? marketBoardController;
     private MagicSortControllers? magicSortControllers;
     private MaterialTrackerOverlay? trackerOverlay;
+    private bool kamiInitialized;
     private volatile bool isDisposed;
 
     public Configuration Configuration { get; }
@@ -79,7 +81,9 @@ public sealed class Plugin : IDalamudPlugin
             Configuration,
             Holdings,
             dataManager,
-            gameGui);
+            gameGui,
+            condition,
+            chatGui);
         Universalis = new UniversalisClient(pluginInterface, log);
         Safety = new InventorySafetyEvaluator(dataManager, Configuration, MaterialTracker.IsItemTracked);
         TriageEngine = new ItemTriageEngine(
@@ -102,7 +106,7 @@ public sealed class Plugin : IDalamudPlugin
             Safety,
             TriageEngine,
             MaterialTracker.GetMissingTrackedForRetainerWithdraw);
-        worldHopPromptWindow = new WorldHopPromptWindow(commandManager, chatGui);
+        worldHopPromptWindow = new WorldHopPromptWindow(commandManager, chatGui, gameGui);
         MarketBoardBuy = new MarketBoardBuyPlanner(
             pluginInterface,
             framework,
@@ -117,6 +121,7 @@ public sealed class Plugin : IDalamudPlugin
             MaterialTracker,
             MagicSort,
             Universalis,
+            Holdings,
             worldHopPromptWindow.ShowOffer);
         BellSweep = new BellSweepService(
             framework,
@@ -128,6 +133,7 @@ public sealed class Plugin : IDalamudPlugin
             chatGui,
             TransactionQueue,
             MagicSort);
+        MaterialTracker.TrackerChanged += OnTrackerChanged;
         MagicActions = new MagicActionCoordinator(
             framework,
             clientState,
@@ -171,7 +177,8 @@ public sealed class Plugin : IDalamudPlugin
             Configuration,
             Holdings,
             Universalis,
-            TriageEngine);
+            TriageEngine,
+            TransactionQueue);
         staleListingsOverlay = new StaleListingsOverlay(gameGui, Configuration, activeListingAuditor);
 
         settingsWindow = new SettingsWindow(
@@ -181,7 +188,9 @@ public sealed class Plugin : IDalamudPlugin
             Holdings,
             Universalis,
             TriageEngine,
-            MagicSort);
+            MagicSort,
+            MaterialTracker,
+            ResetTrackerPosition);
         windowSystem.AddWindow(settingsWindow);
         windowSystem.AddWindow(worldHopPromptWindow);
 
@@ -191,62 +200,111 @@ public sealed class Plugin : IDalamudPlugin
 
         this.commandManager.AddHandler(MagicCommandName, new CommandInfo(OnMagicCommand)
         {
-            HelpMessage = "Magic Inventory: /magic (settings) | sort | sell | buy | track <recipe> [qty] | use | stop | scan",
+            HelpMessage = "Magic Inventory: /magic (settings) | sort | sell | buy | track <recipe> [qty] | use | stop | scan | status",
         });
         this.commandManager.AddHandler(MagicShortCommandName, new CommandInfo(OnMagicCommand)
         {
-            HelpMessage = "Shortcut for /magic: /m | sort | sell | buy | track <recipe> [qty] | use | stop | scan",
+            HelpMessage = "Shortcut for /magic: /m | sort | sell | buy | track <recipe> [qty] | use | stop | scan | status",
         });
 
-        _ = InitializeNativeUiAsync(pluginInterface, framework, clientState, condition);
+        _ = InitializeNativeUiAsync(pluginInterface, framework, clientState, condition, gameGui);
     }
 
     private async Task InitializeNativeUiAsync(
         IDalamudPluginInterface pluginInterface,
         IFramework framework,
         IClientState clientState,
-        ICondition condition)
+        ICondition condition,
+        IGameGui gameGui)
     {
         try
         {
-            await KamiToolKitLibrary.InitializeAsync(pluginInterface, "Magic Inventory").ConfigureAwait(false);
             if (isDisposed)
             {
                 return;
             }
 
-            await framework.RunOnFrameworkThread(() =>
+            await KamiToolKitLibrary.InitializeAsync(pluginInterface, "Magic Inventory").ConfigureAwait(false);
+
+            var disposeKamiImmediately = false;
+            lock (nativeUiGate)
             {
                 if (isDisposed)
                 {
-                    return;
+                    disposeKamiImmediately = true;
+                }
+                else
+                {
+                    kamiInitialized = true;
+                }
+            }
+
+            if (disposeKamiImmediately)
+            {
+                try
+                {
+                    await framework.RunOnFrameworkThread(KamiToolKitLibrary.Dispose).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    log.Warning(ex, "Cleanup warning during deferred KamiToolKitLibrary disposal.");
                 }
 
-                recipeNoteController = new RecipeNoteController(MaterialTracker);
-                recipeNoteController.Enable();
+                return;
+            }
 
-                retainerController = new RetainerController(MagicSort, inventoryHighlightController, inventoryRouteOverlay);
-                retainerController.Enable();
+            await framework.RunOnFrameworkThread(() =>
+            {
+                lock (nativeUiGate)
+                {
+                    if (isDisposed)
+                    {
+                        return;
+                    }
 
-                marketBoardController = new MarketBoardController(MarketBoardBuy);
-                marketBoardController.Enable();
+                    recipeNoteController = new RecipeNoteController(gameGui, MaterialTracker);
+                    recipeNoteController.Enable();
 
-                magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryHighlightController, inventoryRouteOverlay);
-                magicSortControllers.Enable();
+                    retainerController = new RetainerController(MagicSort, inventoryHighlightController, inventoryRouteOverlay);
+                    retainerController.Enable();
 
-                trackerOverlay = new MaterialTrackerOverlay(
-                    MaterialTracker,
-                    Configuration,
-                    pluginInterface,
-                    clientState,
-                    condition,
-                    chatGui);
+                    marketBoardController = new MarketBoardController(MarketBoardBuy);
+                    marketBoardController.Enable();
+
+                    magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryHighlightController, inventoryRouteOverlay);
+                    magicSortControllers.Enable();
+
+                    trackerOverlay = new MaterialTrackerOverlay(
+                        MaterialTracker,
+                        Configuration,
+                        pluginInterface,
+                        clientState,
+                        condition,
+                        chatGui);
+                }
             }).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             log.Error(ex, "Failed to initialize Magic Inventory native UI controllers.");
         }
+    }
+
+    private void OnTrackerChanged()
+    {
+        MagicSort.InvalidateButtonCache();
+        BellSweep.InvalidateButtonCaches();
+    }
+
+    private void ResetTrackerPosition()
+    {
+        MaterialTrackerOverlay? overlay;
+        lock (nativeUiGate)
+        {
+            overlay = trackerOverlay;
+        }
+
+        overlay?.ResetPosition();
     }
 
     private void DrawUi()
@@ -324,9 +382,17 @@ public sealed class Plugin : IDalamudPlugin
             }
 
             case "stop":
-                MaterialTracker.StopPendingCraft();
+            {
+                var stoppedCraft = MaterialTracker.StopPendingCraft();
+                var hadAction = MagicActions.IsAnythingActive;
                 MagicActions.Execute(MagicActionIntent.Stop);
+                if (stoppedCraft && !hadAction)
+                {
+                    chatGui.Print("Stopped pending Quick Synthesis.");
+                }
+
                 break;
+            }
 
             default:
                 chatGui.Print("Usage: /m [sort | sell | buy | track <recipe> [qty] | use | stop | scan | status]");
@@ -336,7 +402,31 @@ public sealed class Plugin : IDalamudPlugin
 
     public void Dispose()
     {
-        isDisposed = true;
+        MaterialTrackerOverlay? localTracker;
+        MagicSortControllers? localMagicSort;
+        MarketBoardController? localMarketBoard;
+        RetainerController? localRetainer;
+        RecipeNoteController? localRecipeNote;
+        bool shouldDisposeKami;
+
+        lock (nativeUiGate)
+        {
+            isDisposed = true;
+            localTracker = trackerOverlay;
+            trackerOverlay = null;
+            localMagicSort = magicSortControllers;
+            magicSortControllers = null;
+            localMarketBoard = marketBoardController;
+            marketBoardController = null;
+            localRetainer = retainerController;
+            retainerController = null;
+            localRecipeNote = recipeNoteController;
+            recipeNoteController = null;
+            shouldDisposeKami = kamiInitialized;
+            kamiInitialized = false;
+        }
+
+        MaterialTracker.TrackerChanged -= OnTrackerChanged;
         pluginInterface.UiBuilder.Draw -= DrawUi;
         pluginInterface.UiBuilder.OpenConfigUi -= ToggleSettingsWindow;
         pluginInterface.UiBuilder.OpenMainUi -= ToggleSettingsWindow;
@@ -345,29 +435,14 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(MagicShortCommandName);
         itemContextMenuController.Dispose();
 
-        // Dispose native UI controllers BEFORE highlight/overlay/services so their DetachButton()
-        // hover-clear callbacks never touch already-disposed services or re-tint cleared nodes.
-        try
-        {
-            trackerOverlay?.Dispose();
-            trackerOverlay = null;
-
-            magicSortControllers?.Dispose();
-            magicSortControllers = null;
-
-            marketBoardController?.Dispose();
-            marketBoardController = null;
-
-            retainerController?.Dispose();
-            retainerController = null;
-
-            recipeNoteController?.Dispose();
-            recipeNoteController = null;
-        }
-        catch (Exception ex)
-        {
-            log.Warning(ex, "Cleanup warning during UI controller disposal.");
-        }
+        // Dispose each native UI controller independently BEFORE highlight/overlay/services so
+        // one failure cannot leak subsequent controllers and DetachButton hover-clear callbacks
+        // never touch already-disposed services.
+        DisposeQuietly(localTracker, nameof(MaterialTrackerOverlay));
+        DisposeQuietly(localMagicSort, nameof(MagicSortControllers));
+        DisposeQuietly(localMarketBoard, nameof(MarketBoardController));
+        DisposeQuietly(localRetainer, nameof(RetainerController));
+        DisposeQuietly(localRecipeNote, nameof(RecipeNoteController));
 
         inventoryRouteOverlay.Dispose();
         inventoryHighlightController.Dispose();
@@ -380,6 +455,33 @@ public sealed class Plugin : IDalamudPlugin
         Universalis.Dispose();
         TransactionQueue.Dispose();
 
-        KamiToolKitLibrary.Dispose();
+        if (shouldDisposeKami)
+        {
+            try
+            {
+                KamiToolKitLibrary.Dispose();
+            }
+            catch (Exception ex)
+            {
+                log.Warning(ex, "Cleanup warning disposing KamiToolKitLibrary.");
+            }
+        }
+    }
+
+    private void DisposeQuietly(IDisposable? disposable, string name)
+    {
+        if (disposable == null)
+        {
+            return;
+        }
+
+        try
+        {
+            disposable.Dispose();
+        }
+        catch (Exception ex)
+        {
+            log.Warning(ex, "Cleanup warning disposing {ControllerName}.", name);
+        }
     }
 }

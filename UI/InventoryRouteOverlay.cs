@@ -28,7 +28,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
     private string? hoveredInventoryAddon;
     private DateTime lastCacheUtc = DateTime.MinValue;
     private readonly Dictionary<(string AddonName, uint NodeId), SlotBadge> cachedBadges = new();
-    private readonly Dictionary<(string Label, int BucketWidth), string> fittedLabelCache = new();
+    private readonly Dictionary<(string Label, int BucketWidth, int FontSizeBucket), string> fittedLabelCache = new();
     private readonly List<InventoryGridLayout.VisualGridSlot> visualSlotScratch = new(320);
 
     private bool glamourListHovered;
@@ -100,10 +100,14 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             return;
         }
 
-        var dl = ImGui.GetForegroundDrawList();
+        // Draw on BackgroundDrawList (below ImGui overlays/settings) and skip slots occluded by native Tooltip/ItemDetail
+        var dl = ImGui.GetBackgroundDrawList();
         var vpPos = ImGui.GetMainViewport().Pos;
         var font = ImGui.GetFont();
         var fontSize = MathF.Max(10f, ImGui.GetFontSize() * 0.72f);
+
+        var hasTooltipRect = TryGetAddonScreenRect("Tooltip", vpPos, out var tipMin, out var tipMax);
+        var hasItemDetailRect = TryGetAddonScreenRect("ItemDetail", vpPos, out var detailMin, out var detailMax);
 
         // Cache Addon* lookups per frame (at most ~10 grid addons instead of ~190 lookups/frame)
         var addonCache = new Dictionary<string, nint>(12, StringComparer.Ordinal);
@@ -130,6 +134,12 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             }
 
             if (!InventoryGridLayout.TryGetNodeScreenRect(addon, node, vpPos, out var min, out var max))
+            {
+                continue;
+            }
+
+            if ((hasTooltipRect && RectsOverlap(min, max, tipMin, tipMax))
+                || (hasItemDetailRect && RectsOverlap(min, max, detailMin, detailMax)))
             {
                 continue;
             }
@@ -178,6 +188,17 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         var gearsetIds = safety.BuildGearsetItemIds();
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var activeRetainerId = HoldingsService.GetActiveRetainerId();
+        var isRetainerSortHover = string.Equals(hoveredInventoryAddon, "InventoryRetainerLarge", StringComparison.Ordinal)
+            || string.Equals(hoveredInventoryAddon, "InventoryRetainer", StringComparison.Ordinal);
+
+        HashSet<(InventoryType Container, int Slot)>? retainerActiveSlots = null;
+        if (isRetainerSortHover && activeRetainerId != 0)
+        {
+            magicSort.GetActiveRetainerSortHighlightSlots(hoveredInventoryAddon, out var depSlots, out var wdSlots);
+            retainerActiveSlots = new HashSet<(InventoryType, int)>(depSlots.Count + wdSlots.Count);
+            retainerActiveSlots.UnionWith(depSlots);
+            retainerActiveSlots.UnionWith(wdSlots);
+        }
 
         visualSlotScratch.Clear();
         InventoryGridLayout.CollectVisiblePlayerBagSlots(gameGui, visualSlotScratch);
@@ -190,6 +211,11 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         var resolver = magicSort.SlotResolver;
         foreach (var vs in visualSlotScratch)
         {
+            // When hovering a Retainer's Magic Sort button, only badge items actually participating in THIS retainer's sort!
+            if (retainerActiveSlots != null && !retainerActiveSlots.Contains((vs.Container, vs.PhysicalSlot)))
+            {
+                continue;
+            }
             var slot = InventorySafetyEvaluator.GetSlot(manager, vs.Container, vs.PhysicalSlot);
             if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
             {
@@ -282,7 +308,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             return;
         }
 
-        var dl = ImGui.GetForegroundDrawList();
+        var dl = ImGui.GetBackgroundDrawList();
         var vpPos = ImGui.GetMainViewport().Pos;
         if (!InventoryGridLayout.TryGetNodeScreenRect(addon, listNode, vpPos, out var listMin, out var listMax))
         {
@@ -371,10 +397,37 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         return string.Empty;
     }
 
+    private bool TryGetAddonScreenRect(string addonName, Vector2 vpPos, out Vector2 min, out Vector2 max)
+    {
+        min = Vector2.Zero;
+        max = Vector2.Zero;
+        var addon = NativeUiHelpers.GetReadyAddon(gameGui, addonName);
+        if (addon == null || addon->RootNode == null || !addon->IsVisible)
+        {
+            return false;
+        }
+
+        var scale = addon->Scale > 0.01f ? addon->Scale : 1f;
+        var w = addon->RootNode->Width * scale;
+        var h = addon->RootNode->Height * scale;
+        if (w < 8f || h < 8f)
+        {
+            return false;
+        }
+
+        min = new Vector2(vpPos.X + addon->X, vpPos.Y + addon->Y);
+        max = new Vector2(min.X + w, min.Y + h);
+        return true;
+    }
+
+    private static bool RectsOverlap(Vector2 aMin, Vector2 aMax, Vector2 bMin, Vector2 bMax)
+        => aMin.X < bMax.X && aMax.X > bMin.X && aMin.Y < bMax.Y && aMax.Y > bMin.Y;
+
     private string GetFittedLabel(string label, float maxWidth, float fontSize)
     {
         var bucket = (int)MathF.Floor(maxWidth / 2f);
-        var key = (label, bucket);
+        var fontBucket = (int)MathF.Round(fontSize * 2f);
+        var key = (label, bucket, fontBucket);
         if (fittedLabelCache.TryGetValue(key, out var cached))
         {
             return cached;

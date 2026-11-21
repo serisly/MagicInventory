@@ -34,7 +34,8 @@ public sealed record TransactionStep(
     PacingProfile Pacing = PacingProfile.StandardSlot,
     string? SecondaryRequiredAddon = null,
     double TimeoutSeconds = 4.0,
-    int SkipOnFailureCount = 0);
+    int SkipOnFailureCount = 0,
+    bool AllowCastingDuringAck = false);
 
 public sealed unsafe class SafeTransactionQueue : IDisposable
 {
@@ -63,6 +64,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     private DateTime? secondaryGraceStartedUtc;
     private Vector3 originPosition;
     private int consecutiveFailures;
+    private bool anyStepAcked;
 
     private enum State
     {
@@ -100,9 +102,10 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     public bool IsExecuting => state is State.Dispatching or State.AwaitingAck
         || (state == State.PostAckJitter && pendingSteps.Count > 0);
 
-    public bool IsCoolingDown => state == State.PostAckJitter && pendingSteps.Count == 0;
+    public bool IsCoolingDown => (state == State.PostAckJitter && pendingSteps.Count == 0)
+        || DateTime.UtcNow < nextAllowedDispatchUtc;
 
-    public bool IsBusy => state != State.Idle || pendingSteps.Count > 0;
+    public bool IsBusy => state != State.Idle || pendingSteps.Count > 0 || DateTime.UtcNow < nextAllowedDispatchUtc;
 
     public bool IgnoreToggleClick => IsExecuting
         && (DateTime.UtcNow - batchStartedUtc).TotalMilliseconds < MinCancelDebounceMs;
@@ -157,6 +160,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         originPosition = player.Position;
         batchStartedUtc = now;
         consecutiveFailures = 0;
+        anyStepAcked = false;
         secondaryGraceStartedUtc = null;
         onBatchCompletedNaturally = onCompleted;
         pendingSteps.Clear();
@@ -182,14 +186,20 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         currentStep = null;
         onBatchCompletedNaturally = null;
         consecutiveFailures = 0;
+        anyStepAcked = false;
         secondaryGraceStartedUtc = null;
 
-        if (wasActive || now < nextAllowedDispatchUtc)
+        if (wasActive)
         {
             var postCancelFloor = now.AddMilliseconds(Random.Shared.Next(1100, 1650));
             nextAllowedDispatchUtc = postCancelFloor > nextAllowedDispatchUtc
                 ? postCancelFloor
                 : nextAllowedDispatchUtc;
+            nextActionUtc = nextAllowedDispatchUtc;
+            state = State.PostAckJitter;
+        }
+        else if (now < nextAllowedDispatchUtc)
+        {
             nextActionUtc = nextAllowedDispatchUtc;
             state = State.PostAckJitter;
         }
@@ -203,7 +213,14 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             LastOutcome = outcome;
             if (!string.IsNullOrWhiteSpace(echoReason))
             {
-                chatGui.Print($"Action cancelled: {echoReason}");
+                if (outcome == QueueBatchOutcome.Succeeded)
+                {
+                    chatGui.Print(echoReason);
+                }
+                else
+                {
+                    chatGui.Print($"Action cancelled: {echoReason}");
+                }
             }
 
             BatchEnded?.Invoke(outcome, echoReason);
@@ -250,26 +267,32 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
 
         if (state == State.PostAckJitter && pendingSteps.Count == 0)
         {
-            if (now >= nextActionUtc)
+            if (now >= nextActionUtc && now >= nextAllowedDispatchUtc)
             {
                 var callback = onBatchCompletedNaturally;
+                var hadAck = anyStepAcked;
                 onBatchCompletedNaturally = null;
                 currentStep = null;
+                anyStepAcked = false;
                 state = State.Idle;
                 if (LastOutcome == QueueBatchOutcome.None)
                 {
-                    LastOutcome = QueueBatchOutcome.Succeeded;
-                    BatchEnded?.Invoke(QueueBatchOutcome.Succeeded, null);
+                    LastOutcome = hadAck ? QueueBatchOutcome.Succeeded : QueueBatchOutcome.AbortedOnError;
+                    BatchEnded?.Invoke(LastOutcome, hadAck ? null : "Action did not complete.");
                 }
 
-                callback?.Invoke();
+                if (hadAck)
+                {
+                    callback?.Invoke();
+                }
             }
 
             return;
         }
 
         var player = objectTable.LocalPlayer;
-        if (!clientState.IsLoggedIn || player == null || !IsInteractionConditionSafe())
+        var allowCasting = state == State.AwaitingAck && currentStep?.AllowCastingDuringAck == true;
+        if (!clientState.IsLoggedIn || player == null || !IsInteractionConditionSafe(allowCasting))
         {
             Cancel("Interrupted.", QueueBatchOutcome.AbortedOnError);
             return;
@@ -388,6 +411,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
                 if (acked)
                 {
                     consecutiveFailures = 0;
+                    anyStepAcked = true;
                     AdvanceOrFinish(now, currentStep.Pacing);
                     return;
                 }
@@ -430,7 +454,8 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         }
 
         var jitterMs = SampleJitterMs(pacing);
-        nextActionUtc = now.AddMilliseconds(jitterMs);
+        var candidate = now.AddMilliseconds(jitterMs);
+        nextActionUtc = candidate > nextAllowedDispatchUtc ? candidate : nextAllowedDispatchUtc;
         state = State.PostAckJitter;
     }
 
@@ -452,12 +477,12 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         return (a + b) / 2;
     }
 
-    private bool IsInteractionConditionSafe()
+    private bool IsInteractionConditionSafe(bool allowCasting = false)
     {
         return !condition[ConditionFlag.BetweenAreas]
             && !condition[ConditionFlag.BetweenAreas51]
             && !condition[ConditionFlag.InCombat]
-            && !condition[ConditionFlag.Casting]
+            && (allowCasting || !condition[ConditionFlag.Casting])
             && !condition[ConditionFlag.BoundByDuty]
             && !condition[ConditionFlag.OccupiedInCutSceneEvent]
             && !condition[ConditionFlag.Unconscious];

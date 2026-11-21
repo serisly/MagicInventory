@@ -92,8 +92,14 @@ public sealed unsafe class MarketBoardController : IDisposable
 
     private void SyncState(AddonItemSearch* addon)
     {
-        if (searchMissingButton == null || addon == null)
+        if (addon == null)
         {
+            return;
+        }
+
+        if (searchMissingButton == null)
+        {
+            OnSetup(addon);
             return;
         }
 
@@ -162,7 +168,7 @@ public sealed unsafe class MarketBoardController : IDisposable
             return;
         }
 
-        var (pos, size) = NativeUiHelpers.ResolveBottomMarginPosition(&addon->AtkUnitBase, 152f, 28f, preferRightSide: false);
+        var (pos, size) = NativeUiHelpers.ResolveBottomMarginPosition(&addon->AtkUnitBase, 196f, 28f, preferRightSide: false);
         buyBestButton = new TextButtonNode
         {
             Position = pos,
@@ -178,8 +184,14 @@ public sealed unsafe class MarketBoardController : IDisposable
 
     private void SyncResultState(AddonItemSearchResult* addon)
     {
-        if (buyBestButton == null || addon == null)
+        if (addon == null)
         {
+            return;
+        }
+
+        if (buyBestButton == null)
+        {
+            OnResultSetup(addon);
             return;
         }
 

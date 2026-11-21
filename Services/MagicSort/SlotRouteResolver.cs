@@ -25,11 +25,16 @@ public sealed unsafe class SlotRouteResolver
 {
     private readonly IDataManager dataManager;
     private readonly InventorySafetyEvaluator safety;
+    private readonly Func<Dictionary<uint, int>>? getMissingTrackedQuantities;
 
-    public SlotRouteResolver(IDataManager dataManager, InventorySafetyEvaluator safety)
+    public SlotRouteResolver(
+        IDataManager dataManager,
+        InventorySafetyEvaluator safety,
+        Func<Dictionary<uint, int>>? getMissingTrackedQuantities = null)
     {
         this.dataManager = dataManager;
         this.safety = safety;
+        this.getMissingTrackedQuantities = getMissingTrackedQuantities;
     }
 
     public ResolvedSlotRoute? ResolveSlot(
@@ -51,7 +56,19 @@ public sealed unsafe class SlotRouteResolver
             or InventoryType.KeyItems
             or InventoryType.RetainerCrystals
             or InventoryType.RetainerGil
-            or InventoryType.RetainerMarket)
+            or InventoryType.RetainerMarket
+            or InventoryType.RetainerEquippedItems
+            or InventoryType.SaddleBag1
+            or InventoryType.SaddleBag2
+            or InventoryType.PremiumSaddleBag1
+            or InventoryType.PremiumSaddleBag2
+            or InventoryType.FreeCompanyPage1
+            or InventoryType.FreeCompanyPage2
+            or InventoryType.FreeCompanyPage3
+            or InventoryType.FreeCompanyPage4
+            or InventoryType.FreeCompanyPage5
+            or InventoryType.FreeCompanyGil
+            or InventoryType.FreeCompanyCrystals)
         {
             return null;
         }
@@ -73,14 +90,14 @@ public sealed unsafe class SlotRouteResolver
         var inRetainer = InventorySafetyEvaluator.IsRetainerContainer(container);
         var inArmoury = container.HasValue && InventorySafetyEvaluator.IsArmouryContainer(container.Value);
 
-        if (container is InventoryType.EquippedItems or InventoryType.RetainerEquippedItems)
+        if (container is InventoryType.EquippedItems)
         {
             if (InventorySafetyEvaluator.IsMateriaExtractable(row, liveItem))
             {
                 return new ResolvedSlotRoute("Materia", 0, string.Empty, null);
             }
 
-            return ResolveStayOrBagRoute(container == InventoryType.RetainerEquippedItems, baseId, null);
+            return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
         }
 
         // Locale-safe crystal/currency check (NEVER FilterGroup == 16!)
@@ -96,17 +113,36 @@ public sealed unsafe class SlotRouteResolver
 
         if (safety.IsItemTracked(baseId))
         {
-            // Tracked crafting materials sitting in a retainer are actively withdrawn to bags by Magic Sort!
-            return new ResolvedSlotRoute(
-                inRetainer ? "Tracked" : "Keep",
-                0,
-                string.Empty,
-                null,
-                IsTrackedInRetainer: inRetainer);
+            // Only tag retainer copies as "Withdraw (Tracked)" when the player actually still needs more!
+            var needsRetainerPull = false;
+            if (inRetainer)
+            {
+                if (getMissingTrackedQuantities != null)
+                {
+                    var missing = getMissingTrackedQuantities();
+                    needsRetainerPull = missing.TryGetValue(baseId, out var qty) && qty > 0;
+                }
+                else
+                {
+                    needsRetainerPull = true;
+                }
+            }
+
+            if (needsRetainerPull)
+            {
+                return new ResolvedSlotRoute("Tracked", 0, string.Empty, null, IsTrackedInRetainer: true);
+            }
+
+            return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 
         if (gearsetIds.Contains(baseId) || ItemIdentity.IsSoulCrystal(row) || row.Rarity >= 4)
         {
+            if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
+            {
+                return new ResolvedSlotRoute("Armoury", 0, string.Empty, null);
+            }
+
             return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 

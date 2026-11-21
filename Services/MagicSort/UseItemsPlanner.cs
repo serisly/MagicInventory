@@ -60,6 +60,7 @@ public sealed unsafe class UseItemsPlanner
         var gearsetIds = safety.BuildGearsetItemIds();
         var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var emptyBagSlots = manager->GetEmptySlotsInBag();
+        var seenUnlockableIds = new HashSet<uint>();
 
         foreach (var containerType in InventorySafetyEvaluator.PlayerBagContainers)
         {
@@ -108,14 +109,24 @@ public sealed unsafe class UseItemsPlanner
                     continue;
                 }
 
-                // Never try to use an item that is already unlocked/registered
+                // Never try to use an item that is already unlocked/registered, and deduplicate
+                // unowned unlockables within the same batch so duplicate minions aren't used twice.
                 var uiState = UIState.Instance();
                 if (uiState != null)
                 {
                     var exdRow = ExdModule.GetItemRowById(baseId);
-                    if (exdRow != null && uiState->IsItemActionUnlocked(exdRow) == 1)
+                    if (exdRow != null)
                     {
-                        continue;
+                        var unlockStatus = uiState->IsItemActionUnlocked(exdRow);
+                        if (unlockStatus == 1)
+                        {
+                            continue;
+                        }
+
+                        if (unlockStatus == 2 && !seenUnlockableIds.Add(baseId))
+                        {
+                            continue;
+                        }
                     }
                 }
 
@@ -155,7 +166,10 @@ public sealed unsafe class UseItemsPlanner
     public int CountPlannedUses(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
         => PlanUses(MaxUsesPerClick, manifestEntries).Count;
 
-    public bool Execute(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries, out string statusMessage)
+    public bool Execute(
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        out string statusMessage,
+        System.Action? onCompleted = null)
     {
         statusMessage = string.Empty;
         if (transactionQueue.IsBusy)
@@ -217,6 +231,16 @@ public sealed unsafe class UseItemsPlanner
                         return true;
                     }
 
+                    var uiState = UIState.Instance();
+                    if (uiState != null)
+                    {
+                        var exdRow = ExdModule.GetItemRowById(captured.BaseItemId);
+                        if (exdRow != null && uiState->IsItemActionUnlocked(exdRow) == 1)
+                        {
+                            return false;
+                        }
+                    }
+
                     if (captured.IsCoffer && mgr->GetEmptySlotsInBag() < 1)
                     {
                         transactionQueue.Cancel("Stopped: no free bag space to open coffer.", QueueBatchOutcome.AbortedOnError);
@@ -260,10 +284,11 @@ public sealed unsafe class UseItemsPlanner
                     return slot == null || slot->ItemId != captured.RawItemId || slot->Quantity < expectedQtyBefore;
                 },
                 Pacing: PacingProfile.StandardSlot,
-                TimeoutSeconds: 6.5));
+                TimeoutSeconds: 6.5,
+                AllowCastingDuringAck: true));
         }
 
-        if (!transactionQueue.TryEnqueueBatch(steps, out var reason))
+        if (!transactionQueue.TryEnqueueBatch(steps, out var reason, onCompleted))
         {
             statusMessage = reason;
             return false;

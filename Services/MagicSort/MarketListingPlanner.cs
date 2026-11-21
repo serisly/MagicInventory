@@ -8,6 +8,7 @@ using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using MagicInventory.Core;
+using MagicInventory.Services.Triage;
 
 namespace MagicInventory.Services.MagicSort;
 
@@ -17,17 +18,20 @@ public sealed unsafe class MarketListingPlanner
 
     private readonly IDataManager dataManager;
     private readonly IGameGui gameGui;
+    private readonly Configuration configuration;
     private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
 
     public MarketListingPlanner(
         IDataManager dataManager,
         IGameGui gameGui,
+        Configuration configuration,
         SafeTransactionQueue transactionQueue,
         InventorySafetyEvaluator safety)
     {
         this.dataManager = dataManager;
         this.gameGui = gameGui;
+        this.configuration = configuration;
         this.transactionQueue = transactionQueue;
         this.safety = safety;
     }
@@ -117,8 +121,19 @@ public sealed unsafe class MarketListingPlanner
                 // Fail-closed: HQ uses ONLY TargetPriceHq; NQ uses ONLY TargetPriceNq (never cross-list NQ at HQ price!)
                 var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
 
-                var minAllowed = Math.Max(2L, itemRow.Value.PriceLow + 1L);
+                var minAllowed = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.Value.PriceLow);
                 if (unitPrice < minAllowed || unitPrice > 999_999_999L)
+                {
+                    continue;
+                }
+
+                // Per-slot value floor: prevent listing tiny 1x 60g leftovers just because total owned across retainers was large
+                var isManualMarket = configuration.ManualRouteOverrides.TryGetValue(baseId, out var manualSpec)
+                    && string.Equals(manualSpec, "Market", StringComparison.OrdinalIgnoreCase);
+                var slotStackValue = unitPrice * Math.Max(1, (int)slot->Quantity);
+                if (!isManualMarket
+                    && unitPrice < configuration.MarketMinUnitPrice
+                    && slotStackValue < configuration.MarketMinStackValue)
                 {
                     continue;
                 }
@@ -176,6 +191,11 @@ public sealed unsafe class MarketListingPlanner
                 "RetainerSellList",
                 Dispatch: () =>
                 {
+                    if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"))
+                    {
+                        return false;
+                    }
+
                     if (!IsContainerWindowOpenForMarketSell(captured.Container))
                     {
                         return false;
@@ -214,7 +234,7 @@ public sealed unsafe class MarketListingPlanner
                         return false;
                     }
 
-                    var minAllowed = Math.Max(2L, itemRow.Value.PriceLow + 1L);
+                    var minAllowed = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.Value.PriceLow);
                     if (targetUnitPrice < minAllowed)
                     {
                         return false;
@@ -237,6 +257,9 @@ public sealed unsafe class MarketListingPlanner
                 SecondaryRequiredAddon: "RetainerSell",
                 SkipOnFailureCount: reviewOnly ? 1 : 2));
 
+            var expectedHq = captured.Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
+            var autoCompareInReview = reviewOnly && configuration.MarketAutoComparePricesInReview;
+
             steps.Add(new TransactionStep(
                 $"Set price for {captured.Name} ({captured.UnitPrice:N0}g)",
                 "RetainerSell",
@@ -248,7 +271,7 @@ public sealed unsafe class MarketListingPlanner
                         return false;
                     }
 
-                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name))
+                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name, expectedHq))
                     {
                         transactionQueue.Cancel("Item mismatch in market listing dialog.", QueueBatchOutcome.AbortedOnError);
                         return false;
@@ -259,6 +282,17 @@ public sealed unsafe class MarketListingPlanner
                     if (sellAddon->Quantity != null && preQty > 0)
                     {
                         sellAddon->Quantity->SetValue(preQty);
+                    }
+
+                    if (autoCompareInReview)
+                    {
+                        var compareBtn = sellAddon->ComparePrices != null
+                            ? sellAddon->ComparePrices
+                            : sellAddon->AtkUnitBase.GetComponentButtonById(4);
+                        if (compareBtn != null && compareBtn->IsEnabled)
+                        {
+                            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)sellAddon, compareBtn);
+                        }
                     }
 
                     return true;
@@ -274,7 +308,8 @@ public sealed unsafe class MarketListingPlanner
 
             if (reviewOnly)
             {
-                // Review mode: stop with RetainerSell open & price prefilled so the user inspects and clicks Confirm themselves.
+                // Review mode: stop with RetainerSell open, price prefilled (and Compare Prices triggered if enabled)
+                // so the user inspects live prices and clicks Confirm themselves.
                 continue;
             }
 
@@ -289,7 +324,7 @@ public sealed unsafe class MarketListingPlanner
                         return false;
                     }
 
-                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name))
+                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name, expectedHq))
                     {
                         transactionQueue.Cancel("Item mismatch in market listing dialog.", QueueBatchOutcome.AbortedOnError);
                         return false;
@@ -314,15 +349,26 @@ public sealed unsafe class MarketListingPlanner
                     }
 
                     var manager = InventoryManager.Instance();
+                    if (manager == null)
+                    {
+                        return false;
+                    }
+
                     var retainerMgr = RetainerManager.Instance();
                     var activeRetainer = retainerMgr != null && retainerMgr->IsReady ? retainerMgr->GetActiveRetainer() : null;
-                    if (manager != null && InventorySafetyEvaluator.GetLiveRetainerMarketCount(manager, activeRetainer) > preMarketCount)
+                    if (InventorySafetyEvaluator.GetLiveRetainerMarketCount(manager, activeRetainer) > preMarketCount)
                     {
                         return true;
                     }
 
-                    var slot = manager != null ? InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot) : null;
-                    return slot == null || slot->ItemId != captured.RawItemId || slot->Flags != captured.Flags || slot->Quantity < preQty;
+                    var container = manager->GetInventoryContainer(captured.Container);
+                    if (!InventorySafetyEvaluator.IsContainerReadable(container))
+                    {
+                        return false;
+                    }
+
+                    var slot = InventorySafetyEvaluator.GetSlot(container, captured.Slot);
+                    return slot != null && (slot->ItemId != captured.RawItemId || slot->Flags != captured.Flags || slot->Quantity < preQty);
                 },
                 PacingProfile.MarketListing,
                 SecondaryRequiredAddon: "RetainerSellList"));
@@ -367,7 +413,7 @@ public sealed unsafe class MarketListingPlanner
             : IsAnyPlayerInventoryAddonOpen();
     }
 
-    private static bool DoesRetainerSellMatchItem(AddonRetainerSell* sellAddon, string expectedName)
+    private static bool DoesRetainerSellMatchItem(AddonRetainerSell* sellAddon, string expectedName, bool expectedHq)
     {
         if (sellAddon == null || string.IsNullOrWhiteSpace(expectedName))
         {
@@ -382,12 +428,18 @@ public sealed unsafe class MarketListingPlanner
             return false;
         }
 
-        var displayed = NativeUiHelpers.NormalizeItemLabel(NativeUiHelpers.ReadTextNodeValue(nameNode));
-        if (string.IsNullOrEmpty(displayed))
+        var rawDisplayed = NativeUiHelpers.ReadTextNodeValue(nameNode);
+        if (string.IsNullOrWhiteSpace(rawDisplayed))
         {
             return false;
         }
 
+        if (rawDisplayed.Contains('\uE03C') != expectedHq)
+        {
+            return false;
+        }
+
+        var displayed = NativeUiHelpers.NormalizeItemLabel(rawDisplayed);
         var cleanExpected = NativeUiHelpers.NormalizeItemLabel(expectedName);
         return string.Equals(displayed, cleanExpected, StringComparison.OrdinalIgnoreCase);
     }

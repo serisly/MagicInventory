@@ -192,7 +192,6 @@ public sealed unsafe class VendorSellPlanner
         {
             var captured = plan;
             var preQty = 0;
-            uint preGil = 0;
             var yesNoConfirmed = false;
             var yesNoReadyAtUtc = DateTime.MinValue;
 
@@ -239,7 +238,6 @@ public sealed unsafe class VendorSellPlanner
                     }
 
                     preQty = slot->Quantity;
-                    preGil = manager->GetGil();
                     yesNoConfirmed = false;
                     yesNoReadyAtUtc = DateTime.MinValue;
 
@@ -308,7 +306,6 @@ public sealed unsafe class VendorSellPlanner
                     }
 
                     preQty = slot->Quantity;
-                    preGil = manager->GetGil();
                     yesNoConfirmed = false;
                     yesNoReadyAtUtc = DateTime.MinValue;
                     return ClickSellInOpenContextMenu();
@@ -359,12 +356,10 @@ public sealed unsafe class VendorSellPlanner
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(manager, captured.Container, captured.Slot);
-                    if (slot == null || slot->ItemId != captured.RawItemId || slot->Flags != captured.Flags || slot->Quantity < preQty)
-                    {
-                        return true;
-                    }
-
-                    return manager->GetGil() > preGil;
+                    return slot == null
+                        || slot->ItemId != captured.RawItemId
+                        || slot->Flags != captured.Flags
+                        || slot->Quantity < preQty;
                 },
                 PacingProfile.VendorOrTurnIn,
                 SecondaryRequiredAddon: "SelectYesno"));

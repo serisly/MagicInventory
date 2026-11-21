@@ -74,7 +74,8 @@ public sealed unsafe class StaleListingsOverlay
         var x = (rightX + panelW <= vp.Pos.X + vp.Size.X - 8f)
             ? rightX
             : Math.Max(vp.Pos.X + 8f, leftX);
-        var y = Math.Clamp(vp.Pos.Y + sellListAddon->Y, vp.Pos.Y + 8f, vp.Pos.Y + vp.Size.Y - 220f);
+        var maxPanelY = Math.Max(vp.Pos.Y + 8f, vp.Pos.Y + vp.Size.Y - 428f);
+        var y = Math.Clamp(vp.Pos.Y + sellListAddon->Y, vp.Pos.Y + 8f, maxPanelY);
 
         ImGui.SetNextWindowPos(new Vector2(x, y), ImGuiCond.Always);
         ImGui.SetNextWindowSize(new Vector2(panelW, 0f), ImGuiCond.Always);
@@ -96,7 +97,8 @@ public sealed unsafe class StaleListingsOverlay
         }
 
         var unsellable = findings.Where(f => f.Severity == StaleListingSeverity.UnrealisticRemove).ToList();
-        var busy = auditor.IsBusy;
+        var sellModalOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell");
+        var actionsBlocked = auditor.IsBusy || sellModalOpen;
 
         ImGui.TextColored(unsellable.Count > 0 ? ColorBad : ColorWarn, $"Stale / Unrealistic Listings ({findings.Count})");
         ImGui.SameLine(panelW - 32f);
@@ -105,12 +107,37 @@ public sealed unsafe class StaleListingsOverlay
             panelDismissedForRetainerId = activeRetainerId;
         }
 
+        if (sellModalOpen)
+        {
+            ImGui.TextColored(ColorMuted, "Close the active price window to remove or reprice listings.");
+        }
+
         if (unsellable.Count > 1)
         {
-            ImGui.BeginDisabled(busy);
+            ImGui.BeginDisabled(actionsBlocked);
             if (ImGui.SmallButton($"Remove All Unsellable ({unsellable.Count})"))
             {
                 auditor.QueueRemoveListings(unsellable);
+            }
+
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+            {
+                ImGui.BeginTooltip();
+                ImGui.TextUnformatted(sellModalOpen
+                    ? "Close RetainerSell before removing listings."
+                    : $"Remove {unsellable.Count} unrealistic listing(s):");
+                foreach (var u in unsellable.Take(12))
+                {
+                    var uHq = u.IsHq ? " HQ" : string.Empty;
+                    ImGui.TextUnformatted($"  - {u.Name}{uHq} ({u.Reason})");
+                }
+
+                if (unsellable.Count > 12)
+                {
+                    ImGui.TextUnformatted($"  ... and {unsellable.Count - 12} more");
+                }
+
+                ImGui.EndTooltip();
             }
 
             ImGui.EndDisabled();
@@ -118,61 +145,64 @@ public sealed unsafe class StaleListingsOverlay
 
         ImGui.Separator();
 
-        var maxShown = Math.Min(findings.Count, 8);
-        for (var i = 0; i < maxShown; i++)
+        var listHeight = Math.Min(310f, Math.Max(74f, findings.Count * 76f));
+        if (ImGui.BeginChild("##MagicInventoryStaleList", new Vector2(0f, listHeight), false))
         {
-            var item = findings[i];
-            ImGui.PushID(item.MarketSlot * 1000 + i);
-
-            var hqTag = item.IsHq ? " HQ" : string.Empty;
-            var qtyTag = item.Quantity > 1 ? $" x{item.Quantity}" : string.Empty;
-            ImGui.TextUnformatted($"{item.Name}{hqTag}{qtyTag}");
-
-            var sevColor = item.Severity == StaleListingSeverity.UnrealisticRemove ? ColorBad : ColorWarn;
-            ImGui.TextColored(sevColor, $"  {item.Reason}");
-
-            var mbStr = item.Viability.ServerCheapest > 0 ? $"{item.Viability.ServerCheapest:N0}g" : "none";
-            var lastStr = MarketViabilityEvaluator.FormatAgeShort(item.Viability.DaysSinceLastSale);
-            ImGui.TextColored(
-                ColorMuted,
-                $"  Listed: {item.ListedUnitPrice:N0}g | MB: {mbStr} | {item.Viability.EffectiveVelocity:0.00}/day ({lastStr})");
-
-            ImGui.BeginDisabled(busy);
-            if (ImGui.SmallButton("Remove"))
+            for (var i = 0; i < findings.Count; i++)
             {
-                auditor.QueueRemoveListings([item]);
-            }
+                var item = findings[i];
+                ImGui.PushID(item.MarketSlot * 1000 + i);
 
-            if (item.Severity == StaleListingSeverity.OverpricedReprice && item.Viability.SuggestedUndercutPrice >= 2)
-            {
-                ImGui.SameLine();
-                if (ImGui.SmallButton($"Reprice (~{item.Viability.SuggestedUndercutPrice:N0}g)"))
+                var hqTag = item.IsHq ? " HQ" : string.Empty;
+                var qtyTag = item.Quantity > 1 ? $" x{item.Quantity}" : string.Empty;
+                ImGui.TextUnformatted($"{item.Name}{hqTag}{qtyTag}");
+
+                var sevColor = item.Severity == StaleListingSeverity.UnrealisticRemove ? ColorBad : ColorWarn;
+                ImGui.TextColored(sevColor, $"  {item.Reason}");
+
+                var mbStr = item.Viability.ServerCheapest > 0 ? $"{item.Viability.ServerCheapest:N0}g" : "none";
+                var medStr = item.Viability.SoldMedian > 0 ? $"{item.Viability.SoldMedian:N0}g" : "n/a";
+                var lastStr = MarketViabilityEvaluator.FormatAgeShort(item.Viability.DaysSinceLastSale);
+                ImGui.TextColored(
+                    ColorMuted,
+                    $"  Listed: {item.ListedUnitPrice:N0}g | MB: {mbStr} | Med: {medStr}");
+                ImGui.TextColored(
+                    ColorMuted,
+                    $"  Freq: {item.Viability.EffectiveVelocity:0.00}/day | Last sold: {lastStr}");
+
+                ImGui.BeginDisabled(actionsBlocked);
+                if (ImGui.SmallButton("Remove"))
                 {
-                    auditor.QueueRepriceReview(item);
+                    auditor.QueueRemoveListings([item]);
                 }
+
+                if (item.Severity == StaleListingSeverity.OverpricedReprice && item.Viability.SuggestedUndercutPrice >= 2)
+                {
+                    ImGui.SameLine();
+                    if (ImGui.SmallButton($"Reprice (~{item.Viability.SuggestedUndercutPrice:N0}g)"))
+                    {
+                        auditor.QueueRepriceReview(item);
+                    }
+                }
+
+                ImGui.EndDisabled();
+
+                ImGui.SameLine();
+                if (ImGui.SmallButton("Keep"))
+                {
+                    auditor.DismissForSession(item);
+                }
+
+                if (i + 1 < findings.Count)
+                {
+                    ImGui.Separator();
+                }
+
+                ImGui.PopID();
             }
-
-            ImGui.EndDisabled();
-
-            ImGui.SameLine();
-            if (ImGui.SmallButton("Keep"))
-            {
-                auditor.DismissForSession(item);
-            }
-
-            if (i + 1 < maxShown)
-            {
-                ImGui.Separator();
-            }
-
-            ImGui.PopID();
         }
 
-        if (findings.Count > maxShown)
-        {
-            ImGui.TextColored(ColorMuted, $"... and {findings.Count - maxShown} more flagged listing(s).");
-        }
-
+        ImGui.EndChild();
         ImGui.End();
     }
 }

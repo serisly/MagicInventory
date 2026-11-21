@@ -12,7 +12,8 @@ public readonly record struct RetainerBellWorkSummary(
     int DepositCount,
     int WithdrawCount,
     int TrackedWithdrawCount,
-    HashSet<ulong> FunnelDestinationIds)
+    HashSet<ulong> FunnelDestinationIds,
+    bool IsFull = false)
 {
     public int TotalItemCount => DepositCount + WithdrawCount + TrackedWithdrawCount;
     public bool HasAnyWork => TotalItemCount > 0;
@@ -81,11 +82,20 @@ public sealed unsafe class RetainerBellEvaluator
         var emptyBagSlots = (int)manager->GetEmptySlotsInBag();
         var missingTracked = getMissingTrackedQuantities();
 
+        // Index retainers and initialize free-slot budgets BEFORE scanning deposits so primary deposits
+        // accurately decrement budgets and spill to overflow when a nearly-full retainer runs out of space.
+        var retainersById = new Dictionary<ulong, KnownRetainerInfo>(knownRetainers.Count);
+        var destFreeBudget = new Dictionary<ulong, int>(knownRetainers.Count);
+        foreach (var ret in knownRetainers)
+        {
+            retainersById[ret.RetainerId] = ret;
+            destFreeBudget[ret.RetainerId] = holdings.GetKnownRetainerFreeSlots(ret.RetainerId);
+        }
+
         // Collect player-bag base IDs once for IsUnique conflict checks + compute validated deposits per retainer
         var playerUniqueBaseIds = new HashSet<uint>();
         var depositCountsByRetainer = new Dictionary<ulong, int>();
-        var rawBagDepositsByDest = new Dictionary<ulong, int>();
-        var overflowBagSlots = new List<(uint BaseId, bool IsHq, int StackSize, ulong PrimaryRetainerId)>();
+        var overflowBagSlots = new List<(uint BaseId, bool IsHq, bool IsUnique, int StackSize, ulong PrimaryRetainerId)>();
 
         foreach (var bagType in InventorySafetyEvaluator.PlayerBagContainers)
         {
@@ -134,20 +144,29 @@ public sealed unsafe class RetainerBellEvaluator
                 }
 
                 var isHq = ItemIdentity.IsHighQuality(slot);
+                var isUnique = row.Value.IsUnique;
                 var stackSize = (int)Math.Max(1, row.Value.StackSize);
-                var mergesPartial = stackSize > 1 && holdings.HasPartialStackOnRetainer(destId, baseId, isHq);
+                var destHasUniqueConflict = isUnique
+                    && retainersById.TryGetValue(destId, out var destRet)
+                    && destRet.Quantities.GetValueOrDefault(baseId) > 0;
+                var mergesPartial = !destHasUniqueConflict
+                    && stackSize > 1
+                    && holdings.HasPartialStackOnRetainer(destId, baseId, isHq);
 
-                if (mergesPartial || !holdings.IsRetainerKnownFullFor(destId, baseId, isHq, stackSize))
+                if (!destHasUniqueConflict && mergesPartial)
                 {
                     depositCountsByRetainer[destId] = depositCountsByRetainer.GetValueOrDefault(destId) + 1;
-                    if (!mergesPartial)
-                    {
-                        rawBagDepositsByDest[destId] = rawBagDepositsByDest.GetValueOrDefault(destId) + 1;
-                    }
+                }
+                else if (!destHasUniqueConflict
+                    && !holdings.IsRetainerKnownFullFor(destId, baseId, isHq, stackSize)
+                    && destFreeBudget.GetValueOrDefault(destId) > 0)
+                {
+                    depositCountsByRetainer[destId] = depositCountsByRetainer.GetValueOrDefault(destId) + 1;
+                    destFreeBudget[destId]--;
                 }
                 else
                 {
-                    overflowBagSlots.Add((baseId, isHq, stackSize, destId));
+                    overflowBagSlots.Add((baseId, isHq, isUnique, stackSize, destId));
                 }
             }
         }
@@ -160,23 +179,26 @@ public sealed unsafe class RetainerBellEvaluator
 
         CollectBaseIds(manager, InventoryType.EquippedItems, playerUniqueBaseIds);
 
-        // Track remaining free slots per retainer (after accounting for validated bag deposits)
-        var destFreeBudget = new Dictionary<ulong, int>(knownRetainers.Count);
-        foreach (var ret in knownRetainers)
-        {
-            var free = holdings.GetKnownRetainerFreeSlots(ret.RetainerId);
-            var incoming = rawBagDepositsByDest.GetValueOrDefault(ret.RetainerId);
-            destFreeBudget[ret.RetainerId] = Math.Max(0, free - incoming);
-        }
-
-        // Attribute overflow bag items to the first retainer with remaining space (only if NOT already counted on primary)
-        foreach (var (baseId, isHq, stackSize, primaryId) in overflowBagSlots)
+        // Attribute overflow bag items to the first retainer with remaining space (and no IsUnique conflict)
+        foreach (var (baseId, isHq, isUnique, stackSize, primaryId) in overflowBagSlots)
         {
             foreach (var ret in knownRetainers)
             {
                 if (ret.RetainerId == primaryId)
                 {
                     continue;
+                }
+
+                if (isUnique && ret.Quantities.GetValueOrDefault(baseId) > 0)
+                {
+                    continue;
+                }
+
+                var mergesPartial = stackSize > 1 && holdings.HasPartialStackOnRetainer(ret.RetainerId, baseId, isHq);
+                if (mergesPartial)
+                {
+                    depositCountsByRetainer[ret.RetainerId] = depositCountsByRetainer.GetValueOrDefault(ret.RetainerId) + 1;
+                    break;
                 }
 
                 if (!holdings.IsRetainerKnownFullFor(ret.RetainerId, baseId, isHq, stackSize)
@@ -282,7 +304,15 @@ public sealed unsafe class RetainerBellEvaluator
                     }
 
                     // Validate via ResolveEffectiveSlotRoute (liveItem: null) so safety-blocked items never trigger wasted visits
-                    var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, null, manifestEntries, gearsetIds, unlockedTop);
+                    var isRetainerHqOnly = ret.HqQuantities != null && ret.HqQuantities.GetValueOrDefault(baseId) >= qty;
+                    var effectiveRoute = safety.ResolveEffectiveSlotRoute(
+                        entry,
+                        row.Value,
+                        null,
+                        manifestEntries,
+                        gearsetIds,
+                        unlockedTop,
+                        isRetainerHqOnly);
                     if (string.IsNullOrEmpty(effectiveRoute))
                     {
                         continue;
@@ -296,11 +326,18 @@ public sealed unsafe class RetainerBellEvaluator
                         continue;
                     }
 
-                    // 2. Misplaced retainer item belonging on a DIFFERENT retainer that has space / partial merge
+                    // 2. Misplaced retainer item belonging on a DIFFERENT retainer that has space / partial merge (and no IsUnique conflict)
                     if (string.Equals(effectiveRoute, "Retainer", StringComparison.OrdinalIgnoreCase)
                         && entry.TargetRetainerId != 0
                         && entry.TargetRetainerId != ret.RetainerId)
                     {
+                        if (row.Value.IsUnique
+                            && retainersById.TryGetValue(entry.TargetRetainerId, out var funnelDestRet)
+                            && funnelDestRet.Quantities.GetValueOrDefault(baseId) > 0)
+                        {
+                            continue;
+                        }
+
                         var stackSize = (int)Math.Max(1, row.Value.StackSize);
                         var mergesPartial = stackSize > 1
                             && (holdings.HasPartialStackOnRetainer(entry.TargetRetainerId, baseId, isHq: false)
@@ -330,7 +367,8 @@ public sealed unsafe class RetainerBellEvaluator
                 deposits,
                 withdrawCount,
                 trackedCount,
-                funnelDests);
+                funnelDests,
+                IsFull: holdings.GetKnownRetainerFreeSlots(ret.RetainerId) <= 0);
         }
 
         return result;

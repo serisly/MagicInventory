@@ -4,6 +4,7 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using MagicInventory.Core;
 using MagicInventory.Services.Triage;
@@ -151,24 +152,23 @@ public sealed unsafe class ActiveListingAuditor
             }
 
             MarketPriceSnapshot? mkt = null;
+            var hasFresh = false;
             if (!string.IsNullOrWhiteSpace(world))
             {
                 if (universalis.TryGetFreshPrice(world, baseId, out var fresh))
                 {
                     mkt = fresh;
+                    hasFresh = true;
                 }
                 else
                 {
                     missingIds.Add(baseId);
-                    if (universalis.TryGetAnyCachedPrice(world, baseId, out var cached)
-                        && cached.SchemaVersion >= UniversalisClient.CurrentSnapshotSchemaVersion)
-                    {
-                        mkt = cached;
-                    }
                 }
             }
 
-            if (mkt == null)
+            // Fail-closed: NEVER flag active listings for removal or repricing based on stale/72h-old cache;
+            // wait for fresh Universalis data queued above.
+            if (mkt == null || !hasFresh)
             {
                 continue;
             }
@@ -233,20 +233,25 @@ public sealed unsafe class ActiveListingAuditor
             return true;
         }
 
-        // 2. Market collapsed below vendor / floor / minimum stack value -> Remove
-        if (v.RealisticUnitPrice <= npcPriceLow
+        // 2. Market collapsed below 5%-tax vendor break-even / floor / minimum stack value -> Remove
+        var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(npcPriceLow);
+        if ((npcPriceLow > 0 && v.RealisticUnitPrice < breakeven)
             || v.RealisticUnitPrice < configuration.MarketMinFloorUnitPrice
             || (v.RealisticStackValue < configuration.VendorMaxStackValue && v.RealisticUnitPrice < configuration.MarketMinUnitPrice))
         {
             severity = StaleListingSeverity.UnrealisticRemove;
-            reason = npcPriceLow > 0 && v.RealisticUnitPrice <= npcPriceLow
-                ? $"MB (~{v.RealisticUnitPrice:N0}g) <= vendor ({npcPriceLow:N0}g)"
+            reason = npcPriceLow > 0 && v.RealisticUnitPrice < breakeven
+                ? $"MB (~{v.RealisticUnitPrice:N0}g) nets <= vendor ({npcPriceLow:N0}g)"
                 : $"Market dropped (~{v.RealisticUnitPrice:N0}g ea)";
             return true;
         }
 
         // 3. Viable item, but your listing is wildly overpriced / heavily undercut -> Reprice
-        if (listedUnitPrice > 0)
+        //    ONLY suggest reprice when SuggestedUndercutPrice is strictly lower by >= 500g (never raise price or loop!)
+        if (listedUnitPrice > 0
+            && v.SuggestedUndercutPrice >= 2
+            && v.SuggestedUndercutPrice < listedUnitPrice
+            && (listedUnitPrice - v.SuggestedUndercutPrice) >= 500)
         {
             var refPrice = v.ServerCheapest > 0 ? v.ServerCheapest : v.SoldMedian;
             var pctThreshold = 1.0 + Math.Clamp(configuration.StaleListingUndercutPct, 5, 200) / 100.0;
@@ -269,9 +274,82 @@ public sealed unsafe class ActiveListingAuditor
         return false;
     }
 
+    private static bool DoesRetainerSellMatchItem(AddonRetainerSell* sellAddon, string expectedName, bool expectedHq)
+    {
+        if (sellAddon == null || sellAddon->ItemName == null)
+        {
+            return false;
+        }
+
+        var rawText = NativeUiHelpers.ReadTextNodeValue(sellAddon->ItemName);
+        if (string.IsNullOrWhiteSpace(rawText))
+        {
+            return false;
+        }
+
+        var addonIsHq = rawText.Contains('\uE03C');
+        if (addonIsHq != expectedHq)
+        {
+            return false;
+        }
+
+        return string.Equals(
+            NativeUiHelpers.NormalizeItemLabel(rawText),
+            NativeUiHelpers.NormalizeItemLabel(expectedName),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasExactCapacityInContainers(
+        InventoryManager* mgr,
+        InventoryType[] containers,
+        uint rawItemId,
+        InventoryItem.ItemFlags flags,
+        int stackSize,
+        int neededQty)
+    {
+        if (mgr == null || neededQty <= 0)
+        {
+            return false;
+        }
+
+        foreach (var cType in containers)
+        {
+            var container = mgr->GetInventoryContainer(cType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                if (slot == null)
+                {
+                    continue;
+                }
+
+                if (slot->ItemId == 0)
+                {
+                    return true;
+                }
+
+                if (stackSize > 1
+                    && slot->ItemId == rawItemId
+                    && slot->Flags == flags
+                    && slot->Quantity > 0
+                    && slot->Quantity + neededQty <= stackSize)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// Opens RetainerSell for an active listing and prefills the suggested undercut price
-    /// so the user can inspect (or click Compare Prices) and Confirm manually. Never auto-confirms.
+    /// so the user can inspect (or view Compare Prices) and Confirm manually. Never auto-confirms.
     /// </summary>
     public void QueueRepriceReview(ActiveListingAuditItem item)
     {
@@ -281,11 +359,20 @@ public sealed unsafe class ActiveListingAuditor
             return;
         }
 
+        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"))
+        {
+            chatGui.Print("Close the open price window before repricing another listing.");
+            return;
+        }
+
         var targetPrice = (int)Math.Clamp(item.Viability.SuggestedUndercutPrice, 2L, 999_999_999L);
         var activeId = item.RetainerId;
         var slotIdx = item.MarketSlot;
         var rawId = item.RawItemId;
+        var expectedFlags = item.Flags;
+        var expectedHq = item.IsHq;
         var itemName = item.Name;
+        var autoCompare = configuration.MarketAutoComparePricesInReview;
 
         var steps = new List<TransactionStep>(2)
         {
@@ -294,14 +381,15 @@ public sealed unsafe class ActiveListingAuditor
                 "RetainerSellList",
                 Dispatch: () =>
                 {
-                    if (HoldingsService.GetActiveRetainerId() != activeId)
+                    if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell")
+                        || HoldingsService.GetActiveRetainerId() != activeId)
                     {
                         return false;
                     }
 
                     var mgr = InventoryManager.Instance();
                     var slot = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, slotIdx) : null;
-                    if (slot == null || slot->ItemId != rawId || slot->Quantity <= 0)
+                    if (slot == null || slot->ItemId != rawId || slot->Flags != expectedFlags || slot->Quantity <= 0)
                     {
                         return false;
                     }
@@ -315,7 +403,11 @@ public sealed unsafe class ActiveListingAuditor
                     agent->OpenRetainerSell(InventoryType.RetainerMarket, (ushort)slotIdx);
                     return true;
                 },
-                HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"),
+                HasServerAck: () =>
+                {
+                    var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
+                    return sellAddon != null && DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq);
+                },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSell",
                 SkipOnFailureCount: 1),
@@ -325,7 +417,9 @@ public sealed unsafe class ActiveListingAuditor
                 Dispatch: () =>
                 {
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
-                    if (sellAddon == null || sellAddon->AskingPrice == null)
+                    if (sellAddon == null
+                        || sellAddon->AskingPrice == null
+                        || !DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq))
                     {
                         return false;
                     }
@@ -335,9 +429,27 @@ public sealed unsafe class ActiveListingAuditor
                         sellAddon->AskingPrice->SetValue(targetPrice);
                     }
 
+                    if (autoCompare)
+                    {
+                        var compareBtn = sellAddon->ComparePrices != null
+                            ? sellAddon->ComparePrices
+                            : sellAddon->AtkUnitBase.GetComponentButtonById(4);
+                        if (compareBtn != null && compareBtn->IsEnabled)
+                        {
+                            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)sellAddon, compareBtn);
+                        }
+                    }
+
                     return true;
                 },
-                HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"),
+                HasServerAck: () =>
+                {
+                    var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
+                    return sellAddon != null
+                        && sellAddon->AskingPrice != null
+                        && DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq)
+                        && (targetPrice < 2 || sellAddon->AskingPrice->Value == targetPrice);
+                },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSellList"),
         };
@@ -350,7 +462,8 @@ public sealed unsafe class ActiveListingAuditor
 
     /// <summary>
     /// Removes user-selected stale/unrealistic listings from RetainerMarket back to Player Bags
-    /// (or Retainer Bags if player bags are full), 1-in-flight with server ACK and human jitter.
+    /// (or Retainer Bags if player bags are full) using native MoveFromRetainerMarketTo* APIs,
+    /// 1-in-flight with server ACK and human jitter.
     /// </summary>
     public void QueueRemoveListings(IReadOnlyList<ActiveListingAuditItem> items)
     {
@@ -360,21 +473,29 @@ public sealed unsafe class ActiveListingAuditor
             return;
         }
 
+        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"))
+        {
+            chatGui.Print("Close the open price window before removing listings.");
+            return;
+        }
+
         if (items.Count == 0)
         {
             return;
         }
 
-        var steps = new List<TransactionStep>(items.Count);
-        foreach (var item in items)
+        var count = Math.Min(items.Count, SafeTransactionQueue.MaxBatchSize);
+        var steps = new List<TransactionStep>(count);
+        for (var i = 0; i < count; i++)
         {
-            var captured = item;
+            var captured = items[i];
             steps.Add(new TransactionStep(
                 $"Remove stale listing: {captured.Name}",
                 "RetainerSellList",
                 Dispatch: () =>
                 {
-                    if (HoldingsService.GetActiveRetainerId() != captured.RetainerId)
+                    if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell")
+                        || HoldingsService.GetActiveRetainerId() != captured.RetainerId)
                     {
                         return false;
                     }
@@ -386,46 +507,43 @@ public sealed unsafe class ActiveListingAuditor
                     }
 
                     var src = InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, captured.MarketSlot);
-                    if (src == null || src->ItemId != captured.RawItemId || src->Quantity <= 0)
+                    if (src == null || src->ItemId != captured.RawItemId || src->Flags != captured.Flags || src->Quantity <= 0)
                     {
                         return false;
                     }
 
-                    var foundDest = InventorySafetyEvaluator.FindDestinationSlot(
-                        mgr,
-                        InventorySafetyEvaluator.PlayerBagContainers,
-                        captured.RawItemId,
-                        captured.Flags,
-                        captured.StackSize,
-                        out var dstContainer,
-                        out var dstSlot);
-
-                    if (!foundDest)
+                    var qty = (uint)src->Quantity;
+                    if (HasExactCapacityInContainers(mgr, InventorySafetyEvaluator.PlayerBagContainers, captured.RawItemId, captured.Flags, captured.StackSize, src->Quantity))
                     {
-                        foundDest = InventorySafetyEvaluator.FindDestinationSlot(
-                            mgr,
-                            InventorySafetyEvaluator.RetainerBagContainers,
-                            captured.RawItemId,
-                            captured.Flags,
-                            captured.StackSize,
-                            out dstContainer,
-                            out dstSlot);
+                        mgr->MoveFromRetainerMarketToPlayerInventory(InventoryType.RetainerMarket, (ushort)captured.MarketSlot, qty);
+                        return true;
                     }
 
-                    if (!foundDest)
+                    if (HasExactCapacityInContainers(mgr, InventorySafetyEvaluator.RetainerBagContainers, captured.RawItemId, captured.Flags, captured.StackSize, src->Quantity))
                     {
-                        transactionQueue.Cancel("No free bag or retainer slot to remove listing.", QueueBatchOutcome.AbortedOnError);
-                        return false;
+                        mgr->MoveFromRetainerMarketToRetainerInventory(InventoryType.RetainerMarket, (ushort)captured.MarketSlot, qty);
+                        return true;
                     }
 
-                    mgr->MoveItemSlot(InventoryType.RetainerMarket, (ushort)captured.MarketSlot, dstContainer, (ushort)dstSlot, true);
-                    return true;
+                    transactionQueue.Cancel("No free bag or retainer slot to remove listing.", QueueBatchOutcome.AbortedOnError);
+                    return false;
                 },
                 HasServerAck: () =>
                 {
                     var mgr = InventoryManager.Instance();
-                    var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, captured.MarketSlot) : null;
-                    if (src == null || src->ItemId == 0 || src->ItemId != captured.RawItemId || src->Quantity <= 0)
+                    if (mgr == null)
+                    {
+                        return false;
+                    }
+
+                    var container = mgr->GetInventoryContainer(InventoryType.RetainerMarket);
+                    if (!InventorySafetyEvaluator.IsContainerReadable(container))
+                    {
+                        return false;
+                    }
+
+                    var src = InventorySafetyEvaluator.GetSlot(container, captured.MarketSlot);
+                    if (src != null && (src->ItemId == 0 || src->ItemId != captured.RawItemId || src->Quantity <= 0))
                     {
                         Invalidate();
                         return true;

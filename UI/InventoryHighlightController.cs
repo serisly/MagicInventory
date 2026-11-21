@@ -57,6 +57,7 @@ public sealed unsafe class InventoryHighlightController : IDisposable
     private bool clearedOrphansOnStartup;
     private string? hoveredSellAddon;
     private string? hoveredRetainerSortAddon;
+    private readonly Dictionary<string, IReadOnlyList<string?>> contextSubmenusByTitle = new(StringComparer.OrdinalIgnoreCase);
     private string? activeContextSubmenuTitle;
     private IReadOnlyList<string?>? activeContextRouteFilters;
     private DateTime contextSubmenuArmedUtc = DateTime.MinValue;
@@ -76,13 +77,23 @@ public sealed unsafe class InventoryHighlightController : IDisposable
 
     public void SetActiveContextSubmenuRoutes(string? submenuTitle, IReadOnlyList<string?>? routeFiltersByIndex)
     {
-        activeContextSubmenuTitle = submenuTitle;
-        activeContextRouteFilters = routeFiltersByIndex;
-        contextSubmenuArmedUtc = DateTime.UtcNow;
         if (routeFiltersByIndex == null || routeFiltersByIndex.Count == 0)
         {
+            activeContextSubmenuTitle = null;
+            activeContextRouteFilters = null;
+            contextSubmenusByTitle.Clear();
             RefreshHighlights();
+            return;
         }
+
+        activeContextSubmenuTitle = submenuTitle;
+        activeContextRouteFilters = routeFiltersByIndex;
+        if (!string.IsNullOrWhiteSpace(submenuTitle))
+        {
+            contextSubmenusByTitle[submenuTitle] = routeFiltersByIndex;
+        }
+
+        contextSubmenuArmedUtc = DateTime.UtcNow;
     }
 
     public void SetHoveredSellAddon(string addonName, bool isHovered)
@@ -145,12 +156,18 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             return;
         }
 
-        if (hoveredSellAddon != null && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, hoveredSellAddon))
+        static string StripAddonSuffix(string addonKey)
+        {
+            var colon = addonKey.IndexOf(':');
+            return colon > 0 ? addonKey[..colon] : addonKey;
+        }
+
+        if (hoveredSellAddon != null && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, StripAddonSuffix(hoveredSellAddon)))
         {
             hoveredSellAddon = null;
         }
 
-        if (hoveredRetainerSortAddon != null && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, hoveredRetainerSortAddon))
+        if (hoveredRetainerSortAddon != null && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, StripAddonSuffix(hoveredRetainerSortAddon)))
         {
             hoveredRetainerSortAddon = null;
         }
@@ -314,29 +331,36 @@ public sealed unsafe class InventoryHighlightController : IDisposable
             {
                 activeContextRouteFilters = null;
                 activeContextSubmenuTitle = null;
+                contextSubmenusByTitle.Clear();
             }
 
             return false;
         }
 
-        // Verify the open AddonContextSub belongs to our expected submenu title (NodeId 2).
-        if (!string.IsNullOrEmpty(activeContextSubmenuTitle))
+        // Verify the open AddonContextSub belongs to our submenu (supporting parent/child submenu transitions via title map).
+        var titleNode = menu->GetNodeById(2);
+        var titleTextNode = titleNode != null ? titleNode->GetAsAtkTextNode() : null;
+        if (titleTextNode != null)
         {
-            var titleNode = menu->GetNodeById(2);
-            var titleTextNode = titleNode != null ? titleNode->GetAsAtkTextNode() : null;
-            if (titleTextNode != null)
+            var actualTitle = NativeUiHelpers.ReadTextNodeValue(titleTextNode);
+            if (!string.IsNullOrWhiteSpace(actualTitle)
+                && contextSubmenusByTitle.TryGetValue(actualTitle, out var mappedRoutes))
             {
-                var actualTitle = titleTextNode->NodeText.ToString().Trim();
-                if (!string.Equals(actualTitle, activeContextSubmenuTitle, StringComparison.OrdinalIgnoreCase))
+                routes = mappedRoutes;
+                activeContextRouteFilters = mappedRoutes;
+                activeContextSubmenuTitle = actualTitle;
+            }
+            else if (!string.IsNullOrEmpty(activeContextSubmenuTitle)
+                && !string.Equals(actualTitle, activeContextSubmenuTitle, StringComparison.OrdinalIgnoreCase))
+            {
+                if (elapsedMs > 450.0)
                 {
-                    if (elapsedMs > 450.0)
-                    {
-                        activeContextRouteFilters = null;
-                        activeContextSubmenuTitle = null;
-                    }
-
-                    return false;
+                    activeContextRouteFilters = null;
+                    activeContextSubmenuTitle = null;
+                    contextSubmenusByTitle.Clear();
                 }
+
+                return false;
             }
         }
 

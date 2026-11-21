@@ -86,10 +86,10 @@ public sealed unsafe class MagicSortService : IDisposable
 
         this.triageEngine.TriageUpdated += InvalidateButtonCache;
 
-        slotResolver = new SlotRouteResolver(dataManager, safety);
+        slotResolver = new SlotRouteResolver(dataManager, safety, getMissingTrackedQuantities);
         bellEvaluator = new RetainerBellEvaluator(dataManager, holdings, safety, slotResolver, getMissingTrackedQuantities);
         retainerPlanner = new RetainerSortPlanner(dataManager, gameGui, holdings, safety, getMissingTrackedQuantities, InvalidateButtonCache);
-        marketPlanner = new MarketListingPlanner(dataManager, gameGui, transactionQueue, safety);
+        marketPlanner = new MarketListingPlanner(dataManager, gameGui, configuration, transactionQueue, safety);
         vendorPlanner = new VendorSellPlanner(dataManager, gameGui, transactionQueue, safety);
         grandCompanyPlanner = new GrandCompanyPlanner(dataManager, gameGui, transactionQueue, safety);
         materiaPlanner = new MateriaExtractPlanner(dataManager, gameGui, condition, transactionQueue, InvalidateButtonCache);
@@ -144,11 +144,33 @@ public sealed unsafe class MagicSortService : IDisposable
         glamourButtonCache.Invalidate();
     }
 
-    public bool IsItemOverwritten(uint rawItemId)
+    public bool TryGetEffectiveOverride(uint rawItemId, out string effectiveSpec)
     {
+        effectiveSpec = string.Empty;
         var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
-        return baseId != 0 && configuration.ManualRouteOverrides.ContainsKey(baseId);
+        if (baseId == 0
+            || !configuration.ManualRouteOverrides.TryGetValue(baseId, out var spec)
+            || string.IsNullOrWhiteSpace(spec))
+        {
+            return false;
+        }
+
+        if (spec.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
+            && ulong.TryParse(spec["Retainer:".Length..], out var ovRetId))
+        {
+            var ownsRetainer = holdings.GetKnownRetainersForCurrentCharacter().Any(r => r.RetainerId == ovRetId);
+            if (!ownsRetainer)
+            {
+                return false;
+            }
+        }
+
+        effectiveSpec = spec;
+        return true;
     }
+
+    public bool IsItemOverwritten(uint rawItemId)
+        => TryGetEffectiveOverride(rawItemId, out _);
 
     public void SetItemOverride(uint rawItemId, string routeSpec, int? marketPriority = null)
     {
@@ -214,7 +236,7 @@ public sealed unsafe class MagicSortService : IDisposable
             return;
         }
 
-        if (usePlanner.Execute(GetLatestManifest(), out var msg))
+        if (usePlanner.Execute(GetLatestManifest(), out var msg, onCompleted: InvalidateButtonCache))
         {
             isOwnBatchActive = true;
         }
@@ -283,7 +305,7 @@ public sealed unsafe class MagicSortService : IDisposable
             return;
         }
 
-        if (inventorySortPlanner.Execute(GetLatestManifest(), out var msg))
+        if (inventorySortPlanner.Execute(GetLatestManifest(), out var msg, onCompleted: InvalidateButtonCache))
         {
             isOwnBatchActive = true;
         }
@@ -373,7 +395,8 @@ public sealed unsafe class MagicSortService : IDisposable
             liveItem,
             GetLatestManifest(),
             safety.BuildGearsetItemIds(),
-            safety.BuildUnlockedJobTopIlvl());
+            safety.BuildUnlockedJobTopIlvl(),
+            includeBagToArmouryRoute: true);
         if (resolved is null)
         {
             return null;
@@ -486,9 +509,9 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public void ExecuteRetainerSort() => ExecuteRetainerSortInternal(fromOrchestrator: false);
 
-    public void ExecuteRetainerSortFromOrchestrator() => ExecuteRetainerSortInternal(fromOrchestrator: true);
+    public bool ExecuteRetainerSortFromOrchestrator() => ExecuteRetainerSortInternal(fromOrchestrator: true);
 
-    private void ExecuteRetainerSortInternal(bool fromOrchestrator)
+    private bool ExecuteRetainerSortInternal(bool fromOrchestrator)
         => TryExecuteOrCancel(
             () =>
             {
@@ -557,7 +580,17 @@ public sealed unsafe class MagicSortService : IDisposable
     public string BuildBellSellTooltip(IReadOnlyList<string> retainerNames)
     {
         var sb = new System.Text.StringBuilder();
-        sb.Append("List Market items via: ").Append(string.Join(", ", retainerNames));
+        if (configuration.MarketReviewBeforeConfirm)
+        {
+            sb.Append("Prep Market listing for review via: ").Append(string.Join(", ", retainerNames));
+            sb.Append(configuration.MarketAutoComparePricesInReview
+                ? "\nOpens & prefills 1 item + live Compare Prices so you inspect before clicking Confirm."
+                : "\nOpens & prefills 1 item so you inspect before clicking Confirm.");
+        }
+        else
+        {
+            sb.Append("List Market items via: ").Append(string.Join(", ", retainerNames));
+        }
 
         var bagMarketPlans = CollectBagMarketPlansForPreview();
         if (bagMarketPlans.Count > 0)
@@ -589,6 +622,27 @@ public sealed unsafe class MagicSortService : IDisposable
     }
 
     public int CountPendingBagMarketItems() => CollectBagMarketPlansForPreview().Count;
+
+    public int CountBagMarketItems() => CollectBagMarketPlansForPreview().Count;
+
+    public int CountBagVendorItems()
+        => vendorPlanner.PlanSales(1, includeArmoury: false, GetLatestManifest()).Count;
+
+    public int CountBagGcItems()
+    {
+        GetSlotsMatchingRouteFilter("GrandCompany", out var bagSlots, out _, out var armourySlots);
+        return bagSlots.Count + armourySlots.Count;
+    }
+
+    public bool HasRemainingAutoSellQuota
+        => configuration.MarketReviewBeforeConfirm || configuration.GetRemainingMarketActionsToday() > 0;
+
+    public int GetUsedMarketActionsToday() => configuration.GetUsedMarketActionsToday();
+
+    public int MarketDailyActionLimit => configuration.MarketDailyActionLimit;
+
+    public void CaptureActiveRetainerSnapshot(bool force = true)
+        => holdings.CaptureActiveRetainerIfOpen(true, force);
 
     private List<MarketPlanItem> CollectBagMarketPlansForPreview()
         => marketPlanner.PlanBagMarketPreview(GetLatestManifest());
@@ -941,11 +995,29 @@ public sealed unsafe class MagicSortService : IDisposable
             return busyState;
         }
 
+        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"))
+        {
+            return new MagicSortButtonState(
+                true,
+                false,
+                "Reviewing...",
+                "Finish or cancel the open Market listing window before preparing another item.");
+        }
+
         var rm = RetainerManager.Instance();
         var active = rm != null && rm->IsReady ? rm->GetActiveRetainer() : null;
         if (active == null || active->RetainerId == 0)
         {
             return HiddenSortButton;
+        }
+
+        if (!configuration.MarketReviewBeforeConfirm && configuration.GetRemainingMarketActionsToday() <= 0)
+        {
+            return new MagicSortButtonState(
+                true,
+                false,
+                "Daily Limit",
+                $"Daily Market Board limit reached ({configuration.GetUsedMarketActionsToday()}/{configuration.MarketDailyActionLimit}). Raise the limit in Settings or switch to Review Mode.");
         }
 
         var sourceMask = marketPlanner.GetOpenMarketSourceMask();
@@ -1029,11 +1101,11 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public bool IsMarketReviewOnly => configuration.MarketReviewBeforeConfirm;
 
-    public void ExecuteMarketSortFromOrchestrator() => ExecuteMarketSortInternal(fromOrchestrator: true);
+    public bool ExecuteMarketSortFromOrchestrator() => ExecuteMarketSortInternal(fromOrchestrator: true);
 
-    private void ExecuteMarketSortInternal(bool fromOrchestrator)
+    private bool ExecuteMarketSortInternal(bool fromOrchestrator)
     {
-        TryExecuteOrCancel(() =>
+        return TryExecuteOrCancel(() =>
         {
             var rm = RetainerManager.Instance();
             var active = rm != null && rm->IsReady ? rm->GetActiveRetainer() : null;
@@ -1073,8 +1145,9 @@ public sealed unsafe class MagicSortService : IDisposable
             var steps = marketPlanner.BuildListingSteps(plans, GetLatestManifest, reviewOnly: reviewOnly);
             if (reviewOnly)
             {
-                // Review mode leaves RetainerSell open for user confirmation — don't consume automated action quota.
-                return (steps, hasMore);
+                // Review mode opens 1 item intentionally for user inspection — don't consume automated quota
+                // and don't print a misleading "Batch paused at the per-click safety cap" message.
+                return (steps, false);
             }
 
             var counted = new List<TransactionStep>(steps.Count);
@@ -1198,14 +1271,27 @@ public sealed unsafe class MagicSortService : IDisposable
         MagicSortButtonState state;
         if (tab != 2)
         {
-            var eligibleCount = grandCompanyPlanner.CountEligibleItemsInBagsAndArmoury(MaxTwoStepBatchItems, entries);
-            state = eligibleCount == 0
-                ? HiddenSortButton
-                : new MagicSortButtonState(
+            var eligibleCount = grandCompanyPlanner.CountEligibleItemsInBagsAndArmoury(MaxTwoStepBatchItems, entries, filter, out var atSealCap);
+            if (eligibleCount == 0)
+            {
+                state = HiddenSortButton;
+            }
+            else if (atSealCap)
+            {
+                state = new MagicSortButtonState(
+                    true,
+                    false,
+                    "Seal Cap",
+                    "Company Seal cap reached. Spend seals before turning in more gear.");
+            }
+            else
+            {
+                state = new MagicSortButtonState(
                     true,
                     true,
                     $"Magic Sell ({eligibleCount})",
                     "Open the Expert Delivery tab to deliver unassigned gear for Company Seals.");
+            }
         }
         else
         {
@@ -1286,7 +1372,15 @@ public sealed unsafe class MagicSortService : IDisposable
 
         var plans = materiaPlanner.PlanExtractions(SafeTransactionQueue.MaxBatchSize, out var blockedByFullBag);
         MagicSortButtonState state;
-        if (plans.Count > 0)
+        if (plans.Count > 0 && materiaPlanner.IsBlockedByMount)
+        {
+            state = new MagicSortButtonState(
+                true,
+                false,
+                "Dismount",
+                $"Dismount before extracting Materia from {plans.Count} gear item(s).");
+        }
+        else if (plans.Count > 0)
         {
             state = new MagicSortButtonState(
                 true,
@@ -1483,7 +1577,7 @@ public sealed unsafe class MagicSortService : IDisposable
 
     public System.Action? OnUserStopRequested { get; set; }
 
-    private void TryExecuteOrCancel(
+    private bool TryExecuteOrCancel(
         Func<(IReadOnlyList<TransactionStep> Steps, bool HasMoreRemaining)> buildBatch,
         System.Action? onBatchFinished = null,
         bool fromOrchestrator = false)
@@ -1497,12 +1591,12 @@ public sealed unsafe class MagicSortService : IDisposable
         if (!fromOrchestrator && IsOrchestratorActive?.Invoke() == true)
         {
             OnUserStopRequested?.Invoke();
-            return;
+            return false;
         }
 
         if (!fromOrchestrator && transactionQueue.IgnoreToggleClick)
         {
-            return;
+            return false;
         }
 
         if (transactionQueue.IsBusy)
@@ -1519,13 +1613,13 @@ public sealed unsafe class MagicSortService : IDisposable
                 }
             }
 
-            return;
+            return false;
         }
 
         var (steps, hasMoreRemaining) = buildBatch();
         if (steps.Count == 0)
         {
-            return;
+            return false;
         }
 
         if (transactionQueue.TryEnqueueBatch(
@@ -1542,11 +1636,11 @@ public sealed unsafe class MagicSortService : IDisposable
                 }))
         {
             isOwnBatchActive = true;
+            return true;
         }
-        else
-        {
-            chatGui.PrintError(reason);
-        }
+
+        chatGui.PrintError(reason);
+        return false;
     }
 
     private bool TryGetBusyButtonState(out MagicSortButtonState busyState)

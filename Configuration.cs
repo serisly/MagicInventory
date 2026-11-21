@@ -105,6 +105,7 @@ public sealed class Configuration : IPluginConfiguration
 
     // Market Board selling workflow & safety limits
     public bool MarketReviewBeforeConfirm { get; set; } = true;
+    public bool MarketAutoComparePricesInReview { get; set; } = true;
     public bool MarketAutoFillRetainerSell { get; set; } = true;
     public bool MarketPromptStaleListings { get; set; } = true;
     public int StaleListingUndercutPct { get; set; } = 25;
@@ -116,13 +117,23 @@ public sealed class Configuration : IPluginConfiguration
     [NonSerialized]
     private CharacterProfile? fallbackProfile;
 
-    public int GetRemainingMarketActionsToday()
+    public int GetUsedMarketActionsToday()
     {
         var today = DateTime.Now.ToString("yyyy-MM-dd");
-        var usedToday = string.Equals(MarketActionsDay, today, StringComparison.Ordinal)
+        return string.Equals(MarketActionsDay, today, StringComparison.Ordinal)
             ? MarketActionsToday
             : 0;
-        return Math.Max(0, MarketDailyActionLimit - usedToday);
+    }
+
+    public int GetRemainingMarketActionsToday()
+    {
+        // 0 = unlimited
+        if (MarketDailyActionLimit <= 0)
+        {
+            return int.MaxValue;
+        }
+
+        return Math.Max(0, MarketDailyActionLimit - GetUsedMarketActionsToday());
     }
 
     public void RecordMarketAction()

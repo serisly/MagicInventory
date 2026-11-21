@@ -1,9 +1,11 @@
 using System.Numerics;
+using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using KamiToolKit.Controllers;
 using KamiToolKit.Enums;
 using KamiToolKit.Nodes;
+using MagicInventory.Core;
 using MagicInventory.Services;
 
 namespace MagicInventory.UI;
@@ -28,6 +30,7 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private static readonly Vector4 RetainerLabelColor = new(0.86f, 0.79f, 0.56f, 0.96f);
     private static readonly Vector4 LabelOutlineColor = new(0.08f, 0.08f, 0.08f, 0.92f);
 
+    private readonly IGameGui gameGui;
     private readonly MaterialTrackerService tracker;
     private readonly AddonController<AddonRecipeNote> controller;
     private readonly TextNode?[] retainerLabels = new TextNode?[IngredientSlotCount];
@@ -38,8 +41,9 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private bool? lastTrackedState;
     private DateTime lastHoldingsRefreshUtc = DateTime.MinValue;
 
-    public RecipeNoteController(MaterialTrackerService tracker)
+    public RecipeNoteController(IGameGui gameGui, MaterialTrackerService tracker)
     {
+        this.gameGui = gameGui;
         this.tracker = tracker;
 
         controller = new AddonController<AddonRecipeNote>
@@ -75,7 +79,7 @@ public sealed unsafe class RecipeNoteController : IDisposable
             Size = new Vector2(ButtonWidth, ButtonHeight),
             String = "Track",
             IsVisible = false,
-            OnClick = () => OnTrackClicked(addon),
+            OnClick = OnTrackClicked,
         };
         trackButton.AttachNode(detailsContainer, NodePosition.AsLastChild);
 
@@ -111,8 +115,14 @@ public sealed unsafe class RecipeNoteController : IDisposable
 
     private void SyncState(AddonRecipeNote* addon)
     {
-        if (trackButton == null || addon == null)
+        if (addon == null)
         {
+            return;
+        }
+
+        if (trackButton == null)
+        {
+            OnSetup(addon);
             return;
         }
 
@@ -160,6 +170,10 @@ public sealed unsafe class RecipeNoteController : IDisposable
     {
         var ingredientsContainer = addon->GetNodeById(IngredientsContainerNodeId);
         var containerVisible = ingredientsContainer != null && ingredientsContainer->IsVisible();
+        if (containerVisible)
+        {
+            tracker.RefreshActiveRetainerSnapshot();
+        }
 
         for (var i = 0; i < IngredientSlotCount; i++)
         {
@@ -180,7 +194,7 @@ public sealed unsafe class RecipeNoteController : IDisposable
                 continue;
             }
 
-            var text = tracker.GetIngredientOwnershipLabel(recipe.Ingredients[i].ItemId);
+            var text = tracker.GetIngredientOwnershipLabel(recipe.Ingredients[i].ItemId, captureRetainer: false);
             if (string.IsNullOrEmpty(text))
             {
                 if (labelNode.IsVisible)
@@ -218,8 +232,15 @@ public sealed unsafe class RecipeNoteController : IDisposable
         }
     }
 
-    private void OnTrackClicked(AddonRecipeNote* addon)
+    private void OnTrackClicked()
     {
+        // Resolve the live RecipeNote addon at click time instead of capturing a raw pointer from OnSetup
+        var addon = (AddonRecipeNote*)NativeUiHelpers.GetReadyAddon(gameGui, "RecipeNote");
+        if (addon == null)
+        {
+            return;
+        }
+
         var recipe = tracker.GetActiveRecipe(addon);
         if (recipe == null)
         {

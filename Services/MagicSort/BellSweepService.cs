@@ -54,6 +54,7 @@ public sealed unsafe class BellSweepService : IDisposable
     private int currentMarketSellPasses;
     private bool marketSellOnlyMode;
     private bool triggeredBatch;
+    private bool truncatedByCap;
 
     private sealed record BellRetainerTarget(int SortedIndex, ulong RetainerId, string Name, bool HasFreeMarketSlots, int EstimatedItemCount);
 
@@ -140,8 +141,10 @@ public sealed unsafe class BellSweepService : IDisposable
         {
             if (!marketSellOnlyMode)
             {
-                var label = activeTarget != null ? $"Stop ({activeTarget.Name})" : "Stop";
-                return new MagicSortButtonState(true, true, label, "Stop the active Magic Sort pass.");
+                var tip = activeTarget != null
+                    ? $"Stop the active Magic Sort pass ({activeTarget.Name})."
+                    : "Stop the active Magic Sort pass.";
+                return new MagicSortButtonState(true, true, "Stop Sort", tip);
             }
 
             return MagicSortButtonState.Hidden;
@@ -185,8 +188,10 @@ public sealed unsafe class BellSweepService : IDisposable
         {
             if (marketSellOnlyMode)
             {
-                var label = activeTarget != null ? $"Stop ({activeTarget.Name})" : "Stop";
-                return new MagicSortButtonState(true, true, label, "Stop the active Magic Sell pass.");
+                var tip = activeTarget != null
+                    ? $"Stop the active Market pass ({activeTarget.Name})."
+                    : "Stop the active Market pass.";
+                return new MagicSortButtonState(true, true, "Stop Sell", tip);
             }
 
             return MagicSortButtonState.Hidden;
@@ -195,6 +200,15 @@ public sealed unsafe class BellSweepService : IDisposable
         if (transactionQueue.IsBusy)
         {
             return MagicSortButtonState.Hidden;
+        }
+
+        if (!magicSort.HasRemainingAutoSellQuota)
+        {
+            return new MagicSortButtonState(
+                true,
+                false,
+                "Daily Limit",
+                $"Daily Market Board limit reached ({magicSort.GetUsedMarketActionsToday()}/{magicSort.MarketDailyActionLimit}). Raise the limit in Settings or enable Review Mode.");
         }
 
         if (bellSellButtonCache.TryGet(0, out var cached))
@@ -212,10 +226,11 @@ public sealed unsafe class BellSweepService : IDisposable
         var tooltip = magicSort.BuildBellSellTooltip(names);
         var pendingMarketCount = magicSort.CountPendingBagMarketItems();
         var countSuffix = pendingMarketCount > 0 ? $" ({pendingMarketCount})" : $" ({targets.Count})";
+        var prefix = magicSort.IsMarketReviewOnly ? "Prep Sell" : "Magic Sell";
         return bellSellButtonCache.Set(0, new MagicSortButtonState(
             true,
             true,
-            $"Magic Sell{countSuffix}",
+            $"{prefix}{countSuffix}",
             tooltip));
     }
 
@@ -255,6 +270,12 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
+        if (marketSellOnly && !magicSort.HasRemainingAutoSellQuota)
+        {
+            chatGui.Print($"Magic Sell: daily limit reached ({magicSort.GetUsedMarketActionsToday()}/{magicSort.MarketDailyActionLimit}). Raise the limit in Settings or enable Review Mode.");
+            return;
+        }
+
         var targets = BuildBellTargets(marketSellOnly);
         if (targets.Count == 0)
         {
@@ -265,6 +286,7 @@ public sealed unsafe class BellSweepService : IDisposable
         }
 
         marketSellOnlyMode = marketSellOnly;
+        truncatedByCap = targets.Count > MaxRetainersPerClick;
         InvalidateButtonCaches();
         pendingRetainers.Clear();
         var cappedCount = Math.Min(targets.Count, MaxRetainersPerClick);
@@ -287,6 +309,7 @@ public sealed unsafe class BellSweepService : IDisposable
         activeTarget = null;
         state = SweepState.Idle;
         marketSellOnlyMode = false;
+        truncatedByCap = false;
         nextActionUtc = DateTime.MinValue;
         stateStartedUtc = DateTime.MinValue;
         ResetCurrentRetainerFlags();
@@ -386,8 +409,9 @@ public sealed unsafe class BellSweepService : IDisposable
             }
 
             var target = new BellRetainerTarget(sortedIdx, retId, name, hasFreeMarket, itemCount);
-            // Visit retainers with withdrawals (especially full 175/175 retainers) FIRST to free space before deposits!
-            if (hasSummary && summary.HasWithdrawWork && !isFunnelDest)
+            // Visit full (175/175) withdrawable retainers FIRST unconditionally (even if they are also funnel destinations)
+            // and non-funnel withdrawable retainers next so space is freed before deposits arrive!
+            if (hasSummary && summary.HasWithdrawWork && (summary.IsFull || !isFunnelDest))
             {
                 withdrawFirst.Add(target);
             }
@@ -608,15 +632,29 @@ public sealed unsafe class BellSweepService : IDisposable
 
         if (!triggeredBatch)
         {
-            if (magicSort.HasMoreRetainerSortWork() && currentRetainerSortPasses < MaxSortBatchesPerRetainer)
+            var hasMoreWork = magicSort.HasMoreRetainerSortWork();
+            if (hasMoreWork && currentRetainerSortPasses < MaxSortBatchesPerRetainer)
             {
-                currentRetainerSortPasses++;
-                triggeredBatch = true;
-                magicSort.ExecuteRetainerSortFromOrchestrator();
-                nextActionUtc = now.AddMilliseconds(500);
+                if (magicSort.ExecuteRetainerSortFromOrchestrator())
+                {
+                    currentRetainerSortPasses++;
+                    triggeredBatch = true;
+                    nextActionUtc = now.AddMilliseconds(500);
+                    return;
+                }
+
+                // Enqueue failed (e.g., busy/condition change); stop cleanly instead of falsely continuing
+                Stop();
                 return;
             }
 
+            if (hasMoreWork)
+            {
+                truncatedByCap = true;
+            }
+
+            // Capture the retainer's final post-sort inventory snapshot before closing
+            magicSort.CaptureActiveRetainerSnapshot(force: true);
             didRetainerSortOnCurrent = true;
             TransitionTo(SweepState.ClosingRetainerInventory, now, SampleJitterMs(700, 1150));
             return;
@@ -639,6 +677,12 @@ public sealed unsafe class BellSweepService : IDisposable
         var retAddon = GetOpenRetainerInventoryAddon();
         if (retAddon != null)
         {
+            if ((now - stateStartedUtc).TotalSeconds > TransitionTimeoutSeconds)
+            {
+                Stop("Magic Sort stopped: timed out closing retainer inventory.");
+                return;
+            }
+
             retAddon->Close(true);
             nextActionUtc = now.AddMilliseconds(SampleJitterMs(750, 1200));
             return;
@@ -696,10 +740,16 @@ public sealed unsafe class BellSweepService : IDisposable
         {
             if (magicSort.HasMoreMarketSellWork() && currentMarketSellPasses < MaxMarketBatchesPerRetainer)
             {
-                currentMarketSellPasses++;
-                triggeredBatch = true;
-                magicSort.ExecuteMarketSortFromOrchestrator();
-                nextActionUtc = now.AddMilliseconds(500);
+                if (magicSort.ExecuteMarketSortFromOrchestrator())
+                {
+                    currentMarketSellPasses++;
+                    triggeredBatch = true;
+                    nextActionUtc = now.AddMilliseconds(500);
+                    return;
+                }
+
+                // Enqueue failed (e.g., daily limit hit or precondition failed); stop without claiming success
+                Stop();
                 return;
             }
 
@@ -743,6 +793,12 @@ public sealed unsafe class BellSweepService : IDisposable
         var sellList = NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSellList");
         if (sellList != null)
         {
+            if ((now - stateStartedUtc).TotalSeconds > TransitionTimeoutSeconds)
+            {
+                Stop("Magic Sell stopped: timed out closing market listing window.");
+                return;
+            }
+
             sellList->Close(true);
             nextActionUtc = now.AddMilliseconds(SampleJitterMs(750, 1200));
             return;
@@ -806,9 +862,30 @@ public sealed unsafe class BellSweepService : IDisposable
 
     private void AdvanceToNextRetainerOrFinish(DateTime now)
     {
+        if (marketSellOnlyMode
+            && (magicSort.CountPendingBagMarketItems() <= 0 || !magicSort.HasRemainingAutoSellQuota))
+        {
+            Stop(magicSort.HasRemainingAutoSellQuota
+                ? "Market Sell complete."
+                : "Market Sell stopped: daily limit reached.");
+            return;
+        }
+
         if (pendingRetainers.Count == 0)
         {
-            Stop("Magic Sort complete.");
+            if (marketSellOnlyMode)
+            {
+                Stop(truncatedByCap
+                    ? "Market Sell pass complete — click again for remaining retainers."
+                    : "Market Sell complete.");
+            }
+            else
+            {
+                Stop(truncatedByCap
+                    ? "Magic Sort pass complete — click Magic Sort again for remaining items/retainers."
+                    : "Magic Sort complete.");
+            }
+
             return;
         }
 

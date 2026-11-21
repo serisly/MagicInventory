@@ -62,6 +62,7 @@ public sealed unsafe class ArmoireStorePlanner
 
         var cabinetLoaded = uiState->Cabinet.IsCabinetLoaded();
         var gearsetIds = safety.BuildGearsetItemIds();
+        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
         var seenCabinetIds = new HashSet<uint>();
 
         var repairNeeded = 0;
@@ -109,7 +110,15 @@ public sealed unsafe class ArmoireStorePlanner
                 }
 
                 var row = itemSheet.GetRowOrDefault(baseId);
-                if (row is null || InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
+                if (row is null)
+                {
+                    continue;
+                }
+
+                var itemRow = row.Value;
+                if (itemRow.Rarity >= 4
+                    || ItemIdentity.IsSoulCrystal(itemRow)
+                    || InventorySafetyEvaluator.IsMateriaExtractable(itemRow, slot))
                 {
                     continue;
                 }
@@ -117,6 +126,14 @@ public sealed unsafe class ArmoireStorePlanner
                 if (slot->GetMateriaCount() > 0 || slot->Materia[0] != 0)
                 {
                     meldedSkipped++;
+                    continue;
+                }
+
+                if (!string.Equals(
+                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedTop),
+                    "Armoire",
+                    StringComparison.OrdinalIgnoreCase))
+                {
                     continue;
                 }
 
@@ -171,7 +188,8 @@ public sealed unsafe class ArmoireStorePlanner
                 RequiredAddon: "Cabinet",
                 Dispatch: () =>
                 {
-                    if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
+                    if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet")
+                        || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectYesno"))
                     {
                         return false;
                     }
@@ -190,7 +208,15 @@ public sealed unsafe class ArmoireStorePlanner
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(mgr, captured.Container, captured.Slot);
-                    if (slot == null || slot->ItemId != captured.RawItemId || slot->Condition < 30000)
+                    var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(captured.BaseItemId);
+                    if (slot == null
+                        || itemRow is null
+                        || slot->ItemId != captured.RawItemId
+                        || slot->Condition < 30000
+                        || slot->GetMateriaCount() > 0
+                        || slot->Materia[0] != 0
+                        || InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot)
+                        || safety.BuildGearsetItemIds().Contains(captured.BaseItemId))
                     {
                         return false;
                     }
@@ -218,10 +244,11 @@ public sealed unsafe class ArmoireStorePlanner
                         var yesNo = (AddonSelectYesno*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectYesno");
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
-                            // Only confirm a prompt that is clearly about this item / the armoire; never blind-click Yes.
+                            // Require exact normalized item name in prompt (never blind-click Yes on unrelated armoire/dye warnings)
                             var promptText = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
-                            if (!promptText.Contains(captured.Name, StringComparison.OrdinalIgnoreCase)
-                                && !promptText.Contains("armoire", StringComparison.OrdinalIgnoreCase))
+                            var expectedName = NativeUiHelpers.NormalizeItemLabel(captured.Name);
+                            if (string.IsNullOrEmpty(expectedName)
+                                || !promptText.Contains(expectedName, StringComparison.OrdinalIgnoreCase))
                             {
                                 if (yesNo->NoButton != null)
                                 {

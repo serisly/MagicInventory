@@ -30,6 +30,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
         overlayController.AddNode(trackerNode);
     }
 
+    public void ResetPosition() => trackerNode.ResetPosition();
+
     public void Dispose()
     {
         overlayController.RemoveNode(trackerNode);
@@ -70,8 +72,10 @@ public sealed class MaterialTrackerOverlay : IDisposable
         private Vector2 lastMousePos;
         private string lastTitle = string.Empty;
         private string lastCountMode = string.Empty;
+        private string lastCountModeTooltip = string.Empty;
         private string lastJobMeta = string.Empty;
         private string lastActionLabel = string.Empty;
+        private string lastActionTooltip = string.Empty;
         private bool actionSwitchesJob;
         private string lastOverflowText = string.Empty;
 
@@ -102,8 +106,11 @@ public sealed class MaterialTrackerOverlay : IDisposable
             this.condition = condition;
             this.chatGui = chatGui;
 
-            var startX = float.IsFinite(config.TrackerX) ? Math.Clamp(config.TrackerX, 4f, 3600f) : 24f;
-            var startY = float.IsFinite(config.TrackerY) ? Math.Clamp(config.TrackerY, 4f, 2000f) : 120f;
+            var vpSize = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
+            var maxStartX = vpSize.X > 400f ? Math.Max(320f, vpSize.X - PanelWidth - 8f) : 3600f;
+            var maxStartY = vpSize.Y > 300f ? Math.Max(200f, vpSize.Y - 60f) : 2000f;
+            var startX = float.IsFinite(config.TrackerX) ? Math.Clamp(config.TrackerX, 4f, maxStartX) : 24f;
+            var startY = float.IsFinite(config.TrackerY) ? Math.Clamp(config.TrackerY, 4f, maxStartY) : 120f;
 
             Position = new Vector2(startX, startY);
             Size = new Vector2(PanelWidth, HeaderHeight);
@@ -180,23 +187,46 @@ public sealed class MaterialTrackerOverlay : IDisposable
             craftActionButton.AttachNode(this, NodePosition.AsLastChild);
         }
 
+        public void ResetPosition()
+        {
+            StopDragging(savePosition: false);
+            Position = new Vector2(24f, 120f);
+            config.TrackerX = 24f;
+            config.TrackerY = 120f;
+            config.Save(pluginInterface);
+        }
+
         private void OnCraftActionClick()
         {
             if (actionSwitchesJob)
             {
-                if (tracker.SwitchToTrackedJob(out var msg) && !string.IsNullOrEmpty(msg))
+                var ok = tracker.SwitchToTrackedJob(out var msg);
+                if (!string.IsNullOrEmpty(msg))
                 {
-                    chatGui.Print(msg);
+                    if (ok) chatGui.Print(msg);
+                    else chatGui.PrintError(msg);
                 }
             }
-            else if (tracker.StartCraftTracked(out var msg) && !string.IsNullOrEmpty(msg))
+            else
             {
-                chatGui.Print(msg);
+                var ok = tracker.StartCraftTracked(out var msg);
+                if (!string.IsNullOrEmpty(msg))
+                {
+                    if (ok) chatGui.Print(msg);
+                    else chatGui.PrintError(msg);
+                }
             }
         }
 
         protected override void OnUpdate()
         {
+            // Release stuck drag if left mouse button was released outside game window (e.g., alt-tab)
+            if (activeDragListener != null
+                && !Dalamud.Bindings.ImGui.ImGui.IsMouseDown(Dalamud.Bindings.ImGui.ImGuiMouseButton.Left))
+            {
+                StopDragging(savePosition: true);
+            }
+
             if (!clientState.IsLoggedIn
                 || condition[ConditionFlag.BetweenAreas]
                 || condition[ConditionFlag.BetweenAreas51]
@@ -218,8 +248,20 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             SetOverlayVisible(true);
 
-            var displayTitle = snapshot.Title.Length > 22
-                ? $"{snapshot.Title[..20].TrimEnd()}..."
+            // Keep tracker clamped inside current display viewport (e.g., after monitor/resolution switch)
+            var liveVp = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
+            if (liveVp.X > 400f && liveVp.Y > 300f)
+            {
+                var clampedX = Math.Clamp(Position.X, 4f, Math.Max(4f, liveVp.X - PanelWidth - 8f));
+                var clampedY = Math.Clamp(Position.Y, 4f, Math.Max(4f, liveVp.Y - 60f));
+                if (MathF.Abs(clampedX - Position.X) > 1f || MathF.Abs(clampedY - Position.Y) > 1f)
+                {
+                    Position = new Vector2(clampedX, clampedY);
+                }
+            }
+
+            var displayTitle = snapshot.Title.Length > 20
+                ? $"{snapshot.Title[..18].TrimEnd()}..."
                 : snapshot.Title;
             if (lastTitle != displayTitle)
             {
@@ -231,6 +273,15 @@ public sealed class MaterialTrackerOverlay : IDisposable
             {
                 lastCountMode = snapshot.CraftCountLabel;
                 countModeButton.String = snapshot.CraftCountLabel;
+            }
+
+            var countTip = snapshot.RecipeId > 0
+                ? "Click to cycle craft count (x1 / x5 / x10 / x20 / All stacks)."
+                : "Click to cycle list multiplier (x1 / x5 / x10 / x20) or pull All stacks from retainers.";
+            if (lastCountModeTooltip != countTip)
+            {
+                lastCountModeTooltip = countTip;
+                countModeButton.TextTooltip = countTip;
             }
 
             tracker.TickPendingCraft();
@@ -300,15 +351,18 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 }
 
                 widget.NameNode.Position = new Vector2(2f, y);
-                widget.NameNode.Size = new Vector2(PanelWidth - 62f, RowHeight);
+                widget.NameNode.Size = new Vector2(PanelWidth - 76f, RowHeight);
 
-                widget.CountNode.Position = new Vector2(PanelWidth - 58f, y);
-                widget.CountNode.Size = new Vector2(58f, RowHeight);
+                widget.CountNode.Position = new Vector2(PanelWidth - 72f, y);
+                widget.CountNode.Size = new Vector2(72f, RowHeight);
 
-                if (widget.LastName != line.Name)
+                var displayName = line.Name.Length > 26
+                    ? $"{line.Name[..24].TrimEnd()}..."
+                    : line.Name;
+                if (widget.LastName != displayName)
                 {
-                    widget.LastName = line.Name;
-                    widget.NameNode.String = line.Name;
+                    widget.LastName = displayName;
+                    widget.NameNode.String = displayName;
                 }
 
                 var countStr = $"{line.OwnedCount}/{line.NeededCount}";
@@ -401,6 +455,11 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 {
                     lastActionLabel = actionLabel;
                     craftActionButton.String = actionLabel;
+                }
+
+                if (lastActionTooltip != actionTip)
+                {
+                    lastActionTooltip = actionTip;
                     craftActionButton.TextTooltip = actionTip;
                 }
 
@@ -410,6 +469,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
             {
                 craftActionButton.IsVisible = false;
                 lastActionLabel = string.Empty;
+                lastActionTooltip = string.Empty;
             }
 
             Size = new Vector2(PanelWidth, y);

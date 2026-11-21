@@ -19,13 +19,22 @@ public readonly record struct MarketViabilityResult(
     double EstimatedDaysToSell);
 
 /// <summary>
-/// Single source of truth for Market Board liquidity, frequency, recency,
-/// oversupply saturation, and anti-manipulation pricing.
-/// Shared by ItemTriageEngine, ActiveListingAuditor, and RetainerSellPriceController
-/// so triage, listing review, and stale-listing detection always agree 100%.
+/// Single source of truth for Market Board liquidity, value-tiered frequency, recency,
+/// oversupply saturation, 5% seller-tax vendor break-even, and anti-manipulation pricing.
+/// Shared by ItemTriageEngine, ActiveListingAuditor, MarketListingPlanner, and RetainerSellPriceController.
 /// </summary>
 public static class MarketViabilityEvaluator
 {
+    private const long MidValueStackThreshold = 10_000;
+    private const long HighValueStackThreshold = 50_000;
+
+    /// <summary>
+    /// Minimum Market Board asking price required to net strictly MORE than instant 0%-tax NPC vendoring
+    /// after FFXIV's 5% Market Board seller tax.
+    /// </summary>
+    public static long ComputeVendorBreakevenPrice(long npcPriceLow)
+        => npcPriceLow <= 0 ? 2L : Math.Max(2L, (long)Math.Ceiling(npcPriceLow / 0.95) + 1L);
+
     public static MarketViabilityResult Evaluate(
         MarketPriceSnapshot? mkt,
         bool isHq,
@@ -34,7 +43,7 @@ public static class MarketViabilityEvaluator
         Configuration cfg,
         DateTime? nowUtcOverride = null)
     {
-        if (mkt == null)
+        if (mkt == null || IsEmptySentinel(mkt))
         {
             return new MarketViabilityResult(
                 HasData: false,
@@ -76,35 +85,56 @@ public static class MarketViabilityEvaluator
             var lastSaleUtc = DateTimeOffset.FromUnixTimeSeconds(lastSaleUnix).UtcDateTime;
             daysSinceLastSale = Math.Max(0.0, (nowUtc - lastSaleUtc).TotalDays);
         }
+        else if (hasQualitySchema && velocity <= 0.0001f)
+        {
+            daysSinceLastSale = double.PositiveInfinity;
+        }
         else
         {
-            daysSinceLastSale = hasQualitySchema ? double.PositiveInfinity : 0.0;
+            // Minority quality had >0 velocity from Universalis server-side stats even if recentHistory was dominated by other quality
+            daysSinceLastSale = velocity > 0.0001f ? Math.Min(7.0, 1.0 / velocity) : 0.0;
         }
 
-        var realisticUnit = ComputeRealisticUnitPrice(serverCheapest, soldMedian, hasQualitySchema);
+        var realisticUnit = ComputeRealisticUnitPrice(serverCheapest, soldMedian, velocity, hasQualitySchema);
         var suggestedUndercut = ComputeUndercutPrice(serverCheapest, soldMedian, npcPriceLow, cfg.MarketUndercutGil);
         var safeQty = Math.Max(1, quantity);
         var stackVal = (long)realisticUnit * safeQty;
         var listingCount = mkt.ListingCount;
-        var estDaysToSell = listingCount > 0 && velocity > 0.0001f
-            ? listingCount / velocity
+
+        // Compare combined NQ+HQ listing count against combined RegularSaleVelocity (never divide combined listings by single-quality velocity!)
+        var combinedVel = mkt.RegularSaleVelocity > 0.0001f ? mkt.RegularSaleVelocity : velocity;
+        var estDaysToSell = listingCount > 0 && combinedVel > 0.0001f
+            ? listingCount / combinedVel
             : (velocity > 0.0001f ? 1.0 / velocity : double.PositiveInfinity);
 
-        // 1. Zero recorded recent sales for this quality -> unrealistic (lone speculative listings don't count!)
-        if (hasQualitySchema && lastSaleUnix <= 0)
+        // Value-tiered liquidity requirements: expensive rare items (10k+, 50k+) naturally sell slower than 500g mats
+        var effectiveMinVel = cfg.MarketMinVelocity;
+        var effectiveMaxDays = Math.Max(1, cfg.MarketMaxDaysSinceLastSale);
+        if (stackVal >= HighValueStackThreshold)
+        {
+            effectiveMinVel = MathF.Min(effectiveMinVel, 0.10f);
+            effectiveMaxDays = Math.Max(effectiveMaxDays, 30);
+        }
+        else if (stackVal >= MidValueStackThreshold)
+        {
+            effectiveMinVel = MathF.Min(effectiveMinVel, 0.25f);
+            effectiveMaxDays = Math.Max(effectiveMaxDays, 21);
+        }
+
+        // 1. Zero recorded recent sales AND zero velocity -> unrealistic (lone speculative listings don't count!)
+        if (hasQualitySchema && lastSaleUnix <= 0 && velocity <= 0.0001f)
         {
             return Build(false, true, $"No recent {(isHq ? "HQ" : "NQ")} sales");
         }
 
         // 2. Last sale was too long ago -> stale / dead market
-        var maxDays = Math.Max(1, cfg.MarketMaxDaysSinceLastSale);
-        if (hasQualitySchema && daysSinceLastSale > maxDays)
+        if (hasQualitySchema && lastSaleUnix > 0 && daysSinceLastSale > effectiveMaxDays)
         {
             return Build(false, true, $"Last sold {(int)Math.Floor(daysSinceLastSale)}d ago");
         }
 
-        // 3. Sale frequency below configured minimum
-        if (velocity < cfg.MarketMinVelocity)
+        // 3. Sale frequency below value-tiered minimum
+        if (velocity < effectiveMinVel)
         {
             return Build(false, true, $"Low demand ({velocity:0.00}/day)");
         }
@@ -115,19 +145,20 @@ public static class MarketViabilityEvaluator
             return Build(false, true, $"Inflated MB listing (median ~{soldMedian:N0}g)");
         }
 
-        // 5. Severe queue saturation: too many competing sellers relative to daily sales
+        // 5. Severe queue saturation: too many competing sellers relative to total daily sales
         var maxCompDays = Math.Max(5, cfg.MarketMaxCompetitionDays);
         if (listingCount >= 10 && estDaysToSell > maxCompDays)
         {
-            return Build(false, true, $"Oversupplied ({listingCount} listed, {velocity:0.0}/day)");
+            return Build(false, true, $"Oversupplied ({listingCount} listed, {combinedVel:0.0}/day)");
         }
 
-        // 6. Realistic price doesn't clear NPC vendor price or floor threshold
-        var floorPrice = Math.Max(cfg.MarketMinFloorUnitPrice, (int)Math.Min(int.MaxValue, npcPriceLow + 1L));
+        // 6. Realistic price must beat 5%-tax NPC vendor break-even AND minimum unit floor
+        var vendorBreakeven = ComputeVendorBreakevenPrice(npcPriceLow);
+        var floorPrice = Math.Max(cfg.MarketMinFloorUnitPrice, (int)Math.Min(int.MaxValue, vendorBreakeven));
         if (realisticUnit < floorPrice)
         {
-            var reason = npcPriceLow > 0 && realisticUnit <= npcPriceLow
-                ? $"MB (~{realisticUnit:N0}g) <= vendor ({npcPriceLow:N0}g)"
+            var reason = npcPriceLow > 0 && realisticUnit < vendorBreakeven
+                ? $"MB (~{realisticUnit:N0}g) <= vendor net ({vendorBreakeven:N0}g)"
                 : $"Below min unit floor ({realisticUnit:N0}g)";
             return Build(false, false, reason);
         }
@@ -158,14 +189,35 @@ public static class MarketViabilityEvaluator
             EstimatedDaysToSell: estDaysToSell);
     }
 
-    public static int ComputeRealisticUnitPrice(int serverCheapest, int soldMedian, bool requireHistoryOnZeroCheapest = true)
+    public static bool IsEmptySentinel(MarketPriceSnapshot mkt)
+        => mkt.ListingCount < 0
+            && mkt.MinPriceAny == 0
+            && mkt.MinPriceNq == 0
+            && mkt.MinPriceHq == 0
+            && mkt.RecentHistoryMedian == 0
+            && mkt.RecentHistoryMedianHq == 0;
+
+    public static int ComputeRealisticUnitPrice(
+        int serverCheapest,
+        int soldMedian,
+        float velocity = 0f,
+        bool hasQualitySchema = true)
     {
         if (serverCheapest > 0 && soldMedian > 0)
         {
-            // Cap speculative outlier listings that sit >3x above actual sold history
-            return serverCheapest > soldMedian * 3L
-                ? (int)Math.Min(int.MaxValue, Math.Round(soldMedian * 1.25))
-                : serverCheapest;
+            // Upward manipulation cap: ignore speculative listings >3x above actual sold history
+            if (serverCheapest > soldMedian * 3L)
+            {
+                return (int)Math.Min(int.MaxValue, Math.Round(soldMedian * 1.25));
+            }
+
+            // Downward bait/fat-finger floor: prevent a single 1-gil bait listing from collapsing a valuable item into Vendor/Remove
+            if (serverCheapest < soldMedian * 0.25)
+            {
+                return (int)Math.Min(int.MaxValue, Math.Round(soldMedian * 0.55));
+            }
+
+            return serverCheapest;
         }
 
         if (soldMedian > 0)
@@ -173,12 +225,18 @@ public static class MarketViabilityEvaluator
             return soldMedian;
         }
 
-        return requireHistoryOnZeroCheapest ? 0 : serverCheapest;
+        // If recentHistory was filled by the other quality, still allow serverCheapest when velocity confirms real sales
+        if (serverCheapest > 0 && (!hasQualitySchema || velocity > 0.0001f))
+        {
+            return serverCheapest;
+        }
+
+        return 0;
     }
 
     public static long ComputeUndercutPrice(long serverCheapest, long soldMedian, long npcPriceLow, int undercutGil)
     {
-        var baseFloor = Math.Max(2L, npcPriceLow + 1L);
+        var baseFloor = ComputeVendorBreakevenPrice(npcPriceLow);
         var panicDumpFloor = soldMedian > 0 ? (long)Math.Round(soldMedian * 0.55) : 0L;
         var floorPrice = Math.Max(baseFloor, panicDumpFloor);
         var effective = serverCheapest > 0 ? serverCheapest : soldMedian;
@@ -205,7 +263,7 @@ public static class MarketViabilityEvaluator
             return 0;
         }
 
-        var floorPrice = Math.Max(2L, npcPriceLow + 1L);
+        var floorPrice = ComputeVendorBreakevenPrice(npcPriceLow);
         var step = Math.Max(0, undercutGil);
         return Math.Max(floorPrice, liveCheapest - step);
     }
