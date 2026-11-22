@@ -27,7 +27,6 @@ public sealed class Plugin : IDalamudPlugin
     private readonly SettingsWindow settingsWindow;
     private readonly WorldHopPromptWindow worldHopPromptWindow;
     private readonly ItemTooltipController itemTooltipController;
-    private readonly InventoryHighlightController inventoryHighlightController;
     private readonly InventoryRouteOverlay inventoryRouteOverlay;
     private readonly ItemContextMenuController itemContextMenuController;
     private readonly ActiveListingAuditor activeListingAuditor;
@@ -78,6 +77,7 @@ public sealed class Plugin : IDalamudPlugin
         TransactionQueue = new SafeTransactionQueue(framework, clientState, objectTable, condition, gameGui, chatGui, log);
         MaterialTracker = new MaterialTrackerService(
             pluginInterface,
+            framework,
             Configuration,
             Holdings,
             dataManager,
@@ -106,7 +106,7 @@ public sealed class Plugin : IDalamudPlugin
             Safety,
             TriageEngine,
             MaterialTracker.GetMissingTrackedForRetainerWithdraw);
-        worldHopPromptWindow = new WorldHopPromptWindow(commandManager, chatGui, gameGui);
+        worldHopPromptWindow = new WorldHopPromptWindow(framework, commandManager, chatGui, gameGui);
         MarketBoardBuy = new MarketBoardBuyPlanner(
             pluginInterface,
             framework,
@@ -145,13 +145,13 @@ public sealed class Plugin : IDalamudPlugin
             TransactionQueue,
             MagicSort,
             BellSweep,
-            MarketBoardBuy);
+            MarketBoardBuy,
+            MaterialTracker);
 
         itemTooltipController = new ItemTooltipController(gameInteropProvider, gameGui, log, MagicSort);
         itemTooltipController.Enable();
 
-        inventoryHighlightController = new InventoryHighlightController(framework, gameGui, Configuration, MagicSort);
-        inventoryRouteOverlay = new InventoryRouteOverlay(gameGui, dataManager, Configuration, Safety, MagicSort);
+        inventoryRouteOverlay = new InventoryRouteOverlay(gameGui, Configuration, Safety, MagicSort);
         itemContextMenuController = new ItemContextMenuController(
             contextMenu,
             gameGui,
@@ -162,7 +162,7 @@ public sealed class Plugin : IDalamudPlugin
             TriageEngine,
             MagicSort,
             MaterialTracker,
-            inventoryHighlightController);
+            inventoryRouteOverlay);
         activeListingAuditor = new ActiveListingAuditor(
             dataManager,
             gameGui,
@@ -265,13 +265,13 @@ public sealed class Plugin : IDalamudPlugin
                     recipeNoteController = new RecipeNoteController(gameGui, MaterialTracker);
                     recipeNoteController.Enable();
 
-                    retainerController = new RetainerController(MagicSort, inventoryHighlightController, inventoryRouteOverlay);
+                    retainerController = new RetainerController(MagicSort, inventoryRouteOverlay);
                     retainerController.Enable();
 
                     marketBoardController = new MarketBoardController(MarketBoardBuy);
                     marketBoardController.Enable();
 
-                    magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryHighlightController, inventoryRouteOverlay);
+                    magicSortControllers = new MagicSortControllers(MagicSort, BellSweep, inventoryRouteOverlay);
                     magicSortControllers.Enable();
 
                     trackerOverlay = new MaterialTrackerOverlay(
@@ -367,7 +367,7 @@ public sealed class Plugin : IDalamudPlugin
                 break;
 
             case "use":
-                MagicSort.ExecuteUseAll();
+                MagicActions.Execute(MagicActionIntent.Use);
                 break;
 
             case "track":
@@ -382,17 +382,8 @@ public sealed class Plugin : IDalamudPlugin
             }
 
             case "stop":
-            {
-                var stoppedCraft = MaterialTracker.StopPendingCraft();
-                var hadAction = MagicActions.IsAnythingActive;
                 MagicActions.Execute(MagicActionIntent.Stop);
-                if (stoppedCraft && !hadAction)
-                {
-                    chatGui.Print("Stopped pending Quick Synthesis.");
-                }
-
                 break;
-            }
 
             default:
                 chatGui.Print("Usage: /m [sort | sell | buy | track <recipe> [qty] | use | stop | scan | status]");
@@ -435,9 +426,6 @@ public sealed class Plugin : IDalamudPlugin
         commandManager.RemoveHandler(MagicShortCommandName);
         itemContextMenuController.Dispose();
 
-        // Dispose each native UI controller independently BEFORE highlight/overlay/services so
-        // one failure cannot leak subsequent controllers and DetachButton hover-clear callbacks
-        // never touch already-disposed services.
         DisposeQuietly(localTracker, nameof(MaterialTrackerOverlay));
         DisposeQuietly(localMagicSort, nameof(MagicSortControllers));
         DisposeQuietly(localMarketBoard, nameof(MarketBoardController));
@@ -445,13 +433,15 @@ public sealed class Plugin : IDalamudPlugin
         DisposeQuietly(localRecipeNote, nameof(RecipeNoteController));
 
         inventoryRouteOverlay.Dispose();
-        inventoryHighlightController.Dispose();
         itemTooltipController.Dispose();
+        worldHopPromptWindow.Dispose();
         MagicActions.Dispose();
         MarketBoardBuy.Dispose();
         BellSweep.Dispose();
         MagicSort.Dispose();
         TriageEngine.Dispose();
+        MaterialTracker.Dispose();
+        Holdings.Dispose();
         Universalis.Dispose();
         TransactionQueue.Dispose();
 

@@ -16,7 +16,9 @@ namespace MagicInventory.Services
         long TargetPriceHq,
         long NpcSellPrice,
         bool Untradable,
-        string Reason);
+        string Reason,
+        bool IsPendingRefresh = false,
+        bool NeedsRetainerVisit = false);
 
     public sealed record MagicSortButtonState(
         bool IsVisible,
@@ -65,7 +67,8 @@ namespace MagicInventory.Services.MagicSort
         uint BaseItemId,
         string Name,
         int Quantity,
-        uint NpcUnitPrice);
+        uint NpcUnitPrice,
+        bool IsUniqueAndUntradable = false);
 
     public sealed record GrandCompanyPlanItem(
         InventoryType Container,

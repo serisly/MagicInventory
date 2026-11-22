@@ -25,13 +25,6 @@ public sealed record InventorySortMove(
     uint BaseItemId,
     string Name);
 
-/// <summary>
-/// Safe Bag <-> Armoury Chest organizer + partial stack consolidator.
-/// Never runs native /isort (preserves the player's personal bag layout).
-/// - Merges split partial stacks of identical items inside Bags.
-/// - Pulls non-Keep gear (Market, Vendor, GC Seals, Glamour Dresser, Armoire, Retainer) out of Armoury Chest into Bags.
-/// - Moves Keep gear from Bags into its matching Armoury Chest tab when space is available.
-/// </summary>
 public sealed unsafe class InventorySortPlanner
 {
     private const int MaxMovesPerClick = 20;
@@ -40,17 +33,20 @@ public sealed unsafe class InventorySortPlanner
     private readonly ICondition condition;
     private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
+    private readonly SlotRouteResolver routeResolver;
 
     public InventorySortPlanner(
         IDataManager dataManager,
         ICondition condition,
         SafeTransactionQueue transactionQueue,
-        InventorySafetyEvaluator safety)
+        InventorySafetyEvaluator safety,
+        SlotRouteResolver routeResolver)
     {
         this.dataManager = dataManager;
         this.condition = condition;
         this.transactionQueue = transactionQueue;
         this.safety = safety;
+        this.routeResolver = routeResolver;
     }
 
     public List<InventorySortMove> PlanMoves(int maxMoves, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
@@ -64,10 +60,10 @@ public sealed unsafe class InventorySortPlanner
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
+        var missingTracked = routeResolver.CaptureMissingTrackedSnapshot();
         var usedSrc = new HashSet<(InventoryType Container, int Slot)>();
 
-        // Count current free slots in Bags and in each Armoury container
         var bagFreeSlots = CountEmptySlots(manager, InventorySafetyEvaluator.PlayerBagContainers);
         var armouryFreeByType = new Dictionary<InventoryType, int>();
         foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
@@ -75,9 +71,6 @@ public sealed unsafe class InventorySortPlanner
             armouryFreeByType[armType] = CountEmptySlots(manager, [armType]);
         }
 
-        armouryFreeByType[InventoryType.ArmorySoulCrystal] = CountEmptySlots(manager, [InventoryType.ArmorySoulCrystal]);
-
-        // 1. Merge split partial stacks inside Bags (identical RawItemId + full Flags; NEVER merge Collectables!)
         var partialStacks = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<(InventoryType Container, int Slot, int Qty, int StackSize, uint BaseId, string Name)>>();
         foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
         {
@@ -125,7 +118,6 @@ public sealed unsafe class InventorySortPlanner
                 continue;
             }
 
-            // Merge later partial stacks into the earliest partial stack
             var dst = list[0];
             var dstQty = dst.Qty;
             for (var k = 1; k < list.Count && moves.Count < maxMoves; k++)
@@ -157,7 +149,6 @@ public sealed unsafe class InventorySortPlanner
                 }
                 else
                 {
-                    // dst is now full and src still holds a remainder: promote src as the next destination!
                     dst = (src.Container, src.Slot, src.Qty - merged, src.StackSize, src.BaseId, src.Name);
                     dstQty = dst.Qty;
                 }
@@ -166,8 +157,6 @@ public sealed unsafe class InventorySortPlanner
 
         void PlanArmouryToBag()
         {
-            // Armoury Chest -> Bags ONLY for Market, Vendor, and Retainer gear
-            // (GC Seals turns in straight from Armoury Chest; Glamour/Armoire stay in Armoury until you visit an Inn)
             foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
             {
                 if (moves.Count >= maxMoves || bagFreeSlots <= 0)
@@ -195,32 +184,23 @@ public sealed unsafe class InventorySortPlanner
                     }
 
                     var rawId = slot->ItemId;
+                    var resolved = routeResolver.ResolveSlot(
+                        rawId,
+                        armType,
+                        slot,
+                        manifestEntries,
+                        gearsetIds,
+                        unlockedProfile,
+                        includeBagToArmouryRoute: false,
+                        missingTracked: missingTracked);
+                    if (!resolved.HasValue || resolved.Value.Route is not ("Market" or "Vendor" or "Retainer"))
+                    {
+                        continue;
+                    }
+
                     var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
-                    if (!ItemIdentity.CanLockOrTagBaseId(baseId)
-                        || gearsetIds.Contains(baseId)
-                        || safety.IsItemTracked(baseId))
-                    {
-                        continue;
-                    }
-
                     var row = itemSheet.GetRowOrDefault(baseId);
-                    if (row is null || row.Value.Rarity >= 4)
-                    {
-                        continue;
-                    }
-
-                    if (InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
-                    {
-                        continue;
-                    }
-
-                    if (!manifestEntries.TryGetValue(baseId, out var entry))
-                    {
-                        continue;
-                    }
-
-                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                    if (effRoute is not ("Market" or "Vendor" or "Retainer"))
+                    if (row is null)
                     {
                         continue;
                     }
@@ -229,7 +209,7 @@ public sealed unsafe class InventorySortPlanner
                         InventorySortMoveKind.ArmouryToBag,
                         armType,
                         i,
-                        InventoryType.Inventory1, // Actual live empty bag slot is resolved at dispatch time
+                        InventoryType.Inventory1,
                         -1,
                         rawId,
                         baseId,
@@ -243,7 +223,6 @@ public sealed unsafe class InventorySortPlanner
 
         void PlanBagToArmoury()
         {
-            // Bags -> Armoury Chest for Keep gear when target Armoury tab has free space
             foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
             {
                 if (moves.Count >= maxMoves)
@@ -272,11 +251,6 @@ public sealed unsafe class InventorySortPlanner
 
                     var rawId = slot->ItemId;
                     var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
-                    if (!ItemIdentity.CanLockOrTagBaseId(baseId))
-                    {
-                        continue;
-                    }
-
                     var row = itemSheet.GetRowOrDefault(baseId);
                     if (row is null || row.Value.EquipSlotCategory.RowId == 0)
                     {
@@ -289,31 +263,16 @@ public sealed unsafe class InventorySortPlanner
                         continue;
                     }
 
-                    // Only move confirmed Keep gear into Armoury Chest (skip pending-price/visit placeholder Keep entries!)
-                    string effectiveRoute = "Keep";
-                    if (!gearsetIds.Contains(baseId)
-                        && !safety.IsItemTracked(baseId)
-                        && !ItemIdentity.IsSoulCrystal(row.Value)
-                        && row.Value.Rarity < 4
-                        && manifestEntries.TryGetValue(baseId, out var entry))
-                    {
-                        if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
-                        {
-                            var isPending = entry.Reason.StartsWith("Checking ", StringComparison.OrdinalIgnoreCase)
-                                || entry.Reason.StartsWith("Open a Summoning Bell", StringComparison.OrdinalIgnoreCase)
-                                || entry.Reason.StartsWith("Visit each retainer", StringComparison.OrdinalIgnoreCase);
-                            if (isPending)
-                            {
-                                continue;
-                            }
-                        }
-                        else
-                        {
-                            effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedTop) ?? "Keep";
-                        }
-                    }
-
-                    if (!string.Equals(effectiveRoute, "Keep", StringComparison.OrdinalIgnoreCase))
+                    var resolved = routeResolver.ResolveSlot(
+                        rawId,
+                        bag,
+                        slot,
+                        manifestEntries,
+                        gearsetIds,
+                        unlockedProfile,
+                        includeBagToArmouryRoute: true,
+                        missingTracked: missingTracked);
+                    if (!resolved.HasValue || !string.Equals(resolved.Value.Route, "Armoury", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -334,7 +293,6 @@ public sealed unsafe class InventorySortPlanner
             }
         }
 
-        // When bags have free space, clear outgoing Armoury gear FIRST so full Armoury tabs make room for Keep gear!
         if (bagFreeSlots > 0)
         {
             PlanArmouryToBag();
@@ -356,20 +314,28 @@ public sealed unsafe class InventorySortPlanner
         }
     }
 
+    public List<(InventoryType Container, int Slot)> GetPlannedMoveSlots(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+    {
+        var moves = PlanMoves(MaxMovesPerClick, manifestEntries);
+        var slots = new List<(InventoryType, int)>(moves.Count);
+        foreach (var move in moves)
+        {
+            slots.Add((move.SrcContainer, move.SrcSlot));
+        }
+
+        return slots;
+    }
+
     public int CountPlannedMoves(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
         => PlanMoves(MaxMovesPerClick, manifestEntries).Count;
 
-    public bool Execute(
+    public List<TransactionStep> BuildSteps(
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
-        out string statusMessage,
-        System.Action? onCompleted = null)
+        out int moveCount,
+        out string statusMessage)
     {
+        moveCount = 0;
         statusMessage = string.Empty;
-        if (transactionQueue.IsBusy)
-        {
-            statusMessage = "Busy — wait for the current action to finish.";
-            return false;
-        }
 
         if (condition[ConditionFlag.InCombat]
             || condition[ConditionFlag.Casting]
@@ -378,22 +344,24 @@ public sealed unsafe class InventorySortPlanner
             || condition[ConditionFlag.OccupiedInCutSceneEvent])
         {
             statusMessage = "Cannot sort bags right now.";
-            return false;
+            return new List<TransactionStep>();
         }
 
         var plan = PlanMoves(MaxMovesPerClick, manifestEntries);
         if (plan.Count == 0)
         {
             statusMessage = "Bags and Armoury Chest are already tidy. Visit a Summoning Bell for retainer items.";
-            return false;
+            return new List<TransactionStep>();
         }
 
+        moveCount = plan.Count;
         var steps = new List<TransactionStep>(plan.Count);
         foreach (var move in plan)
         {
             var captured = move;
             var expectedQtyBefore = 0;
             var dispatched = false;
+            var skipped = false;
 
             steps.Add(new TransactionStep(
                 $"Move {captured.Name}",
@@ -409,8 +377,7 @@ public sealed unsafe class InventorySortPlanner
                     var srcSlot = InventorySafetyEvaluator.GetSlot(mgr, captured.SrcContainer, captured.SrcSlot);
                     if (srcSlot == null || srcSlot->ItemId != captured.RawItemId || srcSlot->Quantity <= 0)
                     {
-                        dispatched = true;
-                        expectedQtyBefore = 0;
+                        skipped = true;
                         return true;
                     }
 
@@ -422,9 +389,15 @@ public sealed unsafe class InventorySortPlanner
                         dstContainer = captured.DstContainer;
                         dstSlot = captured.DstSlot;
                         var dst = InventorySafetyEvaluator.GetSlot(mgr, dstContainer, dstSlot);
-                        if (dst == null || dst->ItemId != captured.RawItemId || dst->Flags != srcSlot->Flags)
+                        var row = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(captured.BaseItemId);
+                        var maxStack = row is not null ? (int)Math.Max(1, row.Value.StackSize) : 1;
+                        if (dst == null
+                            || dst->ItemId != captured.RawItemId
+                            || dst->Flags != srcSlot->Flags
+                            || dst->Quantity >= maxStack)
                         {
-                            return false;
+                            skipped = true;
+                            return true;
                         }
                     }
                     else if (captured.Kind == InventorySortMoveKind.ArmouryToBag)
@@ -440,6 +413,7 @@ public sealed unsafe class InventorySortPlanner
                         dstContainer = captured.DstContainer;
                         if (!TryFindFirstEmptySlot(mgr, dstContainer, out dstSlot))
                         {
+                            transactionQueue.Cancel("Stopped: Armoury Chest tab is full.", QueueBatchOutcome.AbortedOnError);
                             return false;
                         }
                     }
@@ -451,6 +425,11 @@ public sealed unsafe class InventorySortPlanner
                 },
                 HasServerAck: () =>
                 {
+                    if (skipped)
+                    {
+                        return true;
+                    }
+
                     if (!dispatched)
                     {
                         return false;
@@ -469,13 +448,7 @@ public sealed unsafe class InventorySortPlanner
                 TimeoutSeconds: 4.5));
         }
 
-        if (!transactionQueue.TryEnqueueBatch(steps, out var reason, onCompleted))
-        {
-            statusMessage = string.IsNullOrWhiteSpace(reason) ? "Unable to start bag sort." : reason;
-            return false;
-        }
-
-        return true;
+        return steps;
     }
 
     private static int CountEmptySlots(InventoryManager* mgr, ReadOnlySpan<InventoryType> containers)

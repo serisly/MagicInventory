@@ -1,10 +1,7 @@
-﻿using System;
+using System;
 using System.Numerics;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
-using KamiToolKit.Controllers;
-using KamiToolKit.Enums;
-using KamiToolKit.Nodes;
 using MagicInventory.Core;
 using MagicInventory.Services;
 using MagicInventory.Services.MagicSort;
@@ -13,215 +10,193 @@ namespace MagicInventory.UI;
 
 public sealed unsafe class MagicSortControllers : IDisposable
 {
-    private readonly MagicSortAddonBinding<AtkUnitBase> retainerListSortController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> retainerListSellController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> retainerSellListController;
-    private readonly MagicSortAddonBinding<AddonShop> shopController;
-    private readonly MagicSortAddonBinding<AddonGrandCompanySupplyList> grandCompanyController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> materializeController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> cabinetController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> glamourDresserController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionSortController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeSortController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalSortController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryExpansionUseController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryLargeUseController;
-    private readonly MagicSortAddonBinding<AtkUnitBase> inventoryNormalUseController;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> retainerListGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> retainerSellListGroup;
+    private readonly NativeAddonButtonGroup<AddonShop> shopGroup;
+    private readonly NativeAddonButtonGroup<AddonGrandCompanySupplyList> grandCompanyGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> materializeGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> cabinetGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> glamourDresserGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> inventoryExpansionGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> inventoryLargeGroup;
+    private readonly NativeAddonButtonGroup<AtkUnitBase> inventoryNormalGroup;
 
     public MagicSortControllers(
         MagicSortService magicSort,
         BellSweepService bellSweep,
-        InventoryHighlightController highlightController,
         InventoryRouteOverlay routeOverlay)
     {
-        retainerListSortController = new MagicSortAddonBinding<AtkUnitBase>(
+        retainerListGroup = new NativeAddonButtonGroup<AtkUnitBase>(
             "RetainerList",
-            bellSweep.GetBellSortButtonState,
-            bellSweep.ToggleBellSort,
-            addon => addon->RootNode,
-            addon =>
-            {
-                const float btnW = 128f;
-                const float btnH = 28f;
-                var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
-                var rootH = addon != null && addon->RootNode != null ? Math.Max(220f, addon->RootNode->Height) : 360f;
-                // Place side-by-side left of Magic Sell on bottom-right so native "Items for Sale / Venture / Comment" labels stay clear
-                var x = Math.Max(16f, rootW - 18f - btnW - 8f - btnW);
-                var y = Math.Max(16f, rootH - 50f);
-                return (new Vector2(x, y), new Vector2(btnW, btnH));
-            },
-            hovered =>
-            {
-                highlightController.SetHoveredSellAddon("RetainerList:Sort", hovered);
-                routeOverlay.SetHoveredInventorySortAddon("RetainerList", hovered);
-            });
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Sort",
+                bellSweep.GetBellSortButtonState,
+                bellSweep.ToggleBellSort,
+                static addon => addon->RootNode,
+                static addon =>
+                {
+                    const float btnW = 128f;
+                    const float btnH = 28f;
+                    var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
+                    var rootH = addon != null && addon->RootNode != null ? Math.Max(220f, addon->RootNode->Height) : 360f;
+                    var x = Math.Max(16f, rootW - 18f - btnW - 8f - btnW);
+                    var y = Math.Max(16f, rootH - 50f);
+                    return (new Vector2(x, y), new Vector2(btnW, btnH));
+                },
+                hovered => routeOverlay.SetHoveredSellAddon("RetainerList:Sort", hovered)),
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Sell",
+                bellSweep.GetBellSellButtonState,
+                bellSweep.ToggleBellSell,
+                static addon => addon->RootNode,
+                static addon =>
+                {
+                    const float btnW = 128f;
+                    const float btnH = 28f;
+                    var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
+                    var rootH = addon != null && addon->RootNode != null ? Math.Max(220f, addon->RootNode->Height) : 360f;
+                    var x = Math.Max(16f, rootW - 18f - btnW);
+                    var y = Math.Max(16f, rootH - 50f);
+                    return (new Vector2(x, y), new Vector2(btnW, btnH));
+                },
+                hovered => routeOverlay.SetHoveredSellAddon("RetainerList:Sell", hovered)));
 
-        retainerListSellController = new MagicSortAddonBinding<AtkUnitBase>(
-            "RetainerList",
-            bellSweep.GetBellSellButtonState,
-            bellSweep.ToggleBellSell,
-            addon => addon->RootNode,
-            addon =>
-            {
-                const float btnW = 128f;
-                const float btnH = 28f;
-                var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
-                var rootH = addon != null && addon->RootNode != null ? Math.Max(220f, addon->RootNode->Height) : 360f;
-                var x = Math.Max(16f, rootW - 18f - btnW);
-                var y = Math.Max(16f, rootH - 50f);
-                return (new Vector2(x, y), new Vector2(btnW, btnH));
-            },
-            hovered => highlightController.SetHoveredSellAddon("RetainerList:Sell", hovered));
-
-        retainerSellListController = new MagicSortAddonBinding<AtkUnitBase>(
+        retainerSellListGroup = new NativeAddonButtonGroup<AtkUnitBase>(
             "RetainerSellList",
-            magicSort.GetMarketSortButtonState,
-            magicSort.ExecuteMarketSort,
-            addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: true),
-            hovered => highlightController.SetHoveredSellAddon("RetainerSellList", hovered));
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Sell",
+                magicSort.GetMarketSortButtonState,
+                magicSort.ExecuteMarketSort,
+                static addon => addon->RootNode,
+                static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 138f, 28f, preferRightSide: true),
+                hovered => routeOverlay.SetHoveredSellAddon("RetainerSellList", hovered)));
 
-        shopController = new MagicSortAddonBinding<AddonShop>(
+        shopGroup = new NativeAddonButtonGroup<AddonShop>(
             "Shop",
-            magicSort.GetVendorSortButtonState,
-            magicSort.ExecuteVendorSort,
-            addon => addon->AtkUnitBase.RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(&addon->AtkUnitBase, 134f, 28f, preferRightSide: false),
-            hovered => highlightController.SetHoveredSellAddon("Shop", hovered));
+            static a => &a->AtkUnitBase,
+            new NativeAddonButtonGroup<AddonShop>.ButtonSpec(
+                "Magic Sell",
+                magicSort.GetVendorSortButtonState,
+                magicSort.ExecuteVendorSort,
+                static addon => addon->AtkUnitBase.RootNode,
+                static addon => NativeUiHelpers.ResolveBottomMarginPosition(&addon->AtkUnitBase, 134f, 28f, preferRightSide: false),
+                hovered => routeOverlay.SetHoveredSellAddon("Shop", hovered)));
 
-        grandCompanyController = new MagicSortAddonBinding<AddonGrandCompanySupplyList>(
+        grandCompanyGroup = new NativeAddonButtonGroup<AddonGrandCompanySupplyList>(
             "GrandCompanySupplyList",
-            magicSort.GetGrandCompanySortButtonState,
-            magicSort.ExecuteGrandCompanySort,
-            addon => addon->AtkUnitBase.RootNode,
-            ResolveGrandCompanyPosition,
-            hovered => highlightController.SetHoveredSellAddon("GrandCompanySupplyList", hovered));
+            static a => &a->AtkUnitBase,
+            new NativeAddonButtonGroup<AddonGrandCompanySupplyList>.ButtonSpec(
+                "Magic Sell",
+                magicSort.GetGrandCompanySortButtonState,
+                magicSort.ExecuteGrandCompanySort,
+                static addon => addon->AtkUnitBase.RootNode,
+                ResolveGrandCompanyPosition,
+                hovered => routeOverlay.SetHoveredSellAddon("GrandCompanySupplyList", hovered)));
 
-        materializeController = new MagicSortAddonBinding<AtkUnitBase>(
+        materializeGroup = new NativeAddonButtonGroup<AtkUnitBase>(
             "Materialize",
-            magicSort.GetMateriaExtractButtonState,
-            magicSort.ExecuteMateriaExtractSort,
-            addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false));
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Extract All",
+                magicSort.GetMateriaExtractButtonState,
+                magicSort.ExecuteMateriaExtractSort,
+                static addon => addon->RootNode,
+                static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false)));
 
-        cabinetController = new MagicSortAddonBinding<AtkUnitBase>(
+        cabinetGroup = new NativeAddonButtonGroup<AtkUnitBase>(
             "Cabinet",
-            magicSort.GetArmoireStoreButtonState,
-            magicSort.ExecuteArmoireStore,
-            addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: true),
-            hovered => highlightController.SetHoveredSellAddon("Cabinet", hovered));
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Store",
+                magicSort.GetArmoireStoreButtonState,
+                magicSort.ExecuteArmoireStore,
+                static addon => addon->RootNode,
+                static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: true),
+                hovered => routeOverlay.SetHoveredSellAddon("Cabinet", hovered)));
 
-        glamourDresserController = new MagicSortAddonBinding<AtkUnitBase>(
+        glamourDresserGroup = new NativeAddonButtonGroup<AtkUnitBase>(
             "MiragePrismPrismBoxCrystallize",
-            magicSort.GetGlamourDresserButtonState,
-            magicSort.ExecuteGlamourDresserStore,
-            addon => addon->RootNode,
-            addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 126f, 26f, preferRightSide: false),
-            hovered =>
-            {
-                highlightController.SetHoveredSellAddon("MiragePrismPrismBoxCrystallize", hovered);
-                routeOverlay.SetGlamourListHover(hovered);
-            });
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Store",
+                magicSort.GetGlamourDresserButtonState,
+                magicSort.ExecuteGlamourDresserStore,
+                static addon => addon->RootNode,
+                static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 126f, 26f, preferRightSide: false),
+                hovered =>
+                {
+                    routeOverlay.SetHoveredSellAddon("MiragePrismPrismBoxCrystallize", hovered);
+                    routeOverlay.SetGlamourListHover(hovered);
+                }));
 
-        inventoryExpansionSortController = new MagicSortAddonBinding<AtkUnitBase>(
-            "InventoryExpansion",
-            magicSort.GetInventorySortButtonState,
-            magicSort.ExecuteInventorySort,
-            addon => addon->RootNode,
-            ResolveInventorySortPosition,
-            hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryExpansion", hovered));
+        inventoryExpansionGroup = CreateInventoryGroup("InventoryExpansion", magicSort, routeOverlay);
+        inventoryLargeGroup = CreateInventoryGroup("InventoryLarge", magicSort, routeOverlay);
+        inventoryNormalGroup = CreateInventoryGroup("Inventory", magicSort, routeOverlay);
+    }
 
-        inventoryLargeSortController = new MagicSortAddonBinding<AtkUnitBase>(
-            "InventoryLarge",
-            magicSort.GetInventorySortButtonState,
-            magicSort.ExecuteInventorySort,
-            addon => addon->RootNode,
-            ResolveInventorySortPosition,
-            hovered => routeOverlay.SetHoveredInventorySortAddon("InventoryLarge", hovered));
+    private static NativeAddonButtonGroup<AtkUnitBase> CreateInventoryGroup(
+        string addonName,
+        MagicSortService magicSort,
+        InventoryRouteOverlay routeOverlay)
+    {
+        return new NativeAddonButtonGroup<AtkUnitBase>(
+            addonName,
+            static a => a,
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Magic Sort",
+                magicSort.GetInventorySortButtonState,
+                magicSort.ExecuteInventorySort,
+                static addon => addon->RootNode,
+                ResolveInventorySortPosition,
+                hovered => routeOverlay.SetHoveredInventorySortAddon(addonName, hovered)),
+            new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
+                "Use All",
+                magicSort.GetUseAllButtonState,
+                magicSort.ExecuteUseAll,
+                static addon => addon->RootNode,
+                ResolveInventoryUsePosition,
+                hovered => routeOverlay.SetHoveredSellAddon(addonName, hovered)));
+    }
 
-        inventoryNormalSortController = new MagicSortAddonBinding<AtkUnitBase>(
-            "Inventory",
-            magicSort.GetInventorySortButtonState,
-            magicSort.ExecuteInventorySort,
-            addon => addon->RootNode,
-            ResolveInventorySortPosition,
-            hovered => routeOverlay.SetHoveredInventorySortAddon("Inventory", hovered));
-
-        inventoryExpansionUseController = new MagicSortAddonBinding<AtkUnitBase>(
-            "InventoryExpansion",
-            magicSort.GetUseAllButtonState,
-            magicSort.ExecuteUseAll,
-            addon => addon->RootNode,
-            ResolveInventoryUsePosition,
-            hovered => highlightController.SetHoveredSellAddon("InventoryExpansion", hovered));
-
-        inventoryLargeUseController = new MagicSortAddonBinding<AtkUnitBase>(
-            "InventoryLarge",
-            magicSort.GetUseAllButtonState,
-            magicSort.ExecuteUseAll,
-            addon => addon->RootNode,
-            ResolveInventoryUsePosition,
-            hovered => highlightController.SetHoveredSellAddon("InventoryLarge", hovered));
-
-        inventoryNormalUseController = new MagicSortAddonBinding<AtkUnitBase>(
-            "Inventory",
-            magicSort.GetUseAllButtonState,
-            magicSort.ExecuteUseAll,
-            addon => addon->RootNode,
-            ResolveInventoryUsePosition,
-            hovered => highlightController.SetHoveredSellAddon("Inventory", hovered));
+    private static (Vector2 SortPos, Vector2 SortSize, Vector2 UsePos, Vector2 UseSize) ResolveCompactInventoryHeaderLayout(float rootW)
+    {
+        var rightLimit = Math.Max(140f, rootW - 62f);
+        var avail = Math.Max(110f, rightLimit - 66f);
+        const float gap = 3f;
+        var sortW = Math.Clamp((avail - gap) * 0.54f, 64f, 94f);
+        var useW = Math.Clamp(avail - gap - sortW, 56f, 82f);
+        var useX = Math.Max(4f, rightLimit - useW);
+        var sortX = Math.Max(4f, useX - gap - sortW);
+        return (new Vector2(sortX, 8f), new Vector2(sortW, 22f), new Vector2(useX, 8f), new Vector2(useW, 22f));
     }
 
     private static (Vector2 Position, Vector2 Size) ResolveInventorySortPosition(AtkUnitBase* addon)
     {
-        // Reserve combined 224px span (114px Sort + 6px gap + 104px Use All) so both buttons stay clear of native footer buttons
+        var rootW = addon != null && addon->RootNode != null ? addon->RootNode->Width : 560f;
+        if (rootW < 420f)
+        {
+            var layout = ResolveCompactInventoryHeaderLayout(rootW);
+            return (layout.SortPos, layout.SortSize);
+        }
+
         var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 224f, 26f, preferRightSide: false);
         return (basePos, new Vector2(114f, 26f));
     }
 
     private static (Vector2 Position, Vector2 Size) ResolveInventoryUsePosition(AtkUnitBase* addon)
     {
+        var rootW = addon != null && addon->RootNode != null ? addon->RootNode->Width : 560f;
+        if (rootW < 420f)
+        {
+            var layout = ResolveCompactInventoryHeaderLayout(rootW);
+            return (layout.UsePos, layout.UseSize);
+        }
+
         var (basePos, _) = NativeUiHelpers.ResolveBottomMarginPosition(addon, 224f, 26f, preferRightSide: false);
-        var rootW = addon != null && addon->RootNode != null ? Math.Max(320f, addon->RootNode->Width) : 560f;
         var useX = Math.Clamp(basePos.X + 120f, 12f, Math.Max(12f, rootW - 104f - 12f));
         return (new Vector2(useX, basePos.Y), new Vector2(104f, 26f));
-    }
-
-    public void Enable()
-    {
-        retainerListSortController.Enable();
-        retainerListSellController.Enable();
-        retainerSellListController.Enable();
-        shopController.Enable();
-        grandCompanyController.Enable();
-        materializeController.Enable();
-        cabinetController.Enable();
-        glamourDresserController.Enable();
-        inventoryExpansionSortController.Enable();
-        inventoryLargeSortController.Enable();
-        inventoryNormalSortController.Enable();
-        inventoryExpansionUseController.Enable();
-        inventoryLargeUseController.Enable();
-        inventoryNormalUseController.Enable();
-    }
-
-    public void Dispose()
-    {
-        retainerListSortController.Dispose();
-        retainerListSellController.Dispose();
-        retainerSellListController.Dispose();
-        shopController.Dispose();
-        grandCompanyController.Dispose();
-        materializeController.Dispose();
-        cabinetController.Dispose();
-        glamourDresserController.Dispose();
-        inventoryExpansionSortController.Dispose();
-        inventoryLargeSortController.Dispose();
-        inventoryNormalSortController.Dispose();
-        inventoryExpansionUseController.Dispose();
-        inventoryLargeUseController.Dispose();
-        inventoryNormalUseController.Dispose();
     }
 
     private static (Vector2 Position, Vector2 Size) ResolveGrandCompanyPosition(AddonGrandCompanySupplyList* addon)
@@ -250,200 +225,31 @@ public sealed unsafe class MagicSortControllers : IDisposable
         return NativeUiHelpers.ResolveBottomMarginPosition(unit, width, height, preferRightSide);
     }
 
-    private sealed class MagicSortAddonBinding<TAddon> : IDisposable
-        where TAddon : unmanaged
+    public void Enable()
     {
-        public delegate AtkResNode* RootNodeResolver(TAddon* addon);
-        public delegate (Vector2 Position, Vector2 Size) PlacementResolver(TAddon* addon);
+        retainerListGroup.Enable();
+        retainerSellListGroup.Enable();
+        shopGroup.Enable();
+        grandCompanyGroup.Enable();
+        materializeGroup.Enable();
+        cabinetGroup.Enable();
+        glamourDresserGroup.Enable();
+        inventoryExpansionGroup.Enable();
+        inventoryLargeGroup.Enable();
+        inventoryNormalGroup.Enable();
+    }
 
-        private readonly Func<MagicSortButtonState> getState;
-        private readonly Action onClick;
-        private readonly RootNodeResolver getRootNode;
-        private readonly PlacementResolver resolvePlacement;
-        private readonly Action<bool>? onHoverChanged;
-        private readonly AddonController<TAddon> controller;
-
-        private TextButtonNode? button;
-        private string lastLabel = string.Empty;
-        private string lastTooltip = string.Empty;
-        private bool? lastEnabled;
-        private bool? lastVisible;
-        private float lastRootWidth;
-        private float lastRootHeight;
-
-        public MagicSortAddonBinding(
-            string addonName,
-            Func<MagicSortButtonState> getState,
-            Action onClick,
-            RootNodeResolver getRootNode,
-            PlacementResolver resolvePlacement,
-            Action<bool>? onHoverChanged = null)
-        {
-            this.getState = getState;
-            this.onClick = onClick;
-            this.getRootNode = getRootNode;
-            this.resolvePlacement = resolvePlacement;
-            this.onHoverChanged = onHoverChanged;
-
-            controller = new AddonController<TAddon>
-            {
-                AddonName = addonName,
-                OnSetup = OnSetup,
-                OnRefresh = OnRefresh,
-                OnUpdate = SyncState,
-                OnFinalize = OnFinalize,
-            };
-        }
-
-        public void Enable() => controller.Enable();
-
-        private void OnSetup(TAddon* addon)
-        {
-            DetachButton();
-
-            if (addon == null)
-            {
-                return;
-            }
-
-            var rootNode = getRootNode(addon);
-            if (rootNode == null)
-            {
-                return;
-            }
-
-            lastRootWidth = rootNode->Width;
-            lastRootHeight = rootNode->Height;
-            var (pos, size) = resolvePlacement(addon);
-            button = new TextButtonNode
-            {
-                Position = pos,
-                Size = size,
-                String = "Magic Sort",
-                IsVisible = false,
-                OnClick = () =>
-                {
-                    onHoverChanged?.Invoke(false);
-                    onClick();
-                },
-            };
-            if (onHoverChanged != null)
-            {
-                button.AddEvent(AtkEventType.MouseOver, () => onHoverChanged(true));
-                button.AddEvent(AtkEventType.MouseOut, () => onHoverChanged(false));
-            }
-
-            button.AttachNode(rootNode, NodePosition.AsLastChild);
-
-            ResetCache();
-            SyncState(addon);
-        }
-
-        private void OnRefresh(TAddon* addon)
-        {
-            if (addon != null && button != null)
-            {
-                var rootNode = getRootNode(addon);
-                if (rootNode != null
-                    && (MathF.Abs(rootNode->Width - lastRootWidth) > 1f
-                        || MathF.Abs(rootNode->Height - lastRootHeight) > 1f))
-                {
-                    lastRootWidth = rootNode->Width;
-                    lastRootHeight = rootNode->Height;
-                    var (pos, size) = resolvePlacement(addon);
-                    button.Position = pos;
-                    button.Size = size;
-                }
-            }
-
-            SyncState(addon);
-        }
-
-        private void SyncState(TAddon* addon)
-        {
-            if (addon == null)
-            {
-                return;
-            }
-
-            // Persistent addons like InventoryExpansion stay allocated while hidden; attach lazily on first visible update
-            if (button == null)
-            {
-                OnSetup(addon);
-                return;
-            }
-
-            var state = getState();
-            if (lastVisible != state.IsVisible)
-            {
-                lastVisible = state.IsVisible;
-                button.IsVisible = state.IsVisible;
-                if (!state.IsVisible)
-                {
-                    onHoverChanged?.Invoke(false);
-                }
-            }
-
-            if (!state.IsVisible)
-            {
-                return;
-            }
-
-            if (lastEnabled != state.IsEnabled)
-            {
-                lastEnabled = state.IsEnabled;
-                button.IsEnabled = state.IsEnabled;
-                if (!state.IsEnabled)
-                {
-                    onHoverChanged?.Invoke(false);
-                }
-            }
-
-            if (lastLabel != state.Label)
-            {
-                lastLabel = state.Label;
-                button.String = state.Label;
-            }
-
-            var tip = state.Tooltip ?? string.Empty;
-            if (lastTooltip != tip)
-            {
-                lastTooltip = tip;
-                button.TextTooltip = tip;
-            }
-        }
-
-        private void OnFinalize(TAddon* _)
-        {
-            DetachButton();
-        }
-
-        private void DetachButton()
-        {
-            onHoverChanged?.Invoke(false);
-            if (button != null)
-            {
-                button.DetachNode();
-                button.Dispose();
-                button = null;
-            }
-
-            ResetCache();
-        }
-
-        private void ResetCache()
-        {
-            lastLabel = string.Empty;
-            lastTooltip = string.Empty;
-            lastEnabled = null;
-            lastVisible = null;
-        }
-
-        public void Dispose()
-        {
-            controller.Disable();
-            DetachButton();
-            controller.Dispose();
-        }
+    public void Dispose()
+    {
+        retainerListGroup.Dispose();
+        retainerSellListGroup.Dispose();
+        shopGroup.Dispose();
+        grandCompanyGroup.Dispose();
+        materializeGroup.Dispose();
+        cabinetGroup.Dispose();
+        glamourDresserGroup.Dispose();
+        inventoryExpansionGroup.Dispose();
+        inventoryLargeGroup.Dispose();
+        inventoryNormalGroup.Dispose();
     }
 }

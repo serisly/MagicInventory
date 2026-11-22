@@ -3,10 +3,6 @@ using MagicInventory.Services;
 
 namespace MagicInventory.Core;
 
-/// <summary>
-/// Single source of truth for Magic Sort route names, short overlay badges,
-/// context-menu labels, and ImGui color palette.
-/// </summary>
 public static class RoutePresentation
 {
     public static readonly Vector4 ColorRetainer = new(0.56f, 0.80f, 0.98f, 1.00f);

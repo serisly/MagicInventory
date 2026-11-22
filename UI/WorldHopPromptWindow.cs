@@ -1,6 +1,7 @@
 using System;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin.Services;
 using MagicInventory.Core;
@@ -8,13 +9,9 @@ using MagicInventory.Services.Triage;
 
 namespace MagicInventory.UI;
 
-/// <summary>
-/// Optional on-demand confirmation modal (only opened when EnableLifestreamWorldHopPrompt is ON
-/// and Lifestream is installed) offering a 1-click user-confirmed world hop when a tracked item
-/// has no safe listings on the current world. Never auto-travels without explicit Yes click.
-/// </summary>
-public sealed unsafe class WorldHopPromptWindow : Window
+public sealed unsafe class WorldHopPromptWindow : Window, IDisposable
 {
+    private readonly IFramework framework;
     private readonly ICommandManager commandManager;
     private readonly IChatGui chatGui;
     private readonly IGameGui gameGui;
@@ -22,24 +19,28 @@ public sealed unsafe class WorldHopPromptWindow : Window
     private string itemName = string.Empty;
     private string currentWorld = string.Empty;
     private string dataCenterName = string.Empty;
+    private int neededQuantity = 1;
     private DcCheapestListing? pendingOffer;
 
-    public WorldHopPromptWindow(ICommandManager commandManager, IChatGui chatGui, IGameGui gameGui)
+    private string? pendingTravelWorld;
+    private DateTime pendingTravelRequestedUtc = DateTime.MinValue;
+
+    public WorldHopPromptWindow(
+        IFramework framework,
+        ICommandManager commandManager,
+        IChatGui chatGui,
+        IGameGui gameGui)
         : base("Magic Inventory - World Travel###MagicInventoryWorldHop", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoCollapse)
     {
+        this.framework = framework;
         this.commandManager = commandManager;
         this.chatGui = chatGui;
         this.gameGui = gameGui;
-        SizeConstraints = new WindowSizeConstraints
-        {
-            MinimumSize = new Vector2(360, 120),
-            MaximumSize = new Vector2(540, 260),
-        };
+        this.framework.Update += OnFrameworkUpdate;
     }
 
-    public void ShowOffer(string itemName, string currentWorld, string dataCenterName, DcCheapestListing offer)
+    public void ShowOffer(string itemName, string currentWorld, string dataCenterName, DcCheapestListing offer, int neededQuantity = 1)
     {
-        // Do not overwrite an offer the user is currently inspecting
         if (IsOpen && pendingOffer != null)
         {
             return;
@@ -48,8 +49,19 @@ public sealed unsafe class WorldHopPromptWindow : Window
         this.itemName = itemName;
         this.currentWorld = currentWorld;
         this.dataCenterName = dataCenterName;
+        this.neededQuantity = Math.Max(1, neededQuantity);
         pendingOffer = offer;
         IsOpen = true;
+    }
+
+    public override void PreDraw()
+    {
+        var s = ImGuiHelpers.GlobalScale;
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(360f * s, 120f * s),
+            MaximumSize = new Vector2(560f * s, 300f * s),
+        };
     }
 
     public override void Draw()
@@ -61,13 +73,15 @@ public sealed unsafe class WorldHopPromptWindow : Window
             return;
         }
 
-        ImGui.TextWrapped($"No safe listings for {itemName} on {currentWorld}.");
+        ImGui.TextWrapped($"No affordable local listing for {itemName} (need {neededQuantity}) on {currentWorld}.");
         ImGui.Spacing();
         var hqTag = offer.IsHq ? " HQ" : string.Empty;
-        var totalCost = (long)offer.UnitPrice * Math.Max(1, offer.Quantity);
-        ImGui.TextColored(
-            new Vector4(0.60f, 0.90f, 0.65f, 1.0f),
-            $"Cheapest on {dataCenterName}: {offer.WorldName} at {offer.UnitPrice:N0}g ea x{offer.Quantity}{hqTag} ({totalCost:N0}g total)");
+        var subtotal = (long)offer.UnitPrice * Math.Max(1, offer.Quantity);
+        var totalWithTax = subtotal + (subtotal * 5L / 100L);
+        ImGui.PushStyleColor(ImGuiCol.Text, new Vector4(0.60f, 0.90f, 0.65f, 1.0f));
+        ImGui.TextWrapped(
+            $"Cheapest on {dataCenterName}: {offer.WorldName} at {offer.UnitPrice:N0}g ea x{offer.Quantity}{hqTag} (~{totalWithTax:N0}g incl. 5% tax)");
+        ImGui.PopStyleColor();
         ImGui.Spacing();
         ImGui.TextDisabled("Only travels if you click Travel below.");
         ImGui.Separator();
@@ -80,7 +94,12 @@ public sealed unsafe class WorldHopPromptWindow : Window
             pendingOffer = null;
             if (!string.IsNullOrEmpty(world))
             {
-                // Close Market Board windows cleanly before handing off to Lifestream
+                if (!commandManager.Commands.ContainsKey("/li"))
+                {
+                    chatGui.PrintError($"Magic Inventory: Lifestream '/li' command is unavailable. Travel to {world} manually.");
+                    return;
+                }
+
                 var resultAddon = NativeUiHelpers.GetReadyAddon(gameGui, "ItemSearchResult");
                 if (resultAddon != null)
                 {
@@ -93,14 +112,8 @@ public sealed unsafe class WorldHopPromptWindow : Window
                     searchAddon->Close(true);
                 }
 
-                if (commandManager.ProcessCommand($"/li {world}"))
-                {
-                    chatGui.Print($"Magic Inventory: requesting Lifestream travel to {world}...");
-                }
-                else
-                {
-                    chatGui.PrintError($"Magic Inventory: Lifestream did not accept '/li {world}'. Travel manually or check Lifestream.");
-                }
+                pendingTravelWorld = world;
+                pendingTravelRequestedUtc = DateTime.UtcNow;
             }
         }
 
@@ -110,6 +123,39 @@ public sealed unsafe class WorldHopPromptWindow : Window
             IsOpen = false;
             pendingOffer = null;
         }
+    }
+
+    private void OnFrameworkUpdate(IFramework _)
+    {
+        if (string.IsNullOrEmpty(pendingTravelWorld))
+        {
+            return;
+        }
+
+        var resultOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearchResult");
+        var searchOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearch");
+        var timedOut = (DateTime.UtcNow - pendingTravelRequestedUtc).TotalMilliseconds >= 1500.0;
+        if ((resultOpen || searchOpen) && !timedOut)
+        {
+            return;
+        }
+
+        var world = pendingTravelWorld;
+        pendingTravelWorld = null;
+
+        if (commandManager.ProcessCommand($"/li {world}"))
+        {
+            chatGui.Print($"Magic Inventory: requesting Lifestream travel to {world}...");
+        }
+        else
+        {
+            chatGui.PrintError($"Magic Inventory: Lifestream did not accept '/li {world}'. Travel manually or check Lifestream.");
+        }
+    }
+
+    public void Dispose()
+    {
+        framework.Update -= OnFrameworkUpdate;
     }
 
     private static string SanitizeWorldName(string raw)

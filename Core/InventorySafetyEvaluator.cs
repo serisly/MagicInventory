@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
@@ -11,6 +11,46 @@ using MagicInventory.Services.MagicSort;
 using MagicInventory.Services.Triage;
 
 namespace MagicInventory.Core;
+
+public enum EquipSlotKey : byte
+{
+    None = 0,
+    MainHand = 1,
+    OffHand = 2,
+    Head = 3,
+    Body = 4,
+    Gloves = 5,
+    Legs = 6,
+    Feet = 7,
+    Ears = 8,
+    Neck = 9,
+    Wrists = 10,
+    Ring = 11,
+}
+
+public sealed class UnlockedJobGearProfile
+{
+    public Dictionary<uint, int> JobBaselineIlvl { get; } = new();
+    public Dictionary<uint, int> JobLevels { get; } = new();
+    public Dictionary<(uint JobId, EquipSlotKey Slot), int> JobSlotIlvl { get; } = new();
+    public HashSet<uint> SavedGearsetJobIds { get; } = new();
+
+    public int GetEffectiveSlotIlvl(uint jobId, EquipSlotKey slot)
+    {
+        if (slot != EquipSlotKey.None && JobSlotIlvl.TryGetValue((jobId, slot), out var slotIlvl) && slotIlvl > 0)
+        {
+            return slotIlvl;
+        }
+
+        return JobBaselineIlvl.GetValueOrDefault(jobId, 0);
+    }
+}
+
+public readonly record struct EquipmentRelevance(
+    bool IsUpgradeOrLevelingForUnlockedJob,
+    bool IsConfirmedOutgearedByUnlockedJob,
+    bool IsRelevantCrafterGathererTool,
+    string ProtectReason);
 
 public sealed unsafe class InventorySafetyEvaluator
 {
@@ -52,7 +92,6 @@ public sealed unsafe class InventorySafetyEvaluator
         InventoryType.ArmoryHead,
         InventoryType.ArmoryBody,
         InventoryType.ArmoryHands,
-        InventoryType.ArmoryWaist,
         InventoryType.ArmoryLegs,
         InventoryType.ArmoryFeets,
         InventoryType.ArmoryEar,
@@ -79,7 +118,7 @@ public sealed unsafe class InventorySafetyEvaluator
     private HashSet<uint> cachedGearsetIds = new();
     private ulong cachedJobIlvlCharacterId;
     private DateTime lastJobIlvlCacheUtc = DateTime.MinValue;
-    private Dictionary<uint, int> cachedUnlockedJobTopIlvl = new();
+    private UnlockedJobGearProfile cachedJobGearProfile = new();
 
     public InventorySafetyEvaluator(
         IDataManager dataManager,
@@ -103,18 +142,6 @@ public sealed unsafe class InventorySafetyEvaluator
         lastJobIlvlCacheUtc = DateTime.MinValue;
     }
 
-    public bool IsItemLocked(uint rawItemId)
-    {
-        var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
-        if (baseId == 0)
-        {
-            return false;
-        }
-
-        var profile = configuration.GetOrCreateCharacter(GetCurrentContentId());
-        return profile.LockedItemIds.Contains(baseId);
-    }
-
     public bool IsItemTracked(uint rawItemId)
     {
         var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
@@ -122,18 +149,39 @@ public sealed unsafe class InventorySafetyEvaluator
     }
 
     public int GetMarketPriority(uint baseItemId)
-        => configuration.MarketListingPriorities.GetValueOrDefault(ItemIdentity.NormalizeBaseItemId(baseItemId), 0);
+        => configuration.GetMarketListingPriority(GetCurrentContentId(), ItemIdentity.NormalizeBaseItemId(baseItemId));
 
-    /// <summary>
-    /// True ONLY when the user has explicitly pinned this item to "Keep" (Player Bags) via manual override.
-    /// Auto-kept protected items return false so they remain in whichever safe container already holds them.
-    /// </summary>
-    public bool HasExplicitKeepOverride(uint rawItemId)
+    public bool HasManualRouteOverride(uint rawItemId, string expectedRoute)
     {
         var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         return baseId != 0
-            && configuration.ManualRouteOverrides.TryGetValue(baseId, out var spec)
-            && string.Equals(spec, "Keep", StringComparison.OrdinalIgnoreCase);
+            && configuration.TryGetManualRouteOverride(GetCurrentContentId(), baseId, out var spec)
+            && string.Equals(spec, expectedRoute, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public bool HasExplicitKeepOverride(uint rawItemId)
+        => HasManualRouteOverride(rawItemId, "Keep");
+
+    public static EquipSlotKey ResolveEquipSlotKey(Item itemRow)
+    {
+        if (itemRow.EquipSlotCategory.RowId == 0)
+        {
+            return EquipSlotKey.None;
+        }
+
+        var cat = itemRow.EquipSlotCategory.Value;
+        if (cat.MainHand == 1) return EquipSlotKey.MainHand;
+        if (cat.OffHand == 1) return EquipSlotKey.OffHand;
+        if (cat.Head == 1) return EquipSlotKey.Head;
+        if (cat.Body == 1) return EquipSlotKey.Body;
+        if (cat.Gloves == 1) return EquipSlotKey.Gloves;
+        if (cat.Legs == 1) return EquipSlotKey.Legs;
+        if (cat.Feet == 1) return EquipSlotKey.Feet;
+        if (cat.Ears == 1) return EquipSlotKey.Ears;
+        if (cat.Neck == 1) return EquipSlotKey.Neck;
+        if (cat.Wrists == 1) return EquipSlotKey.Wrists;
+        if (cat.FingerL == 1 || cat.FingerR == 1) return EquipSlotKey.Ring;
+        return EquipSlotKey.None;
     }
 
     public static bool IsRetainerContainer(InventoryType? container)
@@ -177,7 +225,6 @@ public sealed unsafe class InventorySafetyEvaluator
             or InventoryType.ArmoryHead
             or InventoryType.ArmoryBody
             or InventoryType.ArmoryHands
-            or InventoryType.ArmoryWaist
             or InventoryType.ArmoryLegs
             or InventoryType.ArmoryFeets
             or InventoryType.ArmoryEar
@@ -221,17 +268,36 @@ public sealed unsafe class InventorySafetyEvaluator
         out InventoryType dstContainer,
         out int dstSlot,
         bool routeCrystalsToCrystalBag = false,
-        bool allowPartialMerge = true)
+        bool allowPartialMerge = true,
+        int incomingQty = 1)
     {
         var baseId = ItemIdentity.NormalizeBaseItemId(exactRawItemId);
+        var requiredQty = Math.Max(1, incomingQty);
         if (routeCrystalsToCrystalBag && ItemIdentity.IsCrystalItemId(baseId))
         {
-            dstContainer = InventoryType.Crystals;
-            dstSlot = (int)(baseId - 2);
-            return true;
+            var crystalBag = manager->GetInventoryContainer(InventoryType.Crystals);
+            var cSlotIdx = (int)(baseId - 2);
+            var cSlot = GetSlot(crystalBag, cSlotIdx);
+            if (cSlot != null)
+            {
+                var currentQty = cSlot->ItemId == baseId ? cSlot->Quantity : 0;
+                var hasCrystalRoom = allowPartialMerge
+                    ? currentQty < 9999
+                    : currentQty + requiredQty <= 9999;
+                if (hasCrystalRoom)
+                {
+                    dstContainer = InventoryType.Crystals;
+                    dstSlot = cSlotIdx;
+                    return true;
+                }
+            }
+
+            dstContainer = default;
+            dstSlot = -1;
+            return false;
         }
 
-        var canStack = allowPartialMerge && stackSize > 1 && (exactFlags & InventoryItem.ItemFlags.Collectable) == 0;
+        var canStack = stackSize > 1 && (exactFlags & InventoryItem.ItemFlags.Collectable) == 0;
         if (canStack)
         {
             foreach (var type in containers)
@@ -249,7 +315,7 @@ public sealed unsafe class InventorySafetyEvaluator
                         && slot->ItemId == baseId
                         && slot->Flags == exactFlags
                         && slot->Quantity > 0
-                        && slot->Quantity < stackSize)
+                        && (allowPartialMerge ? slot->Quantity < stackSize : slot->Quantity + requiredQty <= stackSize))
                     {
                         dstContainer = type;
                         dstSlot = i;
@@ -296,8 +362,6 @@ public sealed unsafe class InventorySafetyEvaluator
 
     public static bool IsLv1GlamourOrStarterGear(Item itemRow)
     {
-        // Only treat untradable iLvl 1 Lv-1 equippable gear (starter/event glamour) as Lv 1 glamour/starter.
-        // Never trap XP bonus rings (iLvl 30/60), tradable high-value Lv 1 crafted glamour, or BLU Soul Crystal.
         return ItemIdentity.IsEquipment(itemRow)
             && itemRow.LevelEquip == 1
             && itemRow.LevelItem.RowId <= 1
@@ -379,33 +443,192 @@ public sealed unsafe class InventorySafetyEvaluator
             ? ps->ClassJobExperience[job.ExpArrayIndex]
             : 0;
 
-        // Ignore untouched Lv 1 class unlocks and untouched 0-XP expansion unlocks (using ClassJob.StartingLevel)
         var startLv = Math.Max(1, (int)job.StartingLevel);
         return jobLevel <= 1 || (jobExp == 0 && jobLevel <= startLv);
     }
 
-    public Dictionary<uint, int> BuildUnlockedJobTopIlvl()
+    public static EquipmentRelevance EvaluateEquipmentRelevance(
+        UnlockedJobGearProfile profile,
+        EquipSlotKey slotKey,
+        int equipLevel,
+        int itemIlvl,
+        bool isCrafterGathererTool,
+        Func<uint, bool> canJobUse)
+    {
+        var isUpgradeOrLeveling = false;
+        var isConfirmedOutgeared = false;
+        var isRelevantTool = false;
+        var protectReason = string.Empty;
+
+        foreach (var (jobId, baselineIlvl) in profile.JobBaselineIlvl)
+        {
+            if (!profile.JobLevels.TryGetValue(jobId, out var jobLevel) || jobLevel <= 0)
+            {
+                continue;
+            }
+
+            if (!canJobUse(jobId))
+            {
+                continue;
+            }
+
+            var slotTopIlvl = profile.GetEffectiveSlotIlvl(jobId, slotKey);
+            var hasSavedGearset = profile.SavedGearsetJobIds.Contains(jobId);
+
+            if (isCrafterGathererTool)
+            {
+                if (equipLevel > jobLevel && equipLevel <= jobLevel + 4)
+                {
+                    isRelevantTool = true;
+                    isUpgradeOrLeveling = true;
+                    if (string.IsNullOrEmpty(protectReason))
+                    {
+                        protectReason = $"Leveling tool (Lv.{equipLevel})";
+                    }
+                }
+                else if (equipLevel <= jobLevel
+                    && ((slotTopIlvl == 0 && (hasSavedGearset || jobLevel > 1))
+                        || (slotTopIlvl > 0 && itemIlvl >= slotTopIlvl - 10)))
+                {
+                    isRelevantTool = true;
+                    isUpgradeOrLeveling = true;
+                    if (string.IsNullOrEmpty(protectReason))
+                    {
+                        protectReason = "Crafter/Gatherer tool";
+                    }
+                }
+            }
+
+            if (equipLevel > jobLevel && equipLevel <= jobLevel + 4)
+            {
+                isUpgradeOrLeveling = true;
+                if (string.IsNullOrEmpty(protectReason))
+                {
+                    protectReason = $"Leveling gear (Lv.{equipLevel})";
+                }
+            }
+            else if (equipLevel <= jobLevel && slotTopIlvl > 0 && itemIlvl >= slotTopIlvl - 5)
+            {
+                isUpgradeOrLeveling = true;
+                if (string.IsNullOrEmpty(protectReason))
+                {
+                    protectReason = itemIlvl > slotTopIlvl ? "Gear upgrade" : "Current gear";
+                }
+            }
+
+            if (equipLevel <= jobLevel && slotTopIlvl > 0 && itemIlvl < slotTopIlvl - 5)
+            {
+                isConfirmedOutgeared = true;
+            }
+        }
+
+        return new EquipmentRelevance(
+            isUpgradeOrLeveling,
+            isConfirmedOutgeared,
+            isRelevantTool,
+            protectReason);
+    }
+
+    public static EquipmentRelevance EvaluateEquipmentRelevance(UnlockedJobGearProfile profile, Item itemRow)
+    {
+        if (itemRow.EquipSlotCategory.RowId == 0)
+        {
+            return default;
+        }
+
+        var category = itemRow.ClassJobCategory.Value;
+        return EvaluateEquipmentRelevance(
+            profile,
+            ResolveEquipSlotKey(itemRow),
+            itemRow.LevelEquip,
+            (int)itemRow.LevelItem.RowId,
+            ItemIdentity.IsCrafterOrGathererTool(itemRow),
+            jobId => CanJobUseCategory(category, jobId));
+    }
+
+    public UnlockedJobGearProfile BuildUnlockedJobGearProfile()
     {
         var now = DateTime.UtcNow;
         var cid = GetCurrentContentId();
         if (cid == cachedJobIlvlCharacterId && (now - lastJobIlvlCacheUtc).TotalMilliseconds < CacheTtlMs)
         {
-            return cachedUnlockedJobTopIlvl;
+            return cachedJobGearProfile;
         }
 
-        var result = new Dictionary<uint, int>();
+        var profile = new UnlockedJobGearProfile();
         var ps = PlayerState.Instance();
         var gearsets = RaptureGearsetModule.Instance();
         var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
         var itemSheet = dataManager.GetExcelSheet<Item>();
         if (ps == null || classJobSheet == null || itemSheet == null)
         {
-            return result;
+            return profile;
         }
 
         var jobIlvlsFromSets = new Dictionary<uint, int>();
+        var slotIlvlByJob = new Dictionary<(uint JobId, EquipSlotKey Slot), int>();
+
+        void RecordSetItems(uint jobId, ReadOnlySpan<uint> rawItemIds, int explicitSetIlvl)
+        {
+            var ringIlvlA = 0;
+            var ringIlvlB = 0;
+            var sum = 0;
+            var count = 0;
+
+            for (var s = 0; s < rawItemIds.Length; s++)
+            {
+                var rawId = rawItemIds[s];
+                if (rawId == 0)
+                {
+                    continue;
+                }
+
+                var row = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(rawId));
+                if (row is null || row.Value.LevelItem.RowId == 0 || ItemIdentity.IsSoulCrystal(row.Value))
+                {
+                    continue;
+                }
+
+                var ilvl = (int)row.Value.LevelItem.RowId;
+                var slotKey = ResolveEquipSlotKey(row.Value);
+                if (slotKey == EquipSlotKey.Ring)
+                {
+                    if (ringIlvlA == 0)
+                    {
+                        ringIlvlA = ilvl;
+                    }
+                    else
+                    {
+                        ringIlvlB = ilvl;
+                    }
+                }
+                else if (slotKey != EquipSlotKey.None)
+                {
+                    var key = (jobId, slotKey);
+                    slotIlvlByJob[key] = Math.Max(slotIlvlByJob.GetValueOrDefault(key), ilvl);
+                }
+
+                sum += ilvl;
+                count++;
+            }
+
+            if (ringIlvlA > 0)
+            {
+                var effectiveRingIlvl = ringIlvlB > 0 ? Math.Min(ringIlvlA, ringIlvlB) : ringIlvlA;
+                var ringKey = (jobId, EquipSlotKey.Ring);
+                slotIlvlByJob[ringKey] = Math.Max(slotIlvlByJob.GetValueOrDefault(ringKey), effectiveRingIlvl);
+            }
+
+            var baseline = explicitSetIlvl > 0 ? explicitSetIlvl : (count > 0 ? sum / count : 0);
+            if (baseline > 0)
+            {
+                jobIlvlsFromSets[jobId] = Math.Max(jobIlvlsFromSets.GetValueOrDefault(jobId), baseline);
+            }
+        }
+
         if (gearsets != null)
         {
+            Span<uint> setItemBuf = stackalloc uint[14];
             for (var i = 0; i < gearsets->Entries.Length; i++)
             {
                 if (!gearsets->IsValidGearset(i))
@@ -419,26 +642,14 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                var setIlvl = (int)entry.ItemLevel;
-                if (setIlvl <= 0)
+                profile.SavedGearsetJobIds.Add(entry.ClassJob);
+                var len = Math.Min(setItemBuf.Length, entry.Items.Length);
+                for (var s = 0; s < len; s++)
                 {
-                    for (var s = 0; s < entry.Items.Length; s++)
-                    {
-                        var rawId = entry.Items[s].ItemId;
-                        if (rawId == 0)
-                        {
-                            continue;
-                        }
-
-                        var row = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(rawId));
-                        if (row is not null)
-                        {
-                            setIlvl = Math.Max(setIlvl, (int)row.Value.LevelItem.RowId);
-                        }
-                    }
+                    setItemBuf[s] = entry.Items[s].ItemId;
                 }
 
-                jobIlvlsFromSets[entry.ClassJob] = Math.Max(jobIlvlsFromSets.GetValueOrDefault(entry.ClassJob), setIlvl);
+                RecordSetItems(entry.ClassJob, setItemBuf[..len], entry.ItemLevel);
             }
         }
 
@@ -446,31 +657,17 @@ public sealed unsafe class InventorySafetyEvaluator
         if (manager != null && ps->CurrentClassJobId != 0)
         {
             var equipped = manager->GetInventoryContainer(InventoryType.EquippedItems);
-            if (equipped != null && equipped->Items != null)
+            if (equipped != null && equipped->Items != null && equipped->Size > 0)
             {
-                var sum = 0;
-                var count = 0;
-                for (var s = 0; s < equipped->Size; s++)
+                var len = Math.Min(14, (int)equipped->Size);
+                Span<uint> eqItemBuf = stackalloc uint[14];
+                for (var s = 0; s < len; s++)
                 {
                     var slot = equipped->GetInventorySlot(s);
-                    if (slot == null || slot->ItemId == 0)
-                    {
-                        continue;
-                    }
-
-                    var row = itemSheet.GetRowOrDefault(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
-                    if (row is not null && row.Value.LevelItem.RowId > 0 && !ItemIdentity.IsSoulCrystal(row.Value))
-                    {
-                        sum += (int)row.Value.LevelItem.RowId;
-                        count++;
-                    }
+                    eqItemBuf[s] = slot != null ? slot->ItemId : 0u;
                 }
 
-                if (count > 0)
-                {
-                    var avg = sum / count;
-                    jobIlvlsFromSets[ps->CurrentClassJobId] = Math.Max(jobIlvlsFromSets.GetValueOrDefault(ps->CurrentClassJobId), avg);
-                }
+                RecordSetItems(ps->CurrentClassJobId, eqItemBuf[..len], explicitSetIlvl: 0);
             }
         }
 
@@ -483,14 +680,25 @@ public sealed unsafe class InventorySafetyEvaluator
                 continue;
             }
 
-            if (ps->ClassJobLevels[job.ExpArrayIndex] <= 0)
+            var jobLv = (int)ps->ClassJobLevels[job.ExpArrayIndex];
+            if (jobLv <= 0)
             {
                 continue;
             }
 
+            profile.JobLevels[job.RowId] = jobLv;
+
             if (jobIlvlsFromSets.TryGetValue(job.RowId, out var directIlvl))
             {
-                result[job.RowId] = directIlvl;
+                profile.JobBaselineIlvl[job.RowId] = directIlvl;
+                foreach (var (slotKeyPair, ilvl) in slotIlvlByJob)
+                {
+                    if (slotKeyPair.JobId == job.RowId)
+                    {
+                        profile.JobSlotIlvl[slotKeyPair] = ilvl;
+                    }
+                }
+
                 continue;
             }
 
@@ -506,6 +714,14 @@ public sealed unsafe class InventorySafetyEvaluator
                     {
                         hasChildSet = true;
                         inherited = Math.Max(inherited, childIlvl);
+                        foreach (var (slotKeyPair, ilvl) in slotIlvlByJob)
+                        {
+                            if (slotKeyPair.JobId == other.RowId)
+                            {
+                                var parentKey = (job.RowId, slotKeyPair.Slot);
+                                profile.JobSlotIlvl[parentKey] = Math.Max(profile.JobSlotIlvl.GetValueOrDefault(parentKey), ilvl);
+                            }
+                        }
                     }
                 }
 
@@ -514,7 +730,7 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                result[job.RowId] = hasChildSet ? inherited : 0;
+                profile.JobBaselineIlvl[job.RowId] = hasChildSet ? inherited : 0;
             }
             else if (ownedSoulCrystalJobs.Contains(job.RowId))
             {
@@ -523,14 +739,14 @@ public sealed unsafe class InventorySafetyEvaluator
                     continue;
                 }
 
-                result[job.RowId] = 0;
+                profile.JobBaselineIlvl[job.RowId] = 0;
             }
         }
 
         cachedJobIlvlCharacterId = cid;
-        cachedUnlockedJobTopIlvl = result;
+        cachedJobGearProfile = profile;
         lastJobIlvlCacheUtc = now;
-        return result;
+        return profile;
     }
 
     public string? ResolveEffectiveSlotRoute(
@@ -539,25 +755,26 @@ public sealed unsafe class InventorySafetyEvaluator
         InventoryItem* liveItem,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
         HashSet<uint> gearsetIds,
-        Dictionary<uint, int> unlockedJobTopIlvl,
-        bool isRetainerHqOnly = false)
+        UnlockedJobGearProfile jobProfile,
+        bool hasNq = true,
+        bool hasHq = false)
     {
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
         {
             return null;
         }
 
-        var hasManualRouteOverride = configuration.ManualRouteOverrides.TryGetValue(entry.ItemId, out var manualSpec)
+        var cid = GetCurrentContentId();
+        var hasManualRouteOverride = configuration.TryGetManualRouteOverride(cid, entry.ItemId, out var manualSpec)
             && string.Equals(manualSpec, entry.Route, StringComparison.OrdinalIgnoreCase);
 
         if (liveItem == null)
         {
-            if (IsItemLocked(entry.ItemId) || gearsetIds.Contains(entry.ItemId) || IsItemTracked(entry.ItemId))
+            if (gearsetIds.Contains(entry.ItemId) || IsItemTracked(entry.ItemId))
             {
                 return null;
             }
 
-            // Retainer snapshots do not track live spiritbond -> never trigger phantom Bell visits for Materia
             if (string.Equals(entry.Route, "Materia", StringComparison.OrdinalIgnoreCase))
             {
                 return null;
@@ -578,27 +795,42 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
 
                 var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.PriceLow);
-                var expectedPrice = isRetainerHqOnly ? entry.TargetPriceHq : (entry.TargetPriceNq > 0 ? entry.TargetPriceNq : entry.TargetPriceHq);
-                if (expectedPrice < breakeven)
+                var nqOk = hasNq && entry.TargetPriceNq >= breakeven;
+                var hqOk = hasHq && entry.TargetPriceHq >= breakeven;
+                if (!nqOk && !hqOk)
                 {
                     return null;
                 }
             }
 
-            if (string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase)
-                && (itemRow.PriceLow == 0
-                    || itemRow.IsUnique
-                    || (!hasManualRouteOverride && isRetainerHqOnly)
-                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow))))
+            if (string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase))
             {
-                return null;
+                if (itemRow.PriceLow == 0
+                    || (!hasManualRouteOverride && hasHq && !hasNq)
+                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow)))
+                {
+                    return null;
+                }
             }
 
             if (string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
             {
-                if (isRetainerHqOnly
+                if ((!hasManualRouteOverride && hasHq && !hasNq)
                     || (!hasManualRouteOverride && !itemRow.IsUntradable)
-                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow)))
+                    || (!hasManualRouteOverride && IsLv1GlamourOrStarterGear(itemRow))
+                    || itemRow.PriceLow == 0)
+                {
+                    return null;
+                }
+            }
+
+            if (entry.Route is "Vendor" or "GrandCompany"
+                && !hasManualRouteOverride
+                && itemRow.EquipSlotCategory.RowId > 0)
+            {
+                var rel = EvaluateEquipmentRelevance(jobProfile, itemRow);
+                if (rel.IsUpgradeOrLevelingForUnlockedJob
+                    || (itemRow.Rarity == 3 && !rel.IsConfirmedOutgearedByUnlockedJob))
                 {
                     return null;
                 }
@@ -614,13 +846,22 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (entry.Route is "Market")
         {
-            if (IsSafeToDisposeOrList(liveItem, itemRow, "Market", manifestEntries, gearsetIds, unlockedJobTopIlvl))
+            if (IsSafeToDisposeOrList(liveItem, itemRow, "Market", manifestEntries, gearsetIds, jobProfile))
             {
                 var isHq = ItemIdentity.IsHighQuality(liveItem);
                 var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
                 var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.PriceLow);
                 if (unitPrice >= breakeven && unitPrice <= 999_999_999L)
                 {
+                    if (!hasManualRouteOverride)
+                    {
+                        var slotStackVal = (long)unitPrice * Math.Max(1, (int)liveItem->Quantity);
+                        if (slotStackVal < configuration.MarketMinStackValue && unitPrice < configuration.MarketMinUnitPrice)
+                        {
+                            return null;
+                        }
+                    }
+
                     return "Market";
                 }
 
@@ -630,7 +871,7 @@ public sealed unsafe class InventorySafetyEvaluator
             if (itemRow.EquipSlotCategory.RowId > 0
                 && liveItem->SpiritbondOrCollectability is > 0 and < 10000
                 && itemRow.Rarity == 1
-                && IsSafeToDisposeOrList(liveItem, itemRow, "Vendor", manifestEntries, gearsetIds, unlockedJobTopIlvl))
+                && IsSafeToDisposeOrList(liveItem, itemRow, "Vendor", manifestEntries, gearsetIds, jobProfile))
             {
                 return "Vendor";
             }
@@ -640,7 +881,7 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (entry.Route is "Vendor" or "GrandCompany")
         {
-            return IsSafeToDisposeOrList(liveItem, itemRow, entry.Route, manifestEntries, gearsetIds, unlockedJobTopIlvl)
+            return IsSafeToDisposeOrList(liveItem, itemRow, entry.Route, manifestEntries, gearsetIds, jobProfile)
                 ? entry.Route
                 : null;
         }
@@ -654,7 +895,6 @@ public sealed unsafe class InventorySafetyEvaluator
                 return null;
             }
 
-            // Storing in the Armoire permanently strips dyes & glamour projections — protect unless explicitly overridden
             if (!hasManualRouteOverride
                 && (liveItem->GlamourId != 0 || liveItem->GetStain(0) != 0 || liveItem->GetStain(1) != 0))
             {
@@ -710,7 +950,7 @@ public sealed unsafe class InventorySafetyEvaluator
         string targetRoute,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
         HashSet<uint> gearsetIds,
-        Dictionary<uint, int> unlockedJobTopIlvl)
+        UnlockedJobGearProfile jobProfile)
     {
         if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
         {
@@ -733,23 +973,20 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        if (ItemIdentity.IsSoulCrystal(itemRow) || itemRow.Rarity >= 4 || ItemIdentity.IsCollectable(slot))
+        if (ItemIdentity.IsSoulCrystal(itemRow) || ItemIdentity.IsRelicRarity(itemRow) || ItemIdentity.IsCollectable(slot))
         {
             return false;
         }
 
-        // Only treat a manual override as permitting disposal when the override itself targets this disposal route
-        // (prevents another character's "Retainer:<id>" override from disabling disposal safety guards on alts).
-        var hasManualDisposalOverride = configuration.ManualRouteOverrides.TryGetValue(baseId, out var overrideSpec)
+        var cid = GetCurrentContentId();
+        var hasManualDisposalOverride = configuration.TryGetManualRouteOverride(cid, baseId, out var overrideSpec)
             && string.Equals(overrideSpec, targetRoute, StringComparison.OrdinalIgnoreCase);
 
-        // Hard-protect Housing Furnishings (FilterGroup 14/34 + all housing categories) from disposal/market unless explicitly overridden
         if (!hasManualDisposalOverride && ItemIdentity.IsHousingItem(itemRow))
         {
             return false;
         }
 
-        // Hard-protect Glamoured or Dyed gear (e.g. Jet Black / Pure White dye) from disposal/market unless explicitly overridden
         if (!hasManualDisposalOverride
             && itemRow.EquipSlotCategory.RowId > 0
             && (slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0))
@@ -762,7 +999,6 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        // Protect ALL HQ items (materials AND equipment) from automatic NPC vendor disposal unless explicitly overridden
         var isHq = ItemIdentity.IsHighQuality(slot);
         if (!hasManualDisposalOverride && targetRoute == "Vendor" && isHq)
         {
@@ -779,57 +1015,17 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        if (targetRoute is "Vendor" or "GrandCompany" && itemRow.EquipSlotCategory.RowId > 0)
+        if (targetRoute is "Vendor" or "GrandCompany"
+            && !hasManualDisposalOverride
+            && itemRow.EquipSlotCategory.RowId > 0)
         {
-            var ps = PlayerState.Instance();
-            var classJobSheet = dataManager.GetExcelSheet<ClassJob>();
-            var category = itemRow.ClassJobCategory.Value;
-            if (ps == null || classJobSheet == null)
+            var rel = EvaluateEquipmentRelevance(jobProfile, itemRow);
+            if (rel.IsUpgradeOrLevelingForUnlockedJob)
             {
                 return false;
             }
 
-            var confirmedOutgearedForBlue = false;
-            foreach (var job in classJobSheet)
-            {
-                if (job.RowId == 0 || job.ExpArrayIndex < 0 || job.ExpArrayIndex >= ps->ClassJobLevels.Length)
-                {
-                    continue;
-                }
-
-                if (!unlockedJobTopIlvl.TryGetValue(job.RowId, out var topIlvl))
-                {
-                    continue;
-                }
-
-                var jobLevel = ps->ClassJobLevels[job.ExpArrayIndex];
-                if (jobLevel <= 0)
-                {
-                    continue;
-                }
-
-                if (!CanJobUseCategory(category, job.RowId))
-                {
-                    continue;
-                }
-
-                // Protect near-future leveling gear (up to +4 levels ahead) and current upgrades/BiS (within 5 iLvl)
-                if (!hasManualDisposalOverride
-                    && ((itemRow.LevelEquip > jobLevel && itemRow.LevelEquip <= jobLevel + 4)
-                        || (itemRow.LevelEquip <= jobLevel && topIlvl > 0 && (int)itemRow.LevelItem.RowId >= topIlvl - 5)))
-                {
-                    return false;
-                }
-
-                // Only confirm outgeared for Blue raid/tome gear when a job can actually equip it AND clearly outgears it
-                if (jobLevel >= itemRow.LevelEquip && topIlvl > 0 && (int)itemRow.LevelItem.RowId < topIlvl - 5)
-                {
-                    confirmedOutgearedForBlue = true;
-                }
-            }
-
-            // Never auto-dispose Blue (Rarity 3) Raid/Tome/Artifact gear unless an unlocked job actually outgears it
-            if (!hasManualDisposalOverride && itemRow.Rarity == 3 && !confirmedOutgearedForBlue)
+            if (itemRow.Rarity == 3 && !rel.IsConfirmedOutgearedByUnlockedJob)
             {
                 return false;
             }
@@ -837,7 +1033,7 @@ public sealed unsafe class InventorySafetyEvaluator
 
         if (targetRoute == "GrandCompany")
         {
-            if (isHq || (!hasManualDisposalOverride && !itemRow.IsUntradable))
+            if (itemRow.PriceLow == 0 || (!hasManualDisposalOverride && (isHq || !itemRow.IsUntradable)))
             {
                 return false;
             }
@@ -845,8 +1041,7 @@ public sealed unsafe class InventorySafetyEvaluator
         else if (targetRoute == "Vendor")
         {
             if (!manifestEntries.TryGetValue(baseId, out var entry)
-                || itemRow.PriceLow == 0
-                || itemRow.IsUnique)
+                || itemRow.PriceLow == 0)
             {
                 return false;
             }
@@ -985,11 +1180,6 @@ public sealed unsafe class InventorySafetyEvaluator
         return owned;
     }
 
-    /// <summary>
-    /// Returns the true live count of items currently listed on the active retainer's market (0..20).
-    /// Trusts the live RetainerMarket container whenever it is loaded (RetainerManager.MarketItemCount stays stale
-    /// after sales or cancellations until exiting back to RetainerList).
-    /// </summary>
     public static int GetLiveRetainerMarketCount(InventoryManager* manager, RetainerManager.Retainer* activeRetainer)
     {
         var cached = activeRetainer != null ? (int)activeRetainer->MarketItemCount : 0;

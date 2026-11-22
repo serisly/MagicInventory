@@ -54,7 +54,6 @@ public sealed unsafe class MateriaExtractPlanner
         var agent = AgentMaterialize.Instance();
         var seenSlots = new HashSet<(InventoryType Container, int Slot)>();
 
-        // 1. Prefer items currently listed in AgentMaterialize.ItemArraySorted when open
         if (agent != null && agent->ItemCount > 0 && agent->ItemArraySorted != null)
         {
             for (var i = 0; i < agent->ItemCount && results.Count < maxItems; i++)
@@ -69,7 +68,6 @@ public sealed unsafe class MateriaExtractPlanner
             }
         }
 
-        // 2. Scan Equipped, Armoury, and Player Bags for any remaining 100%-Spiritbond gear
         foreach (var containerType in InventorySafetyEvaluator.MaterializeSourceContainers)
         {
             if (results.Count >= maxItems)

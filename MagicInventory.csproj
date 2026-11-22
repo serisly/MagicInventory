@@ -6,8 +6,8 @@
     <Author>Seris</Author>
     <Name>Magic Inventory</Name>
     <InternalName>MagicInventory</InternalName>
-    <Punchline>Sort retainers, sell clutter, track recipes, and buy missing mats.</Punchline>
-    <Description>Automatic inventory organizer for FFXIV. Sorts items between bags and retainers, sells junk to vendors or Grand Company, lists profitable surplus on the Market Board, uses unlockables and coffers, tracks recipes, and buys missing materials. Right-click any item to set a custom rule.</Description>
+    <Punchline>Personal inventory organizer and crafting mat tracker.</Punchline>
+    <Description>Personal FFXIV plugin for cleaning up bags and retainers. Adds buttons to game windows for retainer sorting, vendor/GC selling, Market Board price review, and recipe material tracking. Right-click any item to pin your own rule.</Description>
     <RepoUrl>https://github.com/serisly/MagicInventory</RepoUrl>
     <IconUrl>https://raw.githubusercontent.com/serisly/MagicInventory/main/images/icon.png</IconUrl>
     <Tags>inventory;retainer;market;crafting;utility</Tags>
@@ -17,9 +17,13 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <OutputPath>bin\x64\$(Configuration)\</OutputPath>
+    <DefaultItemExcludes>$(DefaultItemExcludes);tests/**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MagicInventory.Tests</_Parameter1>
+    </AssemblyAttribute>
     <PackageReference Include="KamiToolKit" Version="2.2.66" />
     <None Include="images\icon.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

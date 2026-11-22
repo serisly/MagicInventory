@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
@@ -12,12 +12,6 @@ using MagicInventory.Core;
 
 namespace MagicInventory.Services.MagicSort;
 
-/// <summary>
-/// Attended, zero-navigation Summoning Bell orchestrator.
-/// Only starts on explicit user click inside an open RetainerList window.
-/// Cycles retainers with pending Magic Sort / Market work, delegating actual slot
-/// operations to MagicSortService + SafeTransactionQueue with human pacing.
-/// </summary>
 public sealed unsafe class BellSweepService : IDisposable
 {
     private const float MovementToleranceSq = 0.04f;
@@ -112,6 +106,7 @@ public sealed unsafe class BellSweepService : IDisposable
 
         this.framework.Update += OnFrameworkUpdate;
         this.transactionQueue.BatchEnded += OnTransactionBatchEnded;
+        this.magicSort.CacheInvalidated += InvalidateButtonCaches;
     }
 
     private void OnTransactionBatchEnded(QueueBatchOutcome outcome, string? reason)
@@ -123,7 +118,7 @@ public sealed unsafe class BellSweepService : IDisposable
 
         if (outcome is QueueBatchOutcome.CancelledByUser or QueueBatchOutcome.AbortedOnError)
         {
-            Stop();
+            Stop(echoReason: null, fromBatchEnded: true);
         }
     }
 
@@ -160,7 +155,7 @@ public sealed unsafe class BellSweepService : IDisposable
             return cached;
         }
 
-        var targets = BuildBellTargets(marketSellOnly: false);
+        var targets = BuildBellTargets(marketSellOnly: false, out var workByRetainer, out _);
         if (targets.Count == 0)
         {
             return bellSortButtonCache.Set(0, MagicSortButtonState.Hidden);
@@ -173,7 +168,7 @@ public sealed unsafe class BellSweepService : IDisposable
         }
 
         var names = targets.ConvertAll(t => t.Name);
-        var tooltip = magicSort.BuildBellSortTooltip(names);
+        var tooltip = magicSort.BuildBellSortTooltip(names, workByRetainer);
         var displayCount = totalItems > 0 ? totalItems : targets.Count;
         return bellSortButtonCache.Set(0, new MagicSortButtonState(
             true,
@@ -216,21 +211,30 @@ public sealed unsafe class BellSweepService : IDisposable
             return cached;
         }
 
-        var targets = BuildBellTargets(marketSellOnly: true);
+        var targets = BuildBellTargets(marketSellOnly: true, out _, out var bagMarketPlans);
         if (targets.Count == 0)
         {
             return bellSellButtonCache.Set(0, MagicSortButtonState.Hidden);
         }
 
         var names = targets.ConvertAll(t => t.Name);
-        var tooltip = magicSort.BuildBellSellTooltip(names);
-        var pendingMarketCount = magicSort.CountPendingBagMarketItems();
-        var countSuffix = pendingMarketCount > 0 ? $" ({pendingMarketCount})" : $" ({targets.Count})";
-        var prefix = magicSort.IsMarketReviewOnly ? "Prep Sell" : "Magic Sell";
+        var tooltip = magicSort.BuildBellSellTooltip(names, bagMarketPlans);
+        var pendingMarketCount = bagMarketPlans?.Count ?? 0;
+        string label;
+        if (magicSort.IsMarketReviewOnly)
+        {
+            label = pendingMarketCount > 1 ? $"Prep Sell (1/{pendingMarketCount})" : "Prep Sell (1)";
+        }
+        else
+        {
+            var countSuffix = pendingMarketCount > 0 ? $" ({pendingMarketCount})" : $" ({targets.Count})";
+            label = $"Magic Sell{countSuffix}";
+        }
+
         return bellSellButtonCache.Set(0, new MagicSortButtonState(
             true,
             true,
-            $"{prefix}{countSuffix}",
+            label,
             tooltip));
     }
 
@@ -276,7 +280,7 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        var targets = BuildBellTargets(marketSellOnly);
+        var targets = BuildBellTargets(marketSellOnly, out _, out _);
         if (targets.Count == 0)
         {
             chatGui.Print(marketSellOnly
@@ -301,7 +305,7 @@ public sealed unsafe class BellSweepService : IDisposable
         TransitionTo(SweepState.SelectingRetainer, DateTime.UtcNow, 0);
     }
 
-    public void Stop(string? echoReason = null)
+    public void Stop(string? echoReason = null, bool fromBatchEnded = false)
     {
         var wasRunning = IsRunning;
         InvalidateButtonCaches();
@@ -314,7 +318,7 @@ public sealed unsafe class BellSweepService : IDisposable
         stateStartedUtc = DateTime.MinValue;
         ResetCurrentRetainerFlags();
 
-        if (wasRunning && transactionQueue.IsBusy)
+        if (wasRunning && !fromBatchEnded && transactionQueue.IsBusy)
         {
             transactionQueue.Cancel(null, QueueBatchOutcome.CancelledByUser);
         }
@@ -327,7 +331,6 @@ public sealed unsafe class BellSweepService : IDisposable
 
     private void ResetCurrentRetainerFlags()
     {
-        // Strict separation: Sort mode ONLY sorts retainer bags; Sell mode ONLY lists Market items.
         didRetainerSortOnCurrent = marketSellOnlyMode;
         didMarketSortOnCurrent = !marketSellOnlyMode;
         currentRetainerSortPasses = 0;
@@ -335,8 +338,13 @@ public sealed unsafe class BellSweepService : IDisposable
         triggeredBatch = false;
     }
 
-    private List<BellRetainerTarget> BuildBellTargets(bool marketSellOnly = false)
+    private List<BellRetainerTarget> BuildBellTargets(
+        bool marketSellOnly,
+        out Dictionary<ulong, RetainerBellWorkSummary>? evaluatedWork,
+        out List<MarketPlanItem>? evaluatedMarketPlans)
     {
+        evaluatedWork = null;
+        evaluatedMarketPlans = null;
         var list = new List<BellRetainerTarget>();
         var rm = RetainerManager.Instance();
         if (rm == null || !rm->IsReady)
@@ -366,7 +374,8 @@ public sealed unsafe class BellSweepService : IDisposable
 
         if (marketSellOnly)
         {
-            var pendingMarket = magicSort.CountPendingBagMarketItems();
+            evaluatedMarketPlans = magicSort.GetPendingBagMarketPlans();
+            var pendingMarket = evaluatedMarketPlans.Count;
             if (pendingMarket <= 0)
             {
                 return list;
@@ -383,9 +392,8 @@ public sealed unsafe class BellSweepService : IDisposable
             return list;
         }
 
-        // Unified single-pass evaluation via RetainerBellEvaluator (checks ALL 9 withdrawable routes
-        // including Market/Vendor/GC/Glamour/Armoire/Use/Materia/GoldSaucer + misplaced Retainer + Tracked + Deposits!)
-        var workByRetainer = magicSort.EvaluateAllBellWork();
+        evaluatedWork = magicSort.EvaluateAllBellWork();
+        var workByRetainer = evaluatedWork;
         var funnelDestinations = new HashSet<ulong>();
         foreach (var summary in workByRetainer.Values)
         {
@@ -409,8 +417,6 @@ public sealed unsafe class BellSweepService : IDisposable
             }
 
             var target = new BellRetainerTarget(sortedIdx, retId, name, hasFreeMarket, itemCount);
-            // Visit full (175/175) withdrawable retainers FIRST unconditionally (even if they are also funnel destinations)
-            // and non-funnel withdrawable retainers next so space is freed before deposits arrive!
             if (hasSummary && summary.HasWithdrawWork && (summary.IsFull || !isFunnelDest))
             {
                 withdrawFirst.Add(target);
@@ -508,7 +514,6 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        // Re-resolve live SortedIndex by RetainerId so mid-sweep list reordering can never click the wrong retainer
         var resolvedIndex = activeTarget.SortedIndex;
         var rm = RetainerManager.Instance();
         if (rm != null && rm->IsReady)
@@ -643,8 +648,7 @@ public sealed unsafe class BellSweepService : IDisposable
                     return;
                 }
 
-                // Enqueue failed (e.g., busy/condition change); stop cleanly instead of falsely continuing
-                Stop();
+                Stop("Magic Sort stopped: unable to enqueue retainer transfer batch.");
                 return;
             }
 
@@ -653,7 +657,6 @@ public sealed unsafe class BellSweepService : IDisposable
                 truncatedByCap = true;
             }
 
-            // Capture the retainer's final post-sort inventory snapshot before closing
             magicSort.CaptureActiveRetainerSnapshot(force: true);
             didRetainerSortOnCurrent = true;
             TransitionTo(SweepState.ClosingRetainerInventory, now, SampleJitterMs(700, 1150));
@@ -666,9 +669,21 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        // Batch finished; re-check if another 25-step pass remains on this retainer
-        triggeredBatch = false;
         magicSort.InvalidateButtonCache();
+        if (currentRetainerSortPasses >= MaxSortBatchesPerRetainer)
+        {
+            if (magicSort.HasMoreRetainerSortWork())
+            {
+                truncatedByCap = true;
+            }
+
+            magicSort.CaptureActiveRetainerSnapshot(force: true);
+            didRetainerSortOnCurrent = true;
+            TransitionTo(SweepState.ClosingRetainerInventory, now, SampleJitterMs(700, 1150));
+            return;
+        }
+
+        triggeredBatch = false;
         nextActionUtc = now.AddMilliseconds(SampleJitterMs(650, 1050));
     }
 
@@ -738,7 +753,8 @@ public sealed unsafe class BellSweepService : IDisposable
 
         if (!triggeredBatch)
         {
-            if (magicSort.HasMoreMarketSellWork() && currentMarketSellPasses < MaxMarketBatchesPerRetainer)
+            var hasMoreWork = magicSort.HasMoreMarketSellWork();
+            if (hasMoreWork && currentMarketSellPasses < MaxMarketBatchesPerRetainer)
             {
                 if (magicSort.ExecuteMarketSortFromOrchestrator())
                 {
@@ -748,9 +764,13 @@ public sealed unsafe class BellSweepService : IDisposable
                     return;
                 }
 
-                // Enqueue failed (e.g., daily limit hit or precondition failed); stop without claiming success
-                Stop();
+                Stop("Magic Sell stopped: unable to enqueue market listing batch.");
                 return;
+            }
+
+            if (hasMoreWork)
+            {
+                truncatedByCap = true;
             }
 
             didMarketSortOnCurrent = true;
@@ -764,7 +784,6 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        // Review mode: RetainerSell is open and prefilled for manual inspection — stop cleanly without closing it.
         if (magicSort.IsMarketReviewOnly)
         {
             magicSort.InvalidateButtonCache();
@@ -772,7 +791,6 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        // One listing per click: stop after the first listing pass so every listing is a separate user click.
         if (magicSort.IsMarketOnePerClick)
         {
             magicSort.InvalidateButtonCache();
@@ -782,9 +800,20 @@ public sealed unsafe class BellSweepService : IDisposable
             return;
         }
 
-        // Re-check if remaining live slots/items exist after the 8-item pass
-        triggeredBatch = false;
         magicSort.InvalidateButtonCache();
+        if (currentMarketSellPasses >= MaxMarketBatchesPerRetainer)
+        {
+            if (magicSort.HasMoreMarketSellWork())
+            {
+                truncatedByCap = true;
+            }
+
+            didMarketSortOnCurrent = true;
+            TransitionTo(SweepState.ClosingMarketSellList, now, SampleJitterMs(700, 1150));
+            return;
+        }
+
+        triggeredBatch = false;
         nextActionUtc = now.AddMilliseconds(SampleJitterMs(700, 1150));
     }
 
@@ -862,30 +891,30 @@ public sealed unsafe class BellSweepService : IDisposable
 
     private void AdvanceToNextRetainerOrFinish(DateTime now)
     {
-        if (marketSellOnlyMode
-            && (magicSort.CountPendingBagMarketItems() <= 0 || !magicSort.HasRemainingAutoSellQuota))
+        if (marketSellOnlyMode)
         {
-            Stop(magicSort.HasRemainingAutoSellQuota
-                ? "Market Sell complete."
-                : "Market Sell stopped: daily limit reached.");
-            return;
+            var remainingMarket = magicSort.CountPendingBagMarketItems();
+            if (remainingMarket <= 0 || !magicSort.HasRemainingAutoSellQuota)
+            {
+                Stop(magicSort.HasRemainingAutoSellQuota
+                    ? "Market Sell complete."
+                    : "Market Sell stopped: daily limit reached.");
+                return;
+            }
+
+            if (pendingRetainers.Count == 0)
+            {
+                Stop(truncatedByCap
+                    ? $"Market Sell pass complete ({remainingMarket} item(s) remaining). Click again to continue."
+                    : $"Market Sell pass finished ({remainingMarket} item(s) remaining in bags).");
+                return;
+            }
         }
-
-        if (pendingRetainers.Count == 0)
+        else if (pendingRetainers.Count == 0)
         {
-            if (marketSellOnlyMode)
-            {
-                Stop(truncatedByCap
-                    ? "Market Sell pass complete — click again for remaining retainers."
-                    : "Market Sell complete.");
-            }
-            else
-            {
-                Stop(truncatedByCap
-                    ? "Magic Sort pass complete — click Magic Sort again for remaining items/retainers."
-                    : "Magic Sort complete.");
-            }
-
+            Stop(truncatedByCap
+                ? "Magic Sort pass complete. Click Magic Sort again for remaining items."
+                : "Magic Sort complete.");
             return;
         }
 
@@ -969,6 +998,7 @@ public sealed unsafe class BellSweepService : IDisposable
     {
         framework.Update -= OnFrameworkUpdate;
         transactionQueue.BatchEnded -= OnTransactionBatchEnded;
+        magicSort.CacheInvalidated -= InvalidateButtonCaches;
         pendingRetainers.Clear();
         activeTarget = null;
         state = SweepState.Idle;

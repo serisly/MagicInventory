@@ -19,30 +19,23 @@ public sealed record UsePlanItem(
     int Quantity,
     bool IsCoffer);
 
-/// <summary>
-/// Safely uses bag items tagged as "Use" (unowned unlockables, coffers, MGP tickets, or user-pinned usables)
-/// one by one with Server-ACK verification and human pacing.
-/// </summary>
 public sealed unsafe class UseItemsPlanner
 {
     private const int MaxUsesPerClick = 10;
 
     private readonly IDataManager dataManager;
     private readonly ICondition condition;
-    private readonly IChatGui chatGui;
     private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
 
     public UseItemsPlanner(
         IDataManager dataManager,
         ICondition condition,
-        IChatGui chatGui,
         SafeTransactionQueue transactionQueue,
         InventorySafetyEvaluator safety)
     {
         this.dataManager = dataManager;
         this.condition = condition;
-        this.chatGui = chatGui;
         this.transactionQueue = transactionQueue;
         this.safety = safety;
     }
@@ -58,7 +51,7 @@ public sealed unsafe class UseItemsPlanner
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
         var emptyBagSlots = manager->GetEmptySlotsInBag();
         var seenUnlockableIds = new HashSet<uint>();
 
@@ -103,14 +96,12 @@ public sealed unsafe class UseItemsPlanner
                     continue;
                 }
 
-                var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
+                var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
                 if (!string.Equals(effRoute, "Use", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
 
-                // Never try to use an item that is already unlocked/registered, and deduplicate
-                // unowned unlockables within the same batch so duplicate minions aren't used twice.
                 var uiState = UIState.Instance();
                 if (uiState != null)
                 {
@@ -118,7 +109,7 @@ public sealed unsafe class UseItemsPlanner
                     if (exdRow != null)
                     {
                         var unlockStatus = uiState->IsItemActionUnlocked(exdRow);
-                        if (unlockStatus == 1)
+                        if (unlockStatus is 1 or 3)
                         {
                             continue;
                         }
@@ -131,10 +122,15 @@ public sealed unsafe class UseItemsPlanner
                 }
 
                 var name = itemRow.Value.Name.ExtractText();
-                var isCoffer = name.Contains(" Coffer", StringComparison.OrdinalIgnoreCase);
-                if (isCoffer && emptyBagSlots < 1)
+                var isCoffer = ItemIdentity.IsCofferOrContainer(itemRow.Value);
+                if (isCoffer)
                 {
-                    continue;
+                    if (emptyBagSlots < 1)
+                    {
+                        continue;
+                    }
+
+                    emptyBagSlots--;
                 }
 
                 results.Add(new UsePlanItem(
@@ -166,17 +162,13 @@ public sealed unsafe class UseItemsPlanner
     public int CountPlannedUses(IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
         => PlanUses(MaxUsesPerClick, manifestEntries).Count;
 
-    public bool Execute(
+    public List<TransactionStep> BuildSteps(
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
-        out string statusMessage,
-        System.Action? onCompleted = null)
+        out int itemCount,
+        out string statusMessage)
     {
+        itemCount = 0;
         statusMessage = string.Empty;
-        if (transactionQueue.IsBusy)
-        {
-            statusMessage = "Busy — wait for the current action to finish.";
-            return false;
-        }
 
         if (condition[ConditionFlag.InCombat]
             || condition[ConditionFlag.Casting]
@@ -185,16 +177,17 @@ public sealed unsafe class UseItemsPlanner
             || condition[ConditionFlag.OccupiedInCutSceneEvent])
         {
             statusMessage = "Cannot use items right now.";
-            return false;
+            return new List<TransactionStep>();
         }
 
         var plan = PlanUses(MaxUsesPerClick, manifestEntries);
         if (plan.Count == 0)
         {
             statusMessage = "No usable items in your bags.";
-            return false;
+            return new List<TransactionStep>();
         }
 
+        itemCount = plan.Count;
         var steps = new List<TransactionStep>(plan.Count);
         foreach (var item in plan)
         {
@@ -203,6 +196,7 @@ public sealed unsafe class UseItemsPlanner
             var expectedTotalBefore = 0;
             var usedIsHq = false;
             var dispatched = false;
+            var skipped = false;
 
             steps.Add(new TransactionStep(
                 $"Use {captured.Name}",
@@ -225,9 +219,7 @@ public sealed unsafe class UseItemsPlanner
                     var slot = InventorySafetyEvaluator.GetSlot(container, captured.Slot);
                     if (slot == null || slot->ItemId != captured.RawItemId || slot->Quantity <= 0)
                     {
-                        dispatched = true;
-                        expectedQtyBefore = 0;
-                        expectedTotalBefore = 0;
+                        skipped = true;
                         return true;
                     }
 
@@ -235,9 +227,14 @@ public sealed unsafe class UseItemsPlanner
                     if (uiState != null)
                     {
                         var exdRow = ExdModule.GetItemRowById(captured.BaseItemId);
-                        if (exdRow != null && uiState->IsItemActionUnlocked(exdRow) == 1)
+                        if (exdRow != null)
                         {
-                            return false;
+                            var unlockStatus = uiState->IsItemActionUnlocked(exdRow);
+                            if (unlockStatus is 1 or 3)
+                            {
+                                skipped = true;
+                                return true;
+                            }
                         }
                     }
 
@@ -262,6 +259,11 @@ public sealed unsafe class UseItemsPlanner
                 },
                 HasServerAck: () =>
                 {
+                    if (skipped)
+                    {
+                        return true;
+                    }
+
                     if (!dispatched || condition[ConditionFlag.Casting])
                     {
                         return false;
@@ -288,13 +290,6 @@ public sealed unsafe class UseItemsPlanner
                 AllowCastingDuringAck: true));
         }
 
-        if (!transactionQueue.TryEnqueueBatch(steps, out var reason, onCompleted))
-        {
-            statusMessage = reason;
-            return false;
-        }
-
-        chatGui.Print($"Using {plan.Count} item(s)...");
-        return true;
+        return steps;
     }
 }

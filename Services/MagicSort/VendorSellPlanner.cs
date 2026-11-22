@@ -20,7 +20,8 @@ public sealed unsafe class VendorSellPlanner
     private readonly InventorySafetyEvaluator safety;
     private readonly string sellContextText;
     private readonly string sellConfirmPromptText;
-    private readonly string[] unsafeSellPromptTexts;
+    private readonly string uniqueUntradableSellPromptText;
+    private readonly string[] alwaysUnsafeSellPromptTexts;
 
     public VendorSellPlanner(
         IDataManager dataManager,
@@ -38,26 +39,53 @@ public sealed unsafe class VendorSellPlanner
         sellContextText = string.IsNullOrWhiteSpace(rawSell) ? "Sell" : rawSell.Trim();
 
         var rawConfirm = addonSheet?.GetRowOrDefault(4477)?.Text.ExtractText();
-        sellConfirmPromptText = string.IsNullOrWhiteSpace(rawConfirm)
-            ? "Are you certain you wish to sell this item?"
-            : rawConfirm.Trim();
+        var isEnglish = this.dataManager.Language == Dalamud.Game.ClientLanguage.English;
+        sellConfirmPromptText = isEnglish
+            ? (string.IsNullOrWhiteSpace(rawConfirm)
+                ? "Are you certain you wish to sell this item?"
+                : NativeUiHelpers.CollapseWhitespace(rawConfirm))
+            : string.Empty;
 
-        var unsafeList = new List<string>(3);
-        foreach (var rowId in new uint[] { 397, 398, 399 })
+        var rawUniqueConfirm = addonSheet?.GetRowOrDefault(399)?.Text.ExtractText();
+        uniqueUntradableSellPromptText = string.IsNullOrWhiteSpace(rawUniqueConfirm)
+            ? string.Empty
+            : NativeUiHelpers.CollapseWhitespace(rawUniqueConfirm);
+
+        var unsafeRowIds = isEnglish ? new uint[] { 397, 398 } : new uint[] { 397, 398, 4477 };
+        var unsafeList = new List<string>(unsafeRowIds.Length);
+        foreach (var rowId in unsafeRowIds)
         {
             var text = addonSheet?.GetRowOrDefault(rowId)?.Text.ExtractText();
             if (!string.IsNullOrWhiteSpace(text))
             {
-                unsafeList.Add(text.Trim());
+                var collapsed = NativeUiHelpers.CollapseWhitespace(text);
+                if (!string.IsNullOrEmpty(collapsed))
+                {
+                    unsafeList.Add(collapsed);
+                }
             }
         }
 
-        unsafeSellPromptTexts = unsafeList.ToArray();
+        alwaysUnsafeSellPromptTexts = unsafeList.ToArray();
     }
 
     public List<VendorPlanItem> PlanSales(
         int maxItems,
         bool includeArmoury,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+    {
+        var containers = includeArmoury
+            ? InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers)
+            : InventorySafetyEvaluator.PlayerBagContainers;
+        return ScanVendorItems(containers, maxItems, manifestEntries);
+    }
+
+    public int CountArmouryVendorItems(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
+        => ScanVendorItems(InventorySafetyEvaluator.ArmouryGearContainers, maxItems, manifestEntries).Count;
+
+    private List<VendorPlanItem> ScanVendorItems(
+        IEnumerable<InventoryType> containers,
+        int maxItems,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
     {
         var results = new List<VendorPlanItem>(Math.Max(0, maxItems));
@@ -69,10 +97,7 @@ public sealed unsafe class VendorSellPlanner
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-        var containers = includeArmoury
-            ? InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers)
-            : InventorySafetyEvaluator.PlayerBagContainers;
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
 
         foreach (var bag in containers)
         {
@@ -108,7 +133,7 @@ public sealed unsafe class VendorSellPlanner
                     continue;
                 }
 
-                if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", manifestEntries, gearsetIds, unlockedTop))
+                if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", manifestEntries, gearsetIds, unlockedProfile))
                 {
                     continue;
                 }
@@ -121,66 +146,12 @@ public sealed unsafe class VendorSellPlanner
                     baseId,
                     itemRow.Value.Name.ExtractText(),
                     slot->Quantity,
-                    itemRow.Value.PriceLow));
+                    itemRow.Value.PriceLow,
+                    IsUniqueAndUntradable: itemRow.Value.IsUnique && itemRow.Value.IsUntradable));
             }
         }
 
         return results;
-    }
-
-    public int CountArmouryVendorItems(int maxItems, IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries)
-    {
-        var manager = InventoryManager.Instance();
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-        if (manager == null || itemSheet == null || manifestEntries.Count == 0 || maxItems <= 0)
-        {
-            return 0;
-        }
-
-        var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-        var count = 0;
-
-        foreach (var armType in InventorySafetyEvaluator.ArmouryGearContainers)
-        {
-            var container = manager->GetInventoryContainer(armType);
-            if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
-            {
-                var slot = container->GetInventorySlot(slotIdx);
-                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
-                if (!manifestEntries.ContainsKey(baseId))
-                {
-                    continue;
-                }
-
-                var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null)
-                {
-                    continue;
-                }
-
-                if (safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", manifestEntries, gearsetIds, unlockedTop))
-                {
-                    count++;
-                    if (count >= maxItems)
-                    {
-                        return count;
-                    }
-                }
-            }
-        }
-
-        return count;
     }
 
     public List<TransactionStep> BuildSellSteps(
@@ -231,8 +202,8 @@ public sealed unsafe class VendorSellPlanner
                     }
 
                     var gearsetIds = safety.BuildGearsetItemIds();
-                    var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedTop))
+                    var unlockedProfile = safety.BuildUnlockedJobGearProfile();
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedProfile))
                     {
                         return false;
                     }
@@ -298,8 +269,8 @@ public sealed unsafe class VendorSellPlanner
                     }
 
                     var gearsetIds = safety.BuildGearsetItemIds();
-                    var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedTop))
+                    var unlockedProfile = safety.BuildUnlockedJobGearProfile();
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedProfile))
                     {
                         CloseOpenContextMenu();
                         return false;
@@ -320,7 +291,7 @@ public sealed unsafe class VendorSellPlanner
                             var now = DateTime.UtcNow;
                             if (yesNoReadyAtUtc == DateTime.MinValue)
                             {
-                                yesNoReadyAtUtc = now.AddMilliseconds(SampleHumanReactionMs(380, 680));
+                                yesNoReadyAtUtc = now.AddMilliseconds(SafeTransactionQueue.SampleDialogConfirmDelayMs());
                                 return false;
                             }
 
@@ -329,7 +300,7 @@ public sealed unsafe class VendorSellPlanner
                                 return false;
                             }
 
-                            if (!IsSafeVendorSellConfirmPrompt(yesNo))
+                            if (!IsSafeVendorSellConfirmPrompt(yesNo, captured.IsUniqueAndUntradable))
                             {
                                 if (yesNo->NoButton != null)
                                 {
@@ -368,20 +339,20 @@ public sealed unsafe class VendorSellPlanner
         return steps;
     }
 
-    private bool IsSafeVendorSellConfirmPrompt(AddonSelectYesno* yesNo)
+    private bool IsSafeVendorSellConfirmPrompt(AddonSelectYesno* yesNo, bool expectedUniqueAndUntradable)
     {
         if (yesNo == null || yesNo->PromptText == null)
         {
             return false;
         }
 
-        var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
+        var prompt = NativeUiHelpers.CollapseWhitespace(NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText));
         if (string.IsNullOrEmpty(prompt))
         {
             return false;
         }
 
-        foreach (var unsafePrompt in unsafeSellPromptTexts)
+        foreach (var unsafePrompt in alwaysUnsafeSellPromptTexts)
         {
             if (prompt.Contains(unsafePrompt, StringComparison.OrdinalIgnoreCase))
             {
@@ -389,14 +360,14 @@ public sealed unsafe class VendorSellPlanner
             }
         }
 
-        return prompt.Contains(sellConfirmPromptText, StringComparison.OrdinalIgnoreCase);
-    }
+        if (!string.IsNullOrEmpty(uniqueUntradableSellPromptText)
+            && prompt.Contains(uniqueUntradableSellPromptText, StringComparison.OrdinalIgnoreCase))
+        {
+            return expectedUniqueAndUntradable;
+        }
 
-    private static int SampleHumanReactionMs(int minMs, int maxMs)
-    {
-        var a = Random.Shared.Next(minMs, maxMs + 1);
-        var b = Random.Shared.Next(minMs, maxMs + 1);
-        return (a + b) / 2;
+        return !string.IsNullOrEmpty(sellConfirmPromptText)
+            && prompt.Contains(sellConfirmPromptText, StringComparison.OrdinalIgnoreCase);
     }
 
     private static AtkUnitBase* GetOpenContextAddon(AgentInventoryContext* contextAgent)

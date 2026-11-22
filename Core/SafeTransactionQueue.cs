@@ -1,4 +1,4 @@
-﻿using System.Numerics;
+using System.Numerics;
 using Dalamud.Game.Chat;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.Text;
@@ -18,8 +18,6 @@ public enum QueueBatchOutcome
 public enum PacingProfile
 {
     StandardSlot,
-    GearsetSwitch,
-    MarketQuery,
     VendorOrTurnIn,
     MarketListing,
     MarketFormEntry,
@@ -56,6 +54,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     private readonly Queue<TransactionStep> pendingSteps = new();
     private TransactionStep? currentStep;
     private Action? onBatchCompletedNaturally;
+    private string? activeBatchOwner;
     private State state = State.Idle;
     private DateTime batchStartedUtc = DateTime.MinValue;
     private DateTime stepStartedUtc;
@@ -110,12 +109,23 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     public bool IgnoreToggleClick => IsExecuting
         && (DateTime.UtcNow - batchStartedUtc).TotalMilliseconds < MinCancelDebounceMs;
 
-    public int RemainingCount => pendingSteps.Count + (currentStep != null ? 1 : 0);
+    public string? ActiveBatchOwner => IsBusy ? activeBatchOwner : null;
+
+    public bool IsOwnedBy(string owner)
+        => IsBusy && string.Equals(activeBatchOwner, owner, StringComparison.Ordinal);
+
+    public static int SampleDialogConfirmDelayMs()
+    {
+        var a = Random.Shared.Next(380, 681);
+        var b = Random.Shared.Next(380, 681);
+        return (a + b) / 2;
+    }
 
     public bool TryEnqueueBatch(
         IReadOnlyList<TransactionStep> steps,
         out string failureReason,
-        Action? onCompleted = null)
+        Action? onCompleted = null,
+        string? batchOwner = null)
     {
         failureReason = string.Empty;
 
@@ -134,7 +144,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
 
         if (steps.Count > MaxBatchSize)
         {
-            failureReason = $"Batch exceeds the {MaxBatchSize}-item limit.";
+            failureReason = $"Batch exceeds the {MaxBatchSize}-step limit.";
             return false;
         }
 
@@ -163,6 +173,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         anyStepAcked = false;
         secondaryGraceStartedUtc = null;
         onBatchCompletedNaturally = onCompleted;
+        activeBatchOwner = batchOwner;
         pendingSteps.Clear();
 
         foreach (var step in steps)
@@ -180,11 +191,13 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     {
         var wasBusy = IsBusy;
         var wasActive = state is State.Dispatching or State.AwaitingAck || pendingSteps.Count > 0;
+        var hadAck = anyStepAcked;
         var now = DateTime.UtcNow;
 
         pendingSteps.Clear();
         currentStep = null;
         onBatchCompletedNaturally = null;
+        activeBatchOwner = null;
         consecutiveFailures = 0;
         anyStepAcked = false;
         secondaryGraceStartedUtc = null;
@@ -227,9 +240,9 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
         }
         else if (wasBusy && LastOutcome == QueueBatchOutcome.None)
         {
-            // All steps already completed; only trailing jitter was interrupted.
-            LastOutcome = QueueBatchOutcome.Succeeded;
-            BatchEnded?.Invoke(QueueBatchOutcome.Succeeded, null);
+            var finalOutcome = hadAck ? QueueBatchOutcome.Succeeded : QueueBatchOutcome.AbortedOnError;
+            LastOutcome = finalOutcome;
+            BatchEnded?.Invoke(finalOutcome, hadAck ? null : "Action did not complete.");
         }
     }
 
@@ -251,8 +264,6 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             return;
         }
 
-        // Fail-closed immediately on any server/client red error while awaiting a step ACK
-        // so we never sit until timeout or re-attempt a rejected action.
         Cancel($"Server error: {text}", QueueBatchOutcome.AbortedOnError);
     }
 
@@ -272,6 +283,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
                 var callback = onBatchCompletedNaturally;
                 var hadAck = anyStepAcked;
                 onBatchCompletedNaturally = null;
+                activeBatchOwner = null;
                 currentStep = null;
                 anyStepAcked = false;
                 state = State.Idle;
@@ -304,19 +316,25 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             return;
         }
 
-        if (currentStep == null)
+        var stepToValidate = state == State.PostAckJitter && pendingSteps.Count > 0
+            ? pendingSteps.Peek()
+            : currentStep;
+        if (stepToValidate == null)
         {
+            activeBatchOwner = null;
             state = State.Idle;
             return;
         }
 
-        if (IsStepAddonReady(currentStep))
+        if (IsStepAddonReady(stepToValidate)
+            || (state == State.PostAckJitter && currentStep != null && IsStepAddonReady(currentStep)))
         {
             secondaryGraceStartedUtc = null;
         }
         else
         {
-            var allowModalTransitionGrace = !string.IsNullOrEmpty(currentStep.SecondaryRequiredAddon)
+            var allowModalTransitionGrace = (!string.IsNullOrEmpty(stepToValidate.SecondaryRequiredAddon)
+                    || state == State.PostAckJitter)
                 && state is State.AwaitingAck or State.PostAckJitter;
             if (allowModalTransitionGrace)
             {
@@ -328,6 +346,12 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
             }
 
             Cancel("Window closed.", QueueBatchOutcome.AbortedOnError);
+            return;
+        }
+
+        var step = currentStep;
+        if (step == null)
+        {
             return;
         }
 
@@ -343,21 +367,20 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
                 bool dispatched;
                 try
                 {
-                    dispatched = currentStep.Dispatch();
+                    dispatched = step.Dispatch();
                 }
                 catch (Exception ex)
                 {
-                    log.Error(ex, $"Dispatch failed on '{currentStep.Description}'.");
+                    log.Error(ex, $"Dispatch failed on '{step.Description}'.");
                     dispatched = false;
                 }
 
-                // If Dispatch() itself called Cancel() (e.g. cap reached or safety abort), stop cleanly.
                 if (currentStep == null || state != State.Dispatching)
                 {
                     return;
                 }
 
-                var dispatchFloor = now.AddMilliseconds(SampleJitterMs(dispatched ? currentStep.Pacing : PacingProfile.StandardSlot));
+                var dispatchFloor = now.AddMilliseconds(SampleJitterMs(dispatched ? step.Pacing : PacingProfile.StandardSlot));
                 if (dispatchFloor > nextAllowedDispatchUtc)
                 {
                     nextAllowedDispatchUtc = dispatchFloor;
@@ -365,9 +388,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
 
                 if (!dispatched)
                 {
-                    // Skip dependent follow-up steps (e.g. Deliver after failed Select, SetPrice+Confirm after failed Open)
-                    // so a skipped prerequisite never executes orphaned steps on the wrong modal.
-                    for (var skip = 0; skip < currentStep.SkipOnFailureCount && pendingSteps.Count > 0; skip++)
+                    for (var skip = 0; skip < step.SkipOnFailureCount && pendingSteps.Count > 0; skip++)
                     {
                         pendingSteps.Dequeue();
                     }
@@ -375,7 +396,7 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
                     consecutiveFailures++;
                     if (consecutiveFailures >= 2)
                     {
-                        Cancel($"Unable to complete '{currentStep.Description}'.", QueueBatchOutcome.AbortedOnError);
+                        Cancel($"Unable to complete '{step.Description}'.", QueueBatchOutcome.AbortedOnError);
                         return;
                     }
 
@@ -393,16 +414,15 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
                 bool acked;
                 try
                 {
-                    acked = currentStep.HasServerAck();
+                    acked = step.HasServerAck();
                 }
                 catch (Exception ex)
                 {
-                    log.Error(ex, $"Verification failed on '{currentStep.Description}'.");
+                    log.Error(ex, $"Verification failed on '{step.Description}'.");
                     Cancel("Verification error.", QueueBatchOutcome.AbortedOnError);
                     return;
                 }
 
-                // If HasServerAck() itself called Cancel() (e.g. unexpected confirmation dialog), stop cleanly.
                 if (currentStep == null || state != State.AwaitingAck)
                 {
                     return;
@@ -463,10 +483,8 @@ public sealed unsafe class SafeTransactionQueue : IDisposable
     {
         var (minMs, maxMs) = pacing switch
         {
-            PacingProfile.GearsetSwitch => (700, 1150),
             PacingProfile.VendorOrTurnIn => (750, 1350),
             PacingProfile.MateriaExtraction => (850, 1400),
-            PacingProfile.MarketQuery => (2200, 3000),
             PacingProfile.MarketListing => (1650, 2650),
             PacingProfile.MarketFormEntry => (380, 620),
             _ => (650, 1150),

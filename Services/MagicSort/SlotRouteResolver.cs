@@ -16,11 +16,6 @@ public readonly record struct ResolvedSlotRoute(
     bool IsPendingPrice = false,
     bool NeedsRetainerVisit = false);
 
-/// <summary>
-/// Single canonical slot-level route resolver used by Tooltips, Route Overlays,
-/// Highlight Filters, Retainer/Bell Evaluators, and Planners so every UI surface
-/// agrees 100% on where an item belongs.
-/// </summary>
 public sealed unsafe class SlotRouteResolver
 {
     private readonly IDataManager dataManager;
@@ -37,14 +32,18 @@ public sealed unsafe class SlotRouteResolver
         this.getMissingTrackedQuantities = getMissingTrackedQuantities;
     }
 
+    public IReadOnlyDictionary<uint, int>? CaptureMissingTrackedSnapshot()
+        => getMissingTrackedQuantities?.Invoke();
+
     public ResolvedSlotRoute? ResolveSlot(
         uint rawItemId,
         InventoryType? container,
         InventoryItem* liveItem,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
         HashSet<uint> gearsetIds,
-        Dictionary<uint, int> unlockedTop,
-        bool includeBagToArmouryRoute = false)
+        UnlockedJobGearProfile unlockedProfile,
+        bool includeBagToArmouryRoute = false,
+        IReadOnlyDictionary<uint, int>? missingTracked = null)
     {
         if (rawItemId == 0)
         {
@@ -100,7 +99,6 @@ public sealed unsafe class SlotRouteResolver
             return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
         }
 
-        // Locale-safe crystal/currency check (NEVER FilterGroup == 16!)
         if (!ItemIdentity.CanLockOrTagItem(baseId, row))
         {
             return null;
@@ -113,14 +111,13 @@ public sealed unsafe class SlotRouteResolver
 
         if (safety.IsItemTracked(baseId))
         {
-            // Only tag retainer copies as "Withdraw (Tracked)" when the player actually still needs more!
             var needsRetainerPull = false;
             if (inRetainer)
             {
-                if (getMissingTrackedQuantities != null)
+                var missingMap = missingTracked ?? getMissingTrackedQuantities?.Invoke();
+                if (missingMap != null)
                 {
-                    var missing = getMissingTrackedQuantities();
-                    needsRetainerPull = missing.TryGetValue(baseId, out var qty) && qty > 0;
+                    needsRetainerPull = missingMap.TryGetValue(baseId, out var qty) && qty > 0;
                 }
                 else
                 {
@@ -136,7 +133,15 @@ public sealed unsafe class SlotRouteResolver
             return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 
-        if (gearsetIds.Contains(baseId) || ItemIdentity.IsSoulCrystal(row) || row.Rarity >= 4)
+        var hasExplicitRelicStorageOverride = ItemIdentity.IsRelicRarity(row)
+            && manifestEntries.TryGetValue(baseId, out var relicEntry)
+            && (string.Equals(relicEntry.Route, "Glamour", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(relicEntry.Route, "Armoire", StringComparison.OrdinalIgnoreCase)
+                || (string.Equals(relicEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase) && relicEntry.TargetRetainerId != 0));
+
+        if (gearsetIds.Contains(baseId)
+            || ItemIdentity.IsSoulCrystal(row)
+            || (ItemIdentity.IsRelicRarity(row) && !hasExplicitRelicStorageOverride))
         {
             if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
@@ -169,11 +174,10 @@ public sealed unsafe class SlotRouteResolver
 
         if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
         {
-            var isPendingPrice = entry.Reason.StartsWith("Checking ", StringComparison.OrdinalIgnoreCase);
-            var needsVisit = entry.Reason.StartsWith("Open a Summoning Bell", StringComparison.OrdinalIgnoreCase)
-                || entry.Reason.StartsWith("Visit each retainer", StringComparison.OrdinalIgnoreCase);
+            var needsVisit = entry.NeedsRetainerVisit;
+            var isPendingPrice = entry.IsPendingRefresh && !needsVisit;
 
-            if (!isPendingPrice && !needsVisit && includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
+            if (!entry.IsPendingRefresh && includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
                 return new ResolvedSlotRoute("Armoury", 0, string.Empty, entry);
             }
@@ -181,7 +185,7 @@ public sealed unsafe class SlotRouteResolver
             return ResolveStayOrBagRoute(inRetainer, baseId, entry, isPendingPrice, needsVisit);
         }
 
-        var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row, liveItem, manifestEntries, gearsetIds, unlockedTop);
+        var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row, liveItem, manifestEntries, gearsetIds, unlockedProfile);
         if (string.IsNullOrEmpty(effectiveRoute))
         {
             if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
@@ -201,10 +205,6 @@ public sealed unsafe class SlotRouteResolver
         return new ResolvedSlotRoute(effectiveRoute, 0, string.Empty, entry);
     }
 
-    /// <summary>
-    /// Auto-protected items sitting inside a retainer stay in that retainer (Route = "Retainer", active retainer),
-    /// whereas an explicit manual "Keep" override always resolves to "Keep" (Player Bags, withdrawn from retainer).
-    /// </summary>
     private ResolvedSlotRoute ResolveStayOrBagRoute(
         bool inRetainer,
         uint baseId,
@@ -260,7 +260,6 @@ public sealed unsafe class SlotRouteResolver
 
             case "Market":
             {
-                // Fail-closed for HQ items: never display NQ price for an HQ item (matches MarketListingPlanner)
                 long price = 0;
                 if (entry != null)
                 {

@@ -29,7 +29,9 @@ public sealed record MarketPriceSnapshot(
     long LastSaleUnixHq = 0,
     int SalesLast7DaysNq = 0,
     int SalesLast7DaysHq = 0,
-    int SchemaVersion = 0);
+    int SchemaVersion = 0,
+    int CompetitiveListingCountNq = -1,
+    int CompetitiveListingCountHq = -1);
 
 public sealed record DcCheapestListing(
     uint ItemId,
@@ -38,15 +40,9 @@ public sealed record DcCheapestListing(
     int Quantity,
     bool IsHq);
 
-/// <summary>
-/// Polite, background Universalis v2 market client with 6-hour disk TTL cache,
-/// 95-item batching, 1 req/sec pacing, and exponential backoff on 429/5xx.
-/// Strictly ignores currentAveragePrice; prices solely from minPriceNQ/HQ,
-/// regularSaleVelocity, and recentHistory median.
-/// </summary>
 public sealed class UniversalisClient : IDisposable
 {
-    public const int CurrentSnapshotSchemaVersion = 2;
+    public const int CurrentSnapshotSchemaVersion = 3;
     public static readonly TimeSpan CacheTtl = TimeSpan.FromHours(6);
     private const int BatchSize = 95;
     private const int MinDelayBetweenRequestsMs = 1050;
@@ -55,6 +51,7 @@ public sealed class UniversalisClient : IDisposable
     private readonly IPluginLog log;
     private readonly HttpClient httpClient;
     private readonly CancellationTokenSource cts = new();
+    private readonly SemaphoreSlim rateLimitGate = new(1, 1);
 
     private readonly object diskSaveGate = new();
     private readonly ConcurrentDictionary<(string World, uint ItemId), MarketPriceSnapshot> cache = new();
@@ -69,7 +66,8 @@ public sealed class UniversalisClient : IDisposable
     private volatile bool isScanning;
     private string lastError = string.Empty;
     private DateTime lastScanUtc = DateTime.MinValue;
-    private DateTime nextBatchAllowedUtc = DateTime.MinValue;
+    private DateTime lastAnyRequestUtc = DateTime.MinValue;
+    private long nextBatchAllowedTicksUtc;
     private int consecutiveBatchFailures;
     private volatile bool cacheDirty;
 
@@ -132,6 +130,17 @@ public sealed class UniversalisClient : IDisposable
         return cache.TryGetValue((world, baseItemId), out snapshot!);
     }
 
+    public bool IsOnNegativeCooldown(string world, uint baseItemId)
+    {
+        if (string.IsNullOrWhiteSpace(world) || baseItemId < 2)
+        {
+            return false;
+        }
+
+        return negativeCooldowns.TryGetValue((world, baseItemId), out var until)
+            && DateTime.UtcNow < until;
+    }
+
     public int QueueMissing(string world, IEnumerable<uint> baseItemIds, bool forceRefresh = false)
     {
         if (string.IsNullOrWhiteSpace(world))
@@ -140,9 +149,20 @@ public sealed class UniversalisClient : IDisposable
         }
 
         var now = DateTime.UtcNow;
-        if (!forceRefresh && now < nextBatchAllowedUtc)
+        if (forceRefresh)
         {
-            return 0;
+            var wasBackedOff = Volatile.Read(ref nextBatchAllowedTicksUtc) > 0;
+            Volatile.Write(ref nextBatchAllowedTicksUtc, 0L);
+            if (wasBackedOff)
+            {
+                try
+                {
+                    wakeSignal.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
         }
 
         var added = 0;
@@ -216,9 +236,10 @@ public sealed class UniversalisClient : IDisposable
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cts.Token, externalCt);
-        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(dataCenterName)}/{baseItemId}?listings=25&entries=0";
+        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(dataCenterName)}/{baseItemId}?listings=50&entries=0";
         try
         {
+            await WaitForRateLimitSlotAsync(linked.Token).ConfigureAwait(false);
             using var resp = await httpClient.GetAsync(url, linked.Token).ConfigureAwait(false);
             if (!resp.IsSuccessStatusCode)
             {
@@ -280,9 +301,28 @@ public sealed class UniversalisClient : IDisposable
         }
     }
 
+    private async Task WaitForRateLimitSlotAsync(CancellationToken ct)
+    {
+        await rateLimitGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var elapsedMs = (DateTime.UtcNow - lastAnyRequestUtc).TotalMilliseconds;
+            if (elapsedMs < MinDelayBetweenRequestsMs)
+            {
+                var waitMs = (int)Math.Ceiling(MinDelayBetweenRequestsMs - elapsedMs);
+                await Task.Delay(waitMs, ct).ConfigureAwait(false);
+            }
+
+            lastAnyRequestUtc = DateTime.UtcNow;
+        }
+        finally
+        {
+            rateLimitGate.Release();
+        }
+    }
+
     private async Task WorkerLoopAsync(CancellationToken ct)
     {
-        var lastRequestUtc = DateTime.MinValue;
         while (!ct.IsCancellationRequested)
         {
             try
@@ -300,9 +340,20 @@ public sealed class UniversalisClient : IDisposable
                     continue;
                 }
 
+                var blockedUntilTicks = Volatile.Read(ref nextBatchAllowedTicksUtc);
+                if (blockedUntilTicks > 0)
+                {
+                    var remaining = new DateTime(blockedUntilTicks, DateTimeKind.Utc) - DateTime.UtcNow;
+                    if (remaining > TimeSpan.Zero)
+                    {
+                        isScanning = false;
+                        await wakeSignal.WaitAsync(remaining, ct).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+
                 isScanning = true;
 
-                // Dequeue up to BatchSize items belonging to the same world
                 string? batchWorld = null;
                 var batchIds = new List<uint>(BatchSize);
                 var requeue = new List<(string World, uint ItemId)>();
@@ -334,22 +385,21 @@ public sealed class UniversalisClient : IDisposable
                     continue;
                 }
 
-                var elapsedMs = (DateTime.UtcNow - lastRequestUtc).TotalMilliseconds;
-                if (elapsedMs < MinDelayBetweenRequestsMs)
+                var updated = 0;
+                try
                 {
-                    var waitMs = (int)Math.Ceiling(MinDelayBetweenRequestsMs - elapsedMs);
-                    await Task.Delay(waitMs, ct).ConfigureAwait(false);
+                    await WaitForRateLimitSlotAsync(ct).ConfigureAwait(false);
+                    updated = await FetchBatchWithBackoffAsync(batchWorld, batchIds, ct).ConfigureAwait(false);
                 }
-
-                lastRequestUtc = DateTime.UtcNow;
-                var updated = await FetchBatchWithBackoffAsync(batchWorld, batchIds, ct).ConfigureAwait(false);
-
-                foreach (var id in batchIds)
+                finally
                 {
-                    queuedKeys.TryRemove((batchWorld, id), out _);
-                }
+                    foreach (var id in batchIds)
+                    {
+                        queuedKeys.TryRemove((batchWorld, id), out _);
+                    }
 
-                Interlocked.Add(ref completedInCurrentScan, batchIds.Count);
+                    Interlocked.Add(ref completedInCurrentScan, batchIds.Count);
+                }
 
                 if (updated > 0)
                 {
@@ -374,7 +424,7 @@ public sealed class UniversalisClient : IDisposable
     private async Task<int> FetchBatchWithBackoffAsync(string world, List<uint> itemIds, CancellationToken ct)
     {
         var idsJoined = string.Join(',', itemIds);
-        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=10&entries=40";
+        var url = $"https://universalis.app/api/v2/{Uri.EscapeDataString(world)}/{idsJoined}?listings=20&entries=40";
 
         for (var attempt = 0; attempt < 3; attempt++)
         {
@@ -394,7 +444,6 @@ public sealed class UniversalisClient : IDisposable
 
                 if (resp.StatusCode == HttpStatusCode.NotFound)
                 {
-                    // Dedicated negative cooldown (never poisons cache or disk with zero-sentinels!)
                     var negUntil = DateTime.UtcNow.AddMinutes(15);
                     foreach (var requestedId in itemIds)
                     {
@@ -409,7 +458,7 @@ public sealed class UniversalisClient : IDisposable
                 if (!resp.IsSuccessStatusCode)
                 {
                     lastError = $"Universalis returned HTTP {(int)resp.StatusCode}.";
-                    RecordBatchFailureCircuitBreaker();
+                    RecordBatchFailureCircuitBreaker(world, itemIds);
                     return 0;
                 }
 
@@ -443,7 +492,6 @@ public sealed class UniversalisClient : IDisposable
                     updated++;
                 }
 
-                // Put unreturned batch IDs on a clean 15-minute negative cooldown without poisoning cache
                 var missingCooldownUntil = now.AddMinutes(15);
                 foreach (var requestedId in itemIds)
                 {
@@ -454,7 +502,7 @@ public sealed class UniversalisClient : IDisposable
                 }
 
                 consecutiveBatchFailures = 0;
-                nextBatchAllowedUtc = DateTime.MinValue;
+                Volatile.Write(ref nextBatchAllowedTicksUtc, 0L);
                 lastError = string.Empty;
                 return updated;
             }
@@ -472,40 +520,102 @@ public sealed class UniversalisClient : IDisposable
             }
         }
 
-        RecordBatchFailureCircuitBreaker();
+        RecordBatchFailureCircuitBreaker(world, itemIds);
         return 0;
     }
 
-    private void RecordBatchFailureCircuitBreaker()
+    private void RecordBatchFailureCircuitBreaker(string world, List<uint> failedItemIds)
     {
         consecutiveBatchFailures = Math.Min(consecutiveBatchFailures + 1, 4);
-        var backoffSeconds = 30 * (1 << (consecutiveBatchFailures - 1)); // 30s -> 60s -> 120s -> 240s
-        nextBatchAllowedUtc = DateTime.UtcNow.AddSeconds(Math.Min(300, backoffSeconds));
+        var backoffSeconds = Math.Min(300, 30 * (1 << (consecutiveBatchFailures - 1)));
+        var backoffUntil = DateTime.UtcNow.AddSeconds(backoffSeconds);
+        Volatile.Write(ref nextBatchAllowedTicksUtc, backoffUntil.Ticks);
+        foreach (var id in failedItemIds)
+        {
+            negativeCooldowns[(world, id)] = backoffUntil;
+        }
     }
 
-    private static bool ParseItemSnapshot(uint itemId, JsonElement el, DateTime fetchedUtc, out MarketPriceSnapshot snapshot)
+    public static bool ParseItemSnapshot(uint itemId, JsonElement el, DateTime fetchedUtc, out MarketPriceSnapshot snapshot)
     {
-        var minNq = ReadInt(el, "minPriceNQ");
-        var minHq = ReadInt(el, "minPriceHQ");
-        var minAny = ReadInt(el, "minPrice");
+        var rawMinNq = ReadInt(el, "minPriceNQ");
+        var rawMinHq = ReadInt(el, "minPriceHQ");
+        var rawMinAny = ReadInt(el, "minPrice");
         var velocity = ReadFloat(el, "regularSaleVelocity");
         var nqVelocity = ReadFloat(el, "nqSaleVelocity");
         var hqVelocity = ReadFloat(el, "hqSaleVelocity");
         var history = AnalyzeRecentHistory(el, fetchedUtc);
 
-        int listingCount;
-        if (el.TryGetProperty("listingsCount", out var lcEl) && lcEl.ValueKind == JsonValueKind.Number && lcEl.TryGetInt32(out var lc))
+        var liveMinNq = 0;
+        var liveMinHq = 0;
+        var liveMinAny = 0;
+        var compNq = -1;
+        var compHq = -1;
+        var nonMannequinListingCount = 0;
+        var hasListingsArray = el.TryGetProperty("listings", out var listEl) && listEl.ValueKind == JsonValueKind.Array;
+        if (hasListingsArray)
         {
-            listingCount = Math.Max(0, lc);
+            var nqPrices = new List<int>(16);
+            var hqPrices = new List<int>(16);
+            foreach (var l in listEl.EnumerateArray())
+            {
+                if (l.TryGetProperty("onMannequin", out var manEl) && manEl.ValueKind == JsonValueKind.True)
+                {
+                    continue;
+                }
+
+                var price = ReadInt(l, "pricePerUnit");
+                if (price <= 0)
+                {
+                    continue;
+                }
+
+                nonMannequinListingCount++;
+                var isHq = l.TryGetProperty("hq", out var hqEl) && hqEl.ValueKind == JsonValueKind.True;
+                if (isHq)
+                {
+                    hqPrices.Add(price);
+                    if (liveMinHq == 0 || price < liveMinHq) liveMinHq = price;
+                }
+                else
+                {
+                    nqPrices.Add(price);
+                    if (liveMinNq == 0 || price < liveMinNq) liveMinNq = price;
+                }
+
+                if (liveMinAny == 0 || price < liveMinAny) liveMinAny = price;
+            }
+
+            if (liveMinNq > 0)
+            {
+                var band = (long)Math.Ceiling(liveMinNq * 1.25);
+                compNq = nqPrices.Count(p => p <= band);
+            }
+            else
+            {
+                compNq = 0;
+            }
+
+            if (liveMinHq > 0)
+            {
+                var band = (long)Math.Ceiling(liveMinHq * 1.25);
+                compHq = hqPrices.Count(p => p <= band);
+            }
+            else
+            {
+                compHq = 0;
+            }
         }
-        else if (el.TryGetProperty("listings", out var listEl) && listEl.ValueKind == JsonValueKind.Array)
-        {
-            listingCount = listEl.GetArrayLength();
-        }
-        else
-        {
-            listingCount = minAny > 0 ? 1 : 0;
-        }
+
+        var totalListingsCount = el.TryGetProperty("listingsCount", out var lcEl) && lcEl.ValueKind == JsonValueKind.Number && lcEl.TryGetInt32(out var lc)
+            ? Math.Max(0, lc)
+            : (hasListingsArray ? nonMannequinListingCount : (rawMinAny > 0 ? 1 : 0));
+
+        var allListingsReturned = hasListingsArray && totalListingsCount <= 20;
+        var minNq = liveMinNq > 0 ? liveMinNq : (allListingsReturned ? 0 : rawMinNq);
+        var minHq = liveMinHq > 0 ? liveMinHq : (allListingsReturned ? 0 : rawMinHq);
+        var minAny = liveMinAny > 0 ? liveMinAny : (allListingsReturned ? 0 : rawMinAny);
+        var listingCount = allListingsReturned ? nonMannequinListingCount : totalListingsCount;
 
         snapshot = new MarketPriceSnapshot(
             itemId,
@@ -523,7 +633,9 @@ public sealed class UniversalisClient : IDisposable
             history.LastSaleUnixHq,
             history.SalesLast7DaysNq,
             history.SalesLast7DaysHq,
-            CurrentSnapshotSchemaVersion);
+            CurrentSnapshotSchemaVersion,
+            compNq,
+            compHq);
         return true;
     }
 
@@ -552,7 +664,6 @@ public sealed class UniversalisClient : IDisposable
 
         foreach (var entry in histEl.EnumerateArray())
         {
-            // Ignore mannequin transfers so gil transfers never poison medians or sale recency
             if (entry.TryGetProperty("onMannequin", out var manEl) && manEl.ValueKind == JsonValueKind.True)
             {
                 continue;
@@ -767,6 +878,7 @@ public sealed class UniversalisClient : IDisposable
         if (stopped)
         {
             httpClient.Dispose();
+            rateLimitGate.Dispose();
             wakeSignal.Dispose();
             cts.Dispose();
         }

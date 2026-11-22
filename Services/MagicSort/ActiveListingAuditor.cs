@@ -24,6 +24,7 @@ public sealed record ActiveListingAuditItem(
     uint BaseItemId,
     InventoryItem.ItemFlags Flags,
     bool IsHq,
+    bool IsUnique,
     int Quantity,
     int StackSize,
     string Name,
@@ -31,13 +32,9 @@ public sealed record ActiveListingAuditItem(
     long NpcPriceLow,
     StaleListingSeverity Severity,
     string Reason,
-    MarketViabilityResult Viability);
+    MarketViabilityResult Viability,
+    TimeSpan SnapshotAge);
 
-/// <summary>
-/// Audits active listings in InventoryType.RetainerMarket when RetainerSellList is open,
-/// flagging stale, illiquid, below-vendor, or heavily overpriced listings and providing
-/// explicit user-triggered Remove or Review-Reprice actions via SafeTransactionQueue.
-/// </summary>
 public sealed unsafe class ActiveListingAuditor
 {
     private const double PollIntervalMs = 500.0;
@@ -166,8 +163,6 @@ public sealed unsafe class ActiveListingAuditor
                 }
             }
 
-            // Fail-closed: NEVER flag active listings for removal or repricing based on stale/72h-old cache;
-            // wait for fresh Universalis data queued above.
             if (mkt == null || !hasFresh)
             {
                 continue;
@@ -180,8 +175,9 @@ public sealed unsafe class ActiveListingAuditor
                 continue;
             }
 
-            if (TryClassifyFinding(viability, listedPrice, row.Value.PriceLow, out var severity, out var reason))
+            if (TryClassifyFinding(viability, listedPrice, slot->Quantity, row.Value.PriceLow, out var severity, out var reason))
             {
+                var snapAge = now > mkt.FetchedUtc ? now - mkt.FetchedUtc : TimeSpan.Zero;
                 cachedFindings.Add(new ActiveListingAuditItem(
                     activeId,
                     slotIdx,
@@ -189,6 +185,7 @@ public sealed unsafe class ActiveListingAuditor
                     baseId,
                     slot->Flags,
                     isHq,
+                    row.Value.IsUnique,
                     slot->Quantity,
                     (int)Math.Max(1, row.Value.StackSize),
                     row.Value.Name.ExtractText(),
@@ -196,7 +193,8 @@ public sealed unsafe class ActiveListingAuditor
                     row.Value.PriceLow,
                     severity,
                     reason,
-                    viability));
+                    viability,
+                    snapAge));
             }
         }
 
@@ -205,7 +203,6 @@ public sealed unsafe class ActiveListingAuditor
             universalis.QueueMissing(world, missingIds);
         }
 
-        // Show Unrealistic/Remove findings first, then heavily overpriced listings
         cachedFindings.Sort((a, b) =>
         {
             var sevCmp = a.Severity.CompareTo(b.Severity);
@@ -215,9 +212,10 @@ public sealed unsafe class ActiveListingAuditor
         return cachedFindings;
     }
 
-    private bool TryClassifyFinding(
+    public bool TryClassifyFinding(
         MarketViabilityResult v,
         long listedUnitPrice,
+        int quantity,
         long npcPriceLow,
         out StaleListingSeverity severity,
         out string reason)
@@ -225,7 +223,6 @@ public sealed unsafe class ActiveListingAuditor
         severity = StaleListingSeverity.UnrealisticRemove;
         reason = string.Empty;
 
-        // 1. Dead / illiquid / zero-recent-sales / severely oversupplied -> Remove
         if (v.IsDeadOrIlliquid)
         {
             severity = StaleListingSeverity.UnrealisticRemove;
@@ -233,11 +230,11 @@ public sealed unsafe class ActiveListingAuditor
             return true;
         }
 
-        // 2. Market collapsed below 5%-tax vendor break-even / floor / minimum stack value -> Remove
         var breakeven = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(npcPriceLow);
         if ((npcPriceLow > 0 && v.RealisticUnitPrice < breakeven)
-            || v.RealisticUnitPrice < configuration.MarketMinFloorUnitPrice
-            || (v.RealisticStackValue < configuration.VendorMaxStackValue && v.RealisticUnitPrice < configuration.MarketMinUnitPrice))
+            || (!v.IsRealisticToSell
+                && v.RealisticStackValue < configuration.VendorMaxStackValue
+                && v.RealisticUnitPrice < configuration.MarketMinUnitPrice))
         {
             severity = StaleListingSeverity.UnrealisticRemove;
             reason = npcPriceLow > 0 && v.RealisticUnitPrice < breakeven
@@ -246,73 +243,49 @@ public sealed unsafe class ActiveListingAuditor
             return true;
         }
 
-        // 3. Viable item, but your listing is wildly overpriced / heavily undercut -> Reprice
-        //    ONLY suggest reprice when SuggestedUndercutPrice is strictly lower by >= 500g (never raise price or loop!)
+        var safeQty = Math.Max(1, quantity);
         if (listedUnitPrice > 0
             && v.SuggestedUndercutPrice >= 2
-            && v.SuggestedUndercutPrice < listedUnitPrice
-            && (listedUnitPrice - v.SuggestedUndercutPrice) >= 500)
+            && v.SuggestedUndercutPrice < listedUnitPrice)
         {
-            var refPrice = v.ServerCheapest > 0 ? v.ServerCheapest : v.SoldMedian;
-            var pctThreshold = 1.0 + Math.Clamp(configuration.StaleListingUndercutPct, 5, 200) / 100.0;
-            if (refPrice > 0 && listedUnitPrice >= refPrice * pctThreshold && (listedUnitPrice - refPrice) >= 500)
+            var unitDelta = listedUnitPrice - v.SuggestedUndercutPrice;
+            var stackDelta = unitDelta * safeQty;
+            if (unitDelta >= 500 || stackDelta >= 5_000)
             {
-                var pctAbove = (int)Math.Round(((listedUnitPrice - refPrice) / (double)refPrice) * 100.0);
-                severity = StaleListingSeverity.OverpricedReprice;
-                reason = $"Overpriced (+{pctAbove}% vs {refPrice:N0}g)";
-                return true;
-            }
+                var refPrice = v.ServerCheapest > 0 ? v.ServerCheapest : v.SoldMedian;
+                var pctThreshold = 1.0 + Math.Clamp(configuration.StaleListingUndercutPct, 5, 200) / 100.0;
+                if (refPrice > 0
+                    && listedUnitPrice >= refPrice * pctThreshold
+                    && ((listedUnitPrice - refPrice) >= 500 || (listedUnitPrice - refPrice) * safeQty >= 5_000))
+                {
+                    var pctAbove = (int)Math.Round(((listedUnitPrice - refPrice) / (double)refPrice) * 100.0);
+                    severity = StaleListingSeverity.OverpricedReprice;
+                    reason = $"Overpriced (+{pctAbove}% vs est. {refPrice:N0}g)";
+                    return true;
+                }
 
-            if (v.SoldMedian > 0 && listedUnitPrice > v.SoldMedian * 2.5 && (listedUnitPrice - v.SoldMedian) >= 500)
-            {
-                severity = StaleListingSeverity.OverpricedReprice;
-                reason = $"Far above sold median ({v.SoldMedian:N0}g)";
-                return true;
+                if (v.SoldMedian > 0
+                    && listedUnitPrice > v.SoldMedian * 2.5
+                    && ((listedUnitPrice - v.SoldMedian) >= 500 || (listedUnitPrice - v.SoldMedian) * safeQty >= 5_000))
+                {
+                    severity = StaleListingSeverity.OverpricedReprice;
+                    reason = $"Far above sold median ({v.SoldMedian:N0}g)";
+                    return true;
+                }
             }
         }
 
         return false;
     }
 
-    private static bool DoesRetainerSellMatchItem(AddonRetainerSell* sellAddon, string expectedName, bool expectedHq)
+    private static bool PlayerAlreadyOwnsUniqueItem(InventoryManager* mgr, uint baseItemId)
     {
-        if (sellAddon == null || sellAddon->ItemName == null)
+        if (mgr == null || baseItemId == 0)
         {
             return false;
         }
 
-        var rawText = NativeUiHelpers.ReadTextNodeValue(sellAddon->ItemName);
-        if (string.IsNullOrWhiteSpace(rawText))
-        {
-            return false;
-        }
-
-        var addonIsHq = rawText.Contains('\uE03C');
-        if (addonIsHq != expectedHq)
-        {
-            return false;
-        }
-
-        return string.Equals(
-            NativeUiHelpers.NormalizeItemLabel(rawText),
-            NativeUiHelpers.NormalizeItemLabel(expectedName),
-            StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool HasExactCapacityInContainers(
-        InventoryManager* mgr,
-        InventoryType[] containers,
-        uint rawItemId,
-        InventoryItem.ItemFlags flags,
-        int stackSize,
-        int neededQty)
-    {
-        if (mgr == null || neededQty <= 0)
-        {
-            return false;
-        }
-
-        foreach (var cType in containers)
+        foreach (var cType in InventorySafetyEvaluator.MaterializeSourceContainers)
         {
             var container = mgr->GetInventoryContainer(cType);
             if (!InventorySafetyEvaluator.IsContainerReadable(container))
@@ -323,21 +296,7 @@ public sealed unsafe class ActiveListingAuditor
             for (var i = 0; i < container->Size; i++)
             {
                 var slot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (slot == null)
-                {
-                    continue;
-                }
-
-                if (slot->ItemId == 0)
-                {
-                    return true;
-                }
-
-                if (stackSize > 1
-                    && slot->ItemId == rawItemId
-                    && slot->Flags == flags
-                    && slot->Quantity > 0
-                    && slot->Quantity + neededQty <= stackSize)
+                if (slot != null && slot->Quantity > 0 && ItemIdentity.NormalizeBaseItemId(slot->ItemId) == baseItemId)
                 {
                     return true;
                 }
@@ -347,10 +306,74 @@ public sealed unsafe class ActiveListingAuditor
         return false;
     }
 
-    /// <summary>
-    /// Opens RetainerSell for an active listing and prefills the suggested undercut price
-    /// so the user can inspect (or view Compare Prices) and Confirm manually. Never auto-confirms.
-    /// </summary>
+    private static int FindLiveMarketSlot(
+        InventoryManager* mgr,
+        int preferredSlot,
+        uint rawItemId,
+        InventoryItem.ItemFlags expectedFlags,
+        int expectedQty,
+        long expectedListedPrice)
+    {
+        var container = mgr->GetInventoryContainer(InventoryType.RetainerMarket);
+        if (!InventorySafetyEvaluator.IsContainerReadable(container))
+        {
+            return -1;
+        }
+
+        bool Matches(int idx)
+        {
+            var s = InventorySafetyEvaluator.GetSlot(container, idx);
+            if (s == null || s->ItemId != rawItemId || s->Flags != expectedFlags || s->Quantity != expectedQty)
+            {
+                return false;
+            }
+
+            var livePrices = mgr->RetainerMarketPrices;
+            if (expectedListedPrice > 0 && idx < livePrices.Length && (long)livePrices[idx] != expectedListedPrice)
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        if (preferredSlot >= 0 && preferredSlot < container->Size && Matches(preferredSlot))
+        {
+            return preferredSlot;
+        }
+
+        for (var i = 0; i < container->Size; i++)
+        {
+            if (Matches(i))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int CountLiveMarketItems(InventoryManager* mgr)
+    {
+        var container = mgr->GetInventoryContainer(InventoryType.RetainerMarket);
+        if (!InventorySafetyEvaluator.IsContainerReadable(container))
+        {
+            return 0;
+        }
+
+        var count = 0;
+        for (var i = 0; i < container->Size; i++)
+        {
+            var s = InventorySafetyEvaluator.GetSlot(container, i);
+            if (s != null && s->ItemId != 0 && s->Quantity > 0)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
     public void QueueRepriceReview(ActiveListingAuditItem item)
     {
         if (transactionQueue.IsBusy)
@@ -388,8 +411,8 @@ public sealed unsafe class ActiveListingAuditor
                     }
 
                     var mgr = InventoryManager.Instance();
-                    var slot = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, slotIdx) : null;
-                    if (slot == null || slot->ItemId != rawId || slot->Flags != expectedFlags || slot->Quantity <= 0)
+                    var liveSlot = mgr != null ? FindLiveMarketSlot(mgr, slotIdx, rawId, expectedFlags, item.Quantity, item.ListedUnitPrice) : -1;
+                    if (liveSlot < 0)
                     {
                         return false;
                     }
@@ -400,13 +423,13 @@ public sealed unsafe class ActiveListingAuditor
                         return false;
                     }
 
-                    agent->OpenRetainerSell(InventoryType.RetainerMarket, (ushort)slotIdx);
+                    agent->OpenRetainerSell(InventoryType.RetainerMarket, (ushort)liveSlot);
                     return true;
                 },
                 HasServerAck: () =>
                 {
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
-                    return sellAddon != null && DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq);
+                    return sellAddon != null && RetainerSellAddonHelper.MatchesItem(sellAddon, itemName, expectedHq);
                 },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSell",
@@ -419,7 +442,7 @@ public sealed unsafe class ActiveListingAuditor
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
                     if (sellAddon == null
                         || sellAddon->AskingPrice == null
-                        || !DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq))
+                        || !RetainerSellAddonHelper.MatchesItem(sellAddon, itemName, expectedHq))
                     {
                         return false;
                     }
@@ -431,13 +454,7 @@ public sealed unsafe class ActiveListingAuditor
 
                     if (autoCompare)
                     {
-                        var compareBtn = sellAddon->ComparePrices != null
-                            ? sellAddon->ComparePrices
-                            : sellAddon->AtkUnitBase.GetComponentButtonById(4);
-                        if (compareBtn != null && compareBtn->IsEnabled)
-                        {
-                            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)sellAddon, compareBtn);
-                        }
+                        RetainerSellAddonHelper.TryClickComparePrices(sellAddon);
                     }
 
                     return true;
@@ -446,9 +463,9 @@ public sealed unsafe class ActiveListingAuditor
                 {
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
                     return sellAddon != null
-                        && sellAddon->AskingPrice != null
-                        && DoesRetainerSellMatchItem(sellAddon, itemName, expectedHq)
-                        && (targetPrice < 2 || sellAddon->AskingPrice->Value == targetPrice);
+                        && RetainerSellAddonHelper.MatchesItem(sellAddon, itemName, expectedHq)
+                        && (targetPrice < 2
+                            || (RetainerSellAddonHelper.TryReadAskingPrice(sellAddon, out var livePrice) && livePrice == targetPrice));
                 },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSellList"),
@@ -460,11 +477,6 @@ public sealed unsafe class ActiveListingAuditor
         }
     }
 
-    /// <summary>
-    /// Removes user-selected stale/unrealistic listings from RetainerMarket back to Player Bags
-    /// (or Retainer Bags if player bags are full) using native MoveFromRetainerMarketTo* APIs,
-    /// 1-in-flight with server ACK and human jitter.
-    /// </summary>
     public void QueueRemoveListings(IReadOnlyList<ActiveListingAuditItem> items)
     {
         if (transactionQueue.IsBusy)
@@ -489,6 +501,7 @@ public sealed unsafe class ActiveListingAuditor
         for (var i = 0; i < count; i++)
         {
             var captured = items[i];
+            var preMarketCount = 0;
             steps.Add(new TransactionStep(
                 $"Remove stale listing: {captured.Name}",
                 "RetainerSellList",
@@ -506,22 +519,60 @@ public sealed unsafe class ActiveListingAuditor
                         return false;
                     }
 
-                    var src = InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, captured.MarketSlot);
-                    if (src == null || src->ItemId != captured.RawItemId || src->Flags != captured.Flags || src->Quantity <= 0)
+                    var liveSlot = FindLiveMarketSlot(mgr, captured.MarketSlot, captured.RawItemId, captured.Flags, captured.Quantity, captured.ListedUnitPrice);
+                    if (liveSlot < 0)
                     {
                         return false;
                     }
 
-                    var qty = (uint)src->Quantity;
-                    if (HasExactCapacityInContainers(mgr, InventorySafetyEvaluator.PlayerBagContainers, captured.RawItemId, captured.Flags, captured.StackSize, src->Quantity))
+                    var src = InventorySafetyEvaluator.GetSlot(mgr, InventoryType.RetainerMarket, liveSlot);
+                    if (src == null || src->Quantity <= 0)
                     {
-                        mgr->MoveFromRetainerMarketToPlayerInventory(InventoryType.RetainerMarket, (ushort)captured.MarketSlot, qty);
+                        return false;
+                    }
+
+                    preMarketCount = CountLiveMarketItems(mgr);
+                    var qty = (uint)src->Quantity;
+                    var isCrystal = ItemIdentity.IsCrystalItemId(captured.BaseItemId);
+                    var canMoveToPlayer = isCrystal
+                        ? HasCrystalSlotRoom(mgr, InventoryType.Crystals, captured.BaseItemId, src->Quantity)
+                        : (!captured.IsUnique || !PlayerAlreadyOwnsUniqueItem(mgr, captured.BaseItemId))
+                            && InventorySafetyEvaluator.FindDestinationSlot(
+                                mgr,
+                                InventorySafetyEvaluator.PlayerBagContainers,
+                                captured.RawItemId,
+                                captured.Flags,
+                                captured.StackSize,
+                                out _,
+                                out _,
+                                routeCrystalsToCrystalBag: false,
+                                allowPartialMerge: false,
+                                incomingQty: src->Quantity);
+
+                    if (canMoveToPlayer)
+                    {
+                        mgr->MoveFromRetainerMarketToPlayerInventory(InventoryType.RetainerMarket, (ushort)liveSlot, qty);
                         return true;
                     }
 
-                    if (HasExactCapacityInContainers(mgr, InventorySafetyEvaluator.RetainerBagContainers, captured.RawItemId, captured.Flags, captured.StackSize, src->Quantity))
+                    var canMoveToRetainer = isCrystal
+                        ? HasCrystalSlotRoom(mgr, InventoryType.RetainerCrystals, captured.BaseItemId, src->Quantity)
+                        : (!captured.IsUnique || !RetainerAlreadyOwnsUniqueItem(mgr, captured.BaseItemId))
+                            && InventorySafetyEvaluator.FindDestinationSlot(
+                                mgr,
+                                InventorySafetyEvaluator.RetainerBagContainers,
+                                captured.RawItemId,
+                                captured.Flags,
+                                captured.StackSize,
+                                out _,
+                                out _,
+                                routeCrystalsToCrystalBag: false,
+                                allowPartialMerge: false,
+                                incomingQty: src->Quantity);
+
+                    if (canMoveToRetainer)
                     {
-                        mgr->MoveFromRetainerMarketToRetainerInventory(InventoryType.RetainerMarket, (ushort)captured.MarketSlot, qty);
+                        mgr->MoveFromRetainerMarketToRetainerInventory(InventoryType.RetainerMarket, (ushort)liveSlot, qty);
                         return true;
                     }
 
@@ -536,14 +587,7 @@ public sealed unsafe class ActiveListingAuditor
                         return false;
                     }
 
-                    var container = mgr->GetInventoryContainer(InventoryType.RetainerMarket);
-                    if (!InventorySafetyEvaluator.IsContainerReadable(container))
-                    {
-                        return false;
-                    }
-
-                    var src = InventorySafetyEvaluator.GetSlot(container, captured.MarketSlot);
-                    if (src != null && (src->ItemId == 0 || src->ItemId != captured.RawItemId || src->Quantity <= 0))
+                    if (CountLiveMarketItems(mgr) < preMarketCount)
                     {
                         Invalidate();
                         return true;
@@ -558,5 +602,43 @@ public sealed unsafe class ActiveListingAuditor
         {
             chatGui.Print(failReason);
         }
+    }
+
+    private static bool HasCrystalSlotRoom(InventoryManager* mgr, InventoryType crystalBagType, uint crystalBaseId, int incomingQty)
+    {
+        var bag = mgr->GetInventoryContainer(crystalBagType);
+        var slotIdx = (int)(crystalBaseId - 2);
+        var slot = InventorySafetyEvaluator.GetSlot(bag, slotIdx);
+        if (slot == null)
+        {
+            return false;
+        }
+
+        var currentQty = slot->ItemId == crystalBaseId ? slot->Quantity : 0;
+        return currentQty + Math.Max(1, incomingQty) <= 9999;
+    }
+
+    private static bool RetainerAlreadyOwnsUniqueItem(InventoryManager* mgr, uint baseItemId)
+    {
+        foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainers)
+        {
+            var container = mgr->GetInventoryContainer(containerType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                if (slot != null && slot->ItemId != 0 && slot->Quantity > 0
+                    && ItemIdentity.NormalizeBaseItemId(slot->ItemId) == baseItemId)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 }

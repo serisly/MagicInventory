@@ -4,17 +4,12 @@ using Lumina.Excel.Sheets;
 
 namespace MagicInventory.Core;
 
-/// <summary>
-/// Single source of truth for FFXIV item ID normalization, HQ/Collectable flags,
-/// locale-safe Lumina category classification, and manual-route eligibility.
-/// </summary>
 public static class ItemIdentity
 {
     public const uint CollectableIdOffset = 500_000;
     public const uint HighQualityIdOffset = 1_000_000;
     public const uint EventItemIdThreshold = 2_000_000;
 
-    // Exact Lumina ItemUICategory RowIds (verified against FFXIV 7.x ItemUICategory sheet)
     public const uint UiCatFishingTackle = 33;
     public const uint UiCatMedicine = 44;
     public const uint UiCatIngredient = 45;
@@ -46,114 +41,123 @@ public static class ItemIdentity
     public const uint UiCatCurrency = 100;
     public const uint UiCatOutfits = 112;
 
-    // Exact Lumina ItemSortCategory RowId for currencies (Gil, GC Seals, Tomestones, MGP, etc.)
     public const uint SortCatCurrency = 3;
 
-    // Exact Lumina FilterGroup values
     public const byte FilterGroupCrystal = 11;
     public const byte FilterGroupHousing = 14;
     public const byte FilterGroupPainting = 34;
 
     public static readonly FrozenSet<uint> HousingCategoryIds = new uint[]
     {
-        UiCatFurnishing, // 57
-        64, // Construction Permit
-        65, // Roof
-        66, // Exterior Wall
-        67, // Window
-        68, // Door
-        69, // Roof Decoration
-        70, // Exterior Wall Decoration
-        71, // Placard
-        72, // Fence
-        73, // Interior Wall
-        74, // Flooring
-        75, // Ceiling Light
-        76, // Outdoor Furnishing
-        77, // Table
-        78, // Tabletop
-        79, // Wall-mounted
-        80, // Rug
-        UiCatGardening, // 82
-        UiCatPainting, // 95
+        UiCatFurnishing,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        UiCatGardening,
+        UiCatPainting,
     }.ToFrozenSet();
 
     public static readonly FrozenSet<uint> ProtectedConsumableCategoryIds = new uint[]
     {
-        UiCatMedicine, // 44
-        UiCatMeal, // 46
+        UiCatMedicine,
+        UiCatMeal,
     }.ToFrozenSet();
 
     public static readonly FrozenSet<uint> ProtectedStoreNoAutoMarketCategoryIds = new uint[]
     {
-        UiCatFishingTackle, // 33
-        UiCatDye, // 55
-        UiCatMateria, // 58
-        UiCatCatalyst, // 60
+        UiCatFishingTackle,
+        UiCatDye,
+        UiCatMateria,
+        UiCatCatalyst,
     }.ToFrozenSet();
 
     public static readonly FrozenSet<uint> CraftingStapleCategoryIds = new uint[]
     {
-        UiCatIngredient, // 45
-        UiCatSeafood, // 47
-        UiCatStone, // 48
-        UiCatMetal, // 49
-        UiCatLumber, // 50
-        UiCatCloth, // 51
-        UiCatLeather, // 52
-        UiCatBone, // 53
-        UiCatReagent, // 54
-        UiCatPart, // 56
-        UiCatCatalyst, // 60
+        UiCatIngredient,
+        UiCatSeafood,
+        UiCatStone,
+        UiCatMetal,
+        UiCatLumber,
+        UiCatCloth,
+        UiCatLeather,
+        UiCatBone,
+        UiCatReagent,
+        UiCatPart,
+        UiCatCatalyst,
     }.ToFrozenSet();
 
     public static readonly FrozenSet<uint> ProtectedNoVendorCategoryIds = new uint[]
     {
-        UiCatDye, // 55
-        UiCatMateria, // 58
-        UiCatCatalyst, // 60
-        UiCatFishingTackle, // 33
-        UiCatSeasonalMiscellany, // 85
-        UiCatMinion, // 81
-        UiCatTripleTriadCard, // 86
-        UiCatOrchestrionRoll, // 94
-        UiCatDemimateria, // 83
-        UiCatOutfits, // 112
+        UiCatDye,
+        UiCatMateria,
+        UiCatCatalyst,
+        UiCatFishingTackle,
+        UiCatSeasonalMiscellany,
+        UiCatMinion,
+        UiCatTripleTriadCard,
+        UiCatOrchestrionRoll,
+        UiCatDemimateria,
+        UiCatOutfits,
     }.ToFrozenSet();
 
-    public static readonly FrozenSet<uint> CulinaryBotanyDefaultCategoryIds = new uint[]
+    public const uint ActionIdExpManual = 816;
+    public const uint ActionIdGysahlGreens = 851;
+    public const uint ActionIdCordial = 1055;
+    public const uint ActionIdFantasia = 1326;
+    public const uint ActionIdChocoboTrainingGreens = 2483;
+    public const uint ActionIdThavnairianOnion = 3292;
+    public const uint ActionIdMgpCard = 3800;
+    public const uint ActionIdGearCofferA = 4647;
+    public const uint ActionIdAetheryteTicket = 9994;
+    public const uint ActionIdTalesOfAdventure = 25174;
+    public const uint ActionIdGearCofferB = 29153;
+
+    public static readonly FrozenSet<uint> ProtectedUtilityActionIds = new uint[]
     {
-        UiCatIngredient, // 45
-        UiCatSeafood, // 47
-        UiCatMeal, // 46
-        UiCatMedicine, // 44
-        UiCatReagent, // 54
-        UiCatCatalyst, // 60
-        UiCatGardening, // 82
-        UiCatFishingTackle, // 33
+        ActionIdExpManual,
+        ActionIdGysahlGreens,
+        ActionIdCordial,
+        ActionIdFantasia,
+        ActionIdChocoboTrainingGreens,
+        ActionIdThavnairianOnion,
+        ActionIdAetheryteTicket,
+        ActionIdTalesOfAdventure,
     }.ToFrozenSet();
 
-    public static readonly FrozenSet<uint> MaterialsDefaultCategoryIds = new uint[]
+    public static readonly FrozenSet<uint> CofferActionIds = new uint[]
     {
-        UiCatStone, // 48
-        UiCatMetal, // 49
-        UiCatLumber, // 50
-        UiCatCloth, // 51
-        UiCatLeather, // 52
-        UiCatBone, // 53
-        UiCatPart, // 56
-        UiCatMateria, // 58
-        UiCatDye, // 55
-        UiCatFurnishing, // 57
-        UiCatDemimateria, // 83
-        UiCatMiscellany, // 61
-        UiCatOther, // 63
+        ActionIdGearCofferA,
+        ActionIdGearCofferB,
+    }.ToFrozenSet();
+
+    public static readonly FrozenSet<uint> ProtectedUtilityItemIds = new uint[]
+    {
+        5594, 5595, 5596, 5597, 5598, 10386, 17837, 33916,
+        7569,
+        7621,
+        8165,
+        12994, 12995,
+        21800,
     }.ToFrozenSet();
 
     public static readonly FrozenSet<uint> CrafterGathererToolCategoryIds = new uint[]
     {
-        12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, // DoH tools
-        28, 29, 30, 31, 32, 99, // DoL tools (incl. Fisher's Secondary Tool 99)
+        12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29, 30, 31, 32, 99,
     }.ToFrozenSet();
 
     public static bool IsValidItemId(ulong rawItemId)
@@ -162,10 +166,6 @@ public static class ItemIdentity
     public static bool IsCrystalItemId(uint baseItemId)
         => baseItemId is >= 2 and <= 19;
 
-    /// <summary>
-    /// Normalizes a raw FFXIV item ID to its base Item sheet RowId.
-    /// Strips HQ (+1,000,000) and Collectable (+500,000) offsets; rejects 0 and Event/Key items (>= 2,000,000).
-    /// </summary>
     public static uint NormalizeBaseItemId(uint rawItemId)
     {
         if (rawItemId == 0 || rawItemId >= EventItemIdThreshold)
@@ -200,17 +200,9 @@ public static class ItemIdentity
     public static unsafe bool IsCollectable(InventoryItem* slot)
         => slot != null && IsCollectable(slot->ItemId, slot->Flags);
 
-    /// <summary>
-    /// Returns the item ID expected by ActionManager.UseAction(ActionType.Item, ...).
-    /// FFXIV requires baseId + 1,000,000 for HQ consumables/items.
-    /// </summary>
     public static uint ToActionItemId(uint baseItemId, bool isHq)
         => isHq ? baseItemId + HighQualityIdOffset : baseItemId;
 
-    /// <summary>
-    /// Locale-safe currency/crystal check.
-    /// NEVER uses FilterGroup == 16 (which contains Seafood, Medicine/Antidotes, Glamour Prisms, Dark Matter, Minions, etc.).
-    /// </summary>
     public static bool IsCurrencyOrCrystal(uint baseItemId, Item itemRow)
     {
         if (baseItemId <= 19)
@@ -258,10 +250,6 @@ public static class ItemIdentity
         => itemRow.FilterGroup is FilterGroupHousing or FilterGroupPainting
             || HousingCategoryIds.Contains(itemRow.ItemUICategory.RowId);
 
-    /// <summary>
-    /// True for actual unlockable items in protected categories (Triple Triad Card, Minion,
-    /// Outfits, and usable Orchestrion Rolls — excluding Blank Orchestrion Roll crafting mats with ItemAction == 0).
-    /// </summary>
     public static bool IsUnlockableCategory(Item itemRow)
     {
         var uiCat = itemRow.ItemUICategory.RowId;
@@ -278,6 +266,30 @@ public static class ItemIdentity
 
     public static bool IsEquipment(Item itemRow)
         => itemRow.EquipSlotCategory.RowId != 0 && !IsSoulCrystal(itemRow);
+
+    public static bool IsRelicRarity(Item itemRow)
+        => itemRow.Rarity == 4;
+
+    public static bool IsMgpCard(Item itemRow)
+        => itemRow.ItemAction.RowId != 0
+            && itemRow.ItemAction.ValueNullable?.Action.RowId == ActionIdMgpCard;
+
+    public static bool IsCofferOrContainer(Item itemRow)
+        => itemRow.ItemAction.RowId != 0
+            && itemRow.ItemAction.ValueNullable is { } act
+            && CofferActionIds.Contains(act.Action.RowId);
+
+    public static bool IsProtectedUtilityItem(uint baseItemId, Item itemRow)
+    {
+        if (ProtectedUtilityItemIds.Contains(baseItemId))
+        {
+            return true;
+        }
+
+        return itemRow.ItemAction.RowId != 0
+            && itemRow.ItemAction.ValueNullable is { } act
+            && ProtectedUtilityActionIds.Contains(act.Action.RowId);
+    }
 }
 
 public readonly record struct ItemRouteEligibility(
@@ -297,8 +309,8 @@ public readonly record struct ItemRouteEligibility(
         {
             return new ItemRouteEligibility(
                 CanUse: false,
-                CanMarket: true,
-                CanVendor: true,
+                CanMarket: false,
+                CanVendor: false,
                 CanGrandCompany: false,
                 CanGoldSaucer: false,
                 CanGlamour: false,
@@ -310,8 +322,8 @@ public readonly record struct ItemRouteEligibility(
         return new ItemRouteEligibility(
             CanUse: row.ItemAction.RowId > 0,
             CanMarket: ItemIdentity.IsMarketable(row),
-            CanVendor: row.PriceLow > 0 && !row.IsUnique,
-            CanGrandCompany: isEquip && row.Rarity is 2 or 3 or 7 && row.LevelItem.RowId >= 15,
+            CanVendor: row.PriceLow > 0,
+            CanGrandCompany: isEquip && row.Rarity is 2 or 3 or 7 && row.LevelItem.RowId >= 15 && row.LevelEquip >= 15 && row.PriceLow > 0,
             CanGoldSaucer: ItemIdentity.IsTripleTriadCard(row),
             CanGlamour: isEquip,
             CanArmoire: isCabinetItem);

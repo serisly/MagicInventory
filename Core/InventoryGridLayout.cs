@@ -1,16 +1,14 @@
+using System;
+using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace MagicInventory.Core;
 
-/// <summary>
-/// Single source of truth for mapping physical FFXIV InventoryType + Slot coordinates
-/// to visible UI grid addons/node IDs (Player Bags, Armoury Chest, and Retainer Grids)
-/// and computing accurate screen-space bounding boxes for AtkResNodes.
-/// </summary>
 public static unsafe class InventoryGridLayout
 {
     public const int VisualBagSlotsPerPage = 35;
@@ -45,18 +43,18 @@ public static unsafe class InventoryGridLayout
 
     public static readonly InventoryType[] ArmouryTabContainers =
     [
-        InventoryType.ArmoryMainHand,    // RadioButton Node 7
-        InventoryType.ArmoryHead,        // RadioButton Node 8
-        InventoryType.ArmoryBody,        // RadioButton Node 9
-        InventoryType.ArmoryHands,       // RadioButton Node 10
-        InventoryType.ArmoryLegs,        // RadioButton Node 11
-        InventoryType.ArmoryFeets,       // RadioButton Node 12
-        InventoryType.ArmoryOffHand,     // RadioButton Node 13
-        InventoryType.ArmoryEar,         // RadioButton Node 14
-        InventoryType.ArmoryNeck,        // RadioButton Node 15
-        InventoryType.ArmoryWrist,       // RadioButton Node 16
-        InventoryType.ArmoryRings,       // RadioButton Node 17
-        InventoryType.ArmorySoulCrystal, // RadioButton Node 18
+        InventoryType.ArmoryMainHand,
+        InventoryType.ArmoryHead,
+        InventoryType.ArmoryBody,
+        InventoryType.ArmoryHands,
+        InventoryType.ArmoryLegs,
+        InventoryType.ArmoryFeets,
+        InventoryType.ArmoryOffHand,
+        InventoryType.ArmoryEar,
+        InventoryType.ArmoryNeck,
+        InventoryType.ArmoryWrist,
+        InventoryType.ArmoryRings,
+        InventoryType.ArmorySoulCrystal,
     ];
 
     public readonly record struct VisualGridSlot(
@@ -73,7 +71,8 @@ public static unsafe class InventoryGridLayout
             return -1;
         }
 
-        var buttons = new List<(float X, float Y, bool Selected)>(12);
+        Span<(float X, float Y, bool Selected)> buttons = stackalloc (float, float, bool)[12];
+        var count = 0;
         for (uint nodeId = 7; nodeId <= 18; nodeId++)
         {
             var node = armoury->GetNodeById(nodeId);
@@ -88,28 +87,22 @@ public static unsafe class InventoryGridLayout
                 continue;
             }
 
-            buttons.Add((node->X, node->Y, radio->IsSelected));
+            if (count < 12)
+            {
+                buttons[count++] = (node->X, node->Y, radio->IsSelected);
+            }
         }
 
-        if (buttons.Count != 12)
+        if (count != 12)
         {
-            for (var i = 0; i < buttons.Count; i++)
-            {
-                if (buttons[i].Selected)
-                {
-                    return i;
-                }
-            }
-
             return -1;
         }
 
-        // Split into left column (6 smallest X) and right column (6 largest X), each sorted top-to-bottom by Y
-        buttons.Sort((a, b) => a.X.CompareTo(b.X));
-        var left = buttons.GetRange(0, 6);
-        var right = buttons.GetRange(6, 6);
-        left.Sort((a, b) => a.Y.CompareTo(b.Y));
-        right.Sort((a, b) => a.Y.CompareTo(b.Y));
+        SortByX(buttons);
+        var left = buttons[..6];
+        var right = buttons[6..];
+        SortByY(left);
+        SortByY(right);
 
         for (var i = 0; i < 6; i++)
         {
@@ -128,6 +121,38 @@ public static unsafe class InventoryGridLayout
         }
 
         return -1;
+
+        static void SortByX(Span<(float X, float Y, bool Selected)> span)
+        {
+            for (var i = 1; i < span.Length; i++)
+            {
+                var key = span[i];
+                var j = i - 1;
+                while (j >= 0 && span[j].X > key.X)
+                {
+                    span[j + 1] = span[j];
+                    j--;
+                }
+
+                span[j + 1] = key;
+            }
+        }
+
+        static void SortByY(Span<(float X, float Y, bool Selected)> span)
+        {
+            for (var i = 1; i < span.Length; i++)
+            {
+                var key = span[i];
+                var j = i - 1;
+                while (j >= 0 && span[j].Y > key.Y)
+                {
+                    span[j + 1] = span[j];
+                    j--;
+                }
+
+                span[j + 1] = key;
+            }
+        }
     }
 
     public static InventoryType? GetActiveArmouryTabContainer(IGameGui gameGui)
@@ -161,9 +186,6 @@ public static unsafe class InventoryGridLayout
         };
     }
 
-    /// <summary>
-    /// Enumerates all currently visible player-bag visual slots (InventoryExpansion, InventoryLarge, or Inventory).
-    /// </summary>
     public static void CollectVisiblePlayerBagSlots(IGameGui gameGui, List<VisualGridSlot> output)
     {
         var visualEntries = new List<(int Page, int Slot, InventoryType Container, int PhysicalSlot)>(140);
@@ -251,9 +273,6 @@ public static unsafe class InventoryGridLayout
         }
     }
 
-    /// <summary>
-    /// Enumerates all currently visible ArmouryBoard visual slots for the active Armoury tab.
-    /// </summary>
     public static void CollectVisibleArmourySlots(IGameGui gameGui, List<VisualGridSlot> output)
     {
         var tabIdx = GetActiveArmouryTabIndex(gameGui);
@@ -265,13 +284,18 @@ public static unsafe class InventoryGridLayout
         var activeContainer = ArmouryTabContainers[tabIdx];
         var orderModule = ItemOrderModule.Instance();
         var sorter = GetArmourySorter(orderModule, tabIdx);
+        var manager = InventoryManager.Instance();
+        var physContainer = manager != null ? manager->GetInventoryContainer(activeContainer) : null;
+        var containerCap = physContainer != null && physContainer->Size > 0
+            ? Math.Min((int)physContainer->Size, 50)
+            : 50;
 
         if (sorter != null && sorter->Items.Count > 0)
         {
-            for (var v = 0; v < sorter->Items.Count && v < 50; v++)
+            for (var v = 0; v < sorter->Items.Count && v < containerCap; v++)
             {
                 var entryPtr = sorter->Items[v].Value;
-                if (entryPtr == null)
+                if (entryPtr == null || entryPtr->Slot >= containerCap)
                 {
                     continue;
                 }
@@ -281,17 +305,13 @@ public static unsafe class InventoryGridLayout
         }
         else
         {
-            for (var s = 0; s < 50; s++)
+            for (var s = 0; s < containerCap; s++)
             {
                 output.Add(new VisualGridSlot("ArmouryBoard", (uint)(ArmourySlotBaseNodeId + s), activeContainer, s));
             }
         }
     }
 
-    /// <summary>
-    /// Enumerates all currently visible Retainer grid visual slots (RetainerGrid0..4 or RetainerGrid).
-    /// Always divides the flat visual index by 35 (5 visual tabs × 35 slots = 175), NOT sorter->ItemsPerPage (which can be 25).
-    /// </summary>
     public static void CollectVisibleRetainerSlots(IGameGui gameGui, List<VisualGridSlot> output)
     {
         var hasNamedGrids = false;
@@ -347,7 +367,6 @@ public static unsafe class InventoryGridLayout
                     continue;
                 }
 
-                // FFXIV renders retainer bags across 5 visual tabs of 35 slots (175 total).
                 var visualTab = v / VisualRetainerSlotsPerTab;
                 var visualSlot = v % VisualRetainerSlotsPerTab;
                 EmitRetainerVisualSlot(visualTab, visualSlot, physType, entryPtr->Slot, hasNamedGrids, gridReady, singleGridReady, activeSingleTab, output);
@@ -355,7 +374,6 @@ public static unsafe class InventoryGridLayout
         }
         else
         {
-            // Linear fallback: 7 physical pages × 25 slots -> 5 visual tabs × 35 slots
             for (var p = 0; p < 7; p++)
             {
                 var physType = p switch
@@ -404,10 +422,6 @@ public static unsafe class InventoryGridLayout
         }
     }
 
-    /// <summary>
-    /// Maps AgentItemDetail visual bag tab codes (48..51) back to physical Inventory1..4 + physical slot
-    /// using ItemOrderModule.InventorySorter.
-    /// </summary>
     public static void NormalizeVisualBagSlot(ref InventoryType? container, ref short? slot)
     {
         if (!container.HasValue || !slot.HasValue || slot.Value < 0)
@@ -458,10 +472,6 @@ public static unsafe class InventoryGridLayout
         };
     }
 
-    /// <summary>
-    /// Computes accurate screen-space bounding box for an AtkResNode inside an AtkUnitBase,
-    /// properly applying each ancestor's scale to accumulated child offsets (NOT the child's own scale to its own X/Y).
-    /// </summary>
     public static bool TryGetNodeScreenRect(
         AtkUnitBase* addon,
         AtkResNode* node,
@@ -476,16 +486,16 @@ public static unsafe class InventoryGridLayout
             return false;
         }
 
-        var posX = node->X;
-        var posY = node->Y;
+        var posX = node->X + node->OriginX * (1f - node->ScaleX);
+        var posY = node->Y + node->OriginY * (1f - node->ScaleY);
         var scaleX = node->ScaleX;
         var scaleY = node->ScaleY;
         var cur = node->ParentNode;
         var guard = 0;
         while (cur != null && cur->ParentNode != null && guard++ < 64)
         {
-            posX = posX * cur->ScaleX + cur->X;
-            posY = posY * cur->ScaleY + cur->Y;
+            posX = posX * cur->ScaleX + cur->X + cur->OriginX * (1f - cur->ScaleX);
+            posY = posY * cur->ScaleY + cur->Y + cur->OriginY * (1f - cur->ScaleY);
             scaleX *= cur->ScaleX;
             scaleY *= cur->ScaleY;
             cur = cur->ParentNode;
@@ -504,5 +514,89 @@ public static unsafe class InventoryGridLayout
         min = new Vector2(left, top);
         max = new Vector2(left + width, top + height);
         return true;
+    }
+
+    public static bool TryGetAddonScreenRect(AtkUnitBase* addon, Vector2 vpPos, out Vector2 min, out Vector2 max)
+    {
+        min = Vector2.Zero;
+        max = Vector2.Zero;
+        if (addon == null || addon->RootNode == null || !addon->IsVisible || !addon->RootNode->IsVisible())
+        {
+            return false;
+        }
+
+        var scale = addon->Scale > 0.01f ? addon->Scale : 1f;
+        var w = addon->RootNode->Width * scale;
+        var h = addon->RootNode->Height * scale;
+        if (w < 8f || h < 8f)
+        {
+            return false;
+        }
+
+        min = new Vector2(vpPos.X + addon->X, vpPos.Y + addon->Y);
+        max = new Vector2(min.X + w, min.Y + h);
+        return true;
+    }
+
+    public static void CollectHigherZAddonRects(
+        AtkUnitBase* targetAddon,
+        Vector2 vpPos,
+        Vector2 vpSize,
+        List<(Vector2 Min, Vector2 Max)> output)
+    {
+        output.Clear();
+        if (targetAddon == null)
+        {
+            return;
+        }
+
+        var unitManager = RaptureAtkUnitManager.Instance();
+        if (unitManager == null)
+        {
+            return;
+        }
+
+        var targetLayer = targetAddon->DepthLayer;
+        var targetOrder = targetAddon->DrawOrderIndex;
+        var targetHost = targetAddon->HostId != 0 ? targetAddon->HostId : targetAddon->Id;
+
+        var list = unitManager->AllLoadedUnitsList;
+        var count = Math.Min((int)list.Count, list.Entries.Length);
+        for (var i = 0; i < count; i++)
+        {
+            var other = list.Entries[i].Value;
+            if (other == null
+                || other == targetAddon
+                || other->Id == targetHost
+                || (other->HostId != 0 && other->HostId == targetHost))
+            {
+                continue;
+            }
+
+            if (other->DepthLayer < targetLayer
+                || (other->DepthLayer == targetLayer && other->DrawOrderIndex <= targetOrder))
+            {
+                continue;
+            }
+
+            if (!TryGetAddonScreenRect(other, vpPos, out var min, out var max))
+            {
+                continue;
+            }
+
+            var w = max.X - min.X;
+            var h = max.Y - min.Y;
+            if (vpSize.X > 0f && vpSize.Y > 0f && w >= vpSize.X * 0.88f && h >= vpSize.Y * 0.88f)
+            {
+                continue;
+            }
+
+            if (other->WindowCollisionNode == null && other->DepthLayer <= targetLayer)
+            {
+                continue;
+            }
+
+            output.Add((min, max));
+        }
     }
 }

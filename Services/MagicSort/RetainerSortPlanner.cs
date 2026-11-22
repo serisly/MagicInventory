@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
@@ -69,14 +69,14 @@ public sealed unsafe class RetainerSortPlanner
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
         var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
-
         var knownRetainers = holdings.GetKnownRetainersForCurrentCharacter();
 
         var simulatedRetainerEmpty = 0;
         var retainerExistingBaseIds = new HashSet<uint>();
         var retainerPartialSlots = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<int>>();
+        var retainerPartialByQuality = new HashSet<(uint BaseId, bool IsHq)>();
 
         static void AddPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key, int room)
         {
@@ -155,6 +155,7 @@ public sealed unsafe class RetainerSortPlanner
                     && rSlot->Quantity < rStackSize)
                 {
                     AddPartialRoom(retainerPartialSlots, (rSlot->ItemId, rSlot->Flags), rStackSize - rSlot->Quantity);
+                    retainerPartialByQuality.Add((rBaseId, ItemIdentity.IsHighQuality(rSlot)));
                 }
             }
         }
@@ -222,6 +223,80 @@ public sealed unsafe class RetainerSortPlanner
             }
         }
 
+        var missingTracked = getMissingTrackedQuantities();
+
+        var capacityList = new List<RetainerCapacityState>(knownRetainers.Count + 1);
+        var capacityById = new Dictionary<ulong, RetainerCapacityState>(knownRetainers.Count + 1);
+        var liveActiveFree = simulatedRetainerEmpty;
+
+        foreach (var kr in knownRetainers)
+        {
+            var captured = kr;
+            var isLiveActive = kr.RetainerId == activeId;
+            var cap = new RetainerCapacityState
+            {
+                RetainerId = kr.RetainerId,
+                BaseFreeSlots = isLiveActive ? liveActiveFree : holdings.GetKnownRetainerFreeSlots(kr.RetainerId),
+                HasBaseItem = isLiveActive
+                    ? id => retainerExistingBaseIds.Contains(id)
+                    : id => captured.Quantities.GetValueOrDefault(id) > 0,
+                HasPartialStack = isLiveActive
+                    ? (id, hq) => retainerPartialByQuality.Contains((id, hq))
+                    : (id, hq) => holdings.HasPartialStackOnRetainer(captured.RetainerId, id, hq),
+                IsKnownFullFor = isLiveActive
+                    ? (id, hq, stack) => liveActiveFree <= 0 && !(stack > 1 && retainerPartialByQuality.Contains((id, hq)))
+                    : (id, hq, stack) => holdings.IsRetainerKnownFullFor(captured.RetainerId, id, hq, stack),
+            };
+
+            cap.ProjectedWithdrawalFreedSlots = isLiveActive
+                ? ProjectLiveActiveRetainerWithdrawals(
+                    manager,
+                    liveActiveFree,
+                    manifestEntries,
+                    itemSheet,
+                    gearsetIds,
+                    unlockedProfile,
+                    playerExistingBaseIds,
+                    missingTracked)
+                : ProjectDirectWithdrawalsForRetainer(
+                    kr,
+                    cap.BaseFreeSlots,
+                    manifestEntries,
+                    itemSheet,
+                    gearsetIds,
+                    unlockedProfile,
+                    playerUniqueBaseIds: playerExistingBaseIds,
+                    missingTracked);
+
+            capacityList.Add(cap);
+            capacityById[kr.RetainerId] = cap;
+        }
+
+        if (!capacityById.ContainsKey(activeId))
+        {
+            var activeCap = new RetainerCapacityState
+            {
+                RetainerId = activeId,
+                BaseFreeSlots = liveActiveFree,
+                ProjectedWithdrawalFreedSlots = ProjectLiveActiveRetainerWithdrawals(
+                    manager,
+                    liveActiveFree,
+                    manifestEntries,
+                    itemSheet,
+                    gearsetIds,
+                    unlockedProfile,
+                    playerExistingBaseIds,
+                    missingTracked),
+                HasBaseItem = id => retainerExistingBaseIds.Contains(id),
+                HasPartialStack = (id, hq) => retainerPartialByQuality.Contains((id, hq)),
+                IsKnownFullFor = (id, hq, stack) => liveActiveFree <= 0 && !(stack > 1 && retainerPartialByQuality.Contains((id, hq))),
+            };
+            capacityList.Add(activeCap);
+            capacityById[activeId] = activeCap;
+        }
+
+        RetainerTransferPolicy.InitializeProjectedBudgets(capacityList, simulatedPlayerEmpty);
+
         var depositSources = armouryOpen
             ? InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers)
             : InventorySafetyEvaluator.PlayerBagContainers;
@@ -254,12 +329,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
-                if (itemRow is null || ItemIdentity.IsSoulCrystal(itemRow.Value) || itemRow.Value.Rarity >= 4)
-                {
-                    continue;
-                }
-
-                if (itemRow.Value.IsUnique && retainerExistingBaseIds.Contains(baseId))
+                if (itemRow is null || ItemIdentity.IsSoulCrystal(itemRow.Value) || ItemIdentity.IsRelicRarity(itemRow.Value))
                 {
                     continue;
                 }
@@ -269,45 +339,22 @@ public sealed unsafe class RetainerSortPlanner
 
                 if (manifestEntries.TryGetValue(baseId, out var entry))
                 {
-                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                    if (effRoute != "Retainer")
+                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
+                    if (effRoute != "Retainer" || entry.TargetRetainerId == 0)
                     {
                         continue;
                     }
 
-                    var isPrimaryTarget = entry.TargetRetainerId == activeId;
-                    var isOverflowTarget = false;
-                    if (!isPrimaryTarget
-                        && entry.TargetRetainerId != 0
-                        && holdings.IsRetainerKnownFullFor(entry.TargetRetainerId, baseId, isHq, stackSize))
-                    {
-                        // Deterministic overflow selection matching RetainerBellEvaluator (prevents cross-retainer ping-pong):
-                        // only accept overflow if this retainer is the first non-full eligible retainer (or has a partial merge).
-                        ulong chosenOverflowId = 0;
-                        foreach (var kr in knownRetainers)
-                        {
-                            if (kr.RetainerId == entry.TargetRetainerId)
-                            {
-                                continue;
-                            }
-
-                            if (itemRow.Value.IsUnique && kr.Quantities.GetValueOrDefault(baseId) > 0)
-                            {
-                                continue;
-                            }
-
-                            var hasPartial = stackSize > 1 && holdings.HasPartialStackOnRetainer(kr.RetainerId, baseId, isHq);
-                            if (hasPartial || !holdings.IsRetainerKnownFullFor(kr.RetainerId, baseId, isHq, stackSize))
-                            {
-                                chosenOverflowId = kr.RetainerId;
-                                break;
-                            }
-                        }
-
-                        isOverflowTarget = chosenOverflowId == activeId || chosenOverflowId == 0;
-                    }
-
-                    if (!isPrimaryTarget && !isOverflowTarget)
+                    var decision = RetainerTransferPolicy.ResolveDepositTarget(
+                        entry.TargetRetainerId,
+                        baseId,
+                        isHq,
+                        itemRow.Value.IsUnique,
+                        stackSize,
+                        capacityList,
+                        capacityById,
+                        consumeBudget: true);
+                    if (decision.TargetRetainerId != activeId)
                     {
                         continue;
                     }
@@ -320,6 +367,11 @@ public sealed unsafe class RetainerSortPlanner
                     {
                         continue;
                     }
+                }
+
+                if (itemRow.Value.IsUnique && retainerExistingBaseIds.Contains(baseId))
+                {
+                    continue;
                 }
 
                 depositCandidates.Add(new RetainerTransferCandidate(
@@ -341,74 +393,6 @@ public sealed unsafe class RetainerSortPlanner
             var bMerges = PeekFirstPartialRoom(retainerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
             return bMerges.CompareTo(aMerges);
         });
-
-        // Pre-compute destination retainer free-slot budgets AFTER accounting for player-bag items already
-        // queued to deposit into those retainers, so cross-retainer funneling NEVER pulls an item out of
-        // this retainer only to leave it stranded in the player's bag because the target retainer filled up.
-        var destFreeSlotBudget = new Dictionary<ulong, int>();
-        foreach (var srcBag in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var bagContainer = manager->GetInventoryContainer(srcBag);
-            if (!InventorySafetyEvaluator.IsContainerReadable(bagContainer))
-            {
-                continue;
-            }
-
-            for (var sIdx = 0; sIdx < bagContainer->Size; sIdx++)
-            {
-                var pSlot = InventorySafetyEvaluator.GetSlot(bagContainer, sIdx);
-                if (pSlot == null || pSlot->ItemId == 0 || pSlot->Quantity <= 0)
-                {
-                    continue;
-                }
-
-                var pBase = ItemIdentity.NormalizeBaseItemId(pSlot->ItemId);
-                if (!ItemIdentity.CanLockOrTagBaseId(pBase)
-                    || gearsetIds.Contains(pBase)
-                    || safety.IsItemTracked(pBase))
-                {
-                    continue;
-                }
-
-                if (!manifestEntries.TryGetValue(pBase, out var pEntry)
-                    || !string.Equals(pEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
-                    || pEntry.TargetRetainerId == 0
-                    || pEntry.TargetRetainerId == activeId)
-                {
-                    continue;
-                }
-
-                var pRow = itemSheet.GetRowOrDefault(pBase);
-                if (pRow is null
-                    || ItemIdentity.IsSoulCrystal(pRow.Value)
-                    || pRow.Value.Rarity >= 4)
-                {
-                    continue;
-                }
-
-                if (!string.Equals(
-                        safety.ResolveEffectiveSlotRoute(pEntry, pRow.Value, pSlot, manifestEntries, gearsetIds, unlockedTop),
-                        "Retainer",
-                        StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                var pStack = (int)Math.Max(1, pRow.Value.StackSize);
-                var pHq = ItemIdentity.IsHighQuality(pSlot);
-                if (pStack > 1 && holdings.HasPartialStackOnRetainer(pEntry.TargetRetainerId, pBase, pHq))
-                {
-                    continue;
-                }
-
-                if (!destFreeSlotBudget.TryGetValue(pEntry.TargetRetainerId, out var rem))
-                {
-                    rem = holdings.GetKnownRetainerFreeSlots(pEntry.TargetRetainerId);
-                }
-
-                destFreeSlotBudget[pEntry.TargetRetainerId] = Math.Max(0, rem - 1);
-            }
-        }
 
         var withdrawCandidates = new List<RetainerTransferCandidate>();
         foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainers)
@@ -444,7 +428,7 @@ public sealed unsafe class RetainerSortPlanner
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
                 if (itemRow is null
                     || ItemIdentity.IsSoulCrystal(itemRow.Value)
-                    || itemRow.Value.Rarity >= 4)
+                    || ItemIdentity.IsRelicRarity(itemRow.Value))
                 {
                     continue;
                 }
@@ -458,14 +442,13 @@ public sealed unsafe class RetainerSortPlanner
                 var isHq = ItemIdentity.IsHighQuality(slot);
                 var shouldWithdraw = false;
 
-                // Explicit manual "Keep" override pulls the item out of the retainer into Player Bags
                 if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
                 {
                     shouldWithdraw = safety.HasExplicitKeepOverride(baseId);
                 }
                 else
                 {
-                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
+                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
                     if (effRoute != null)
                     {
                         if (RetainerBellEvaluator.IsWithdrawableRoute(effRoute))
@@ -476,25 +459,17 @@ public sealed unsafe class RetainerSortPlanner
                             && entry.TargetRetainerId != 0
                             && entry.TargetRetainerId != activeId)
                         {
-                            var mergesIntoPartial = stackSize > 1
-                                && holdings.HasPartialStackOnRetainer(entry.TargetRetainerId, baseId, isHq);
-                            if (mergesIntoPartial)
-                            {
-                                shouldWithdraw = true;
-                            }
-                            else
-                            {
-                                if (!destFreeSlotBudget.TryGetValue(entry.TargetRetainerId, out var remSlots))
-                                {
-                                    remSlots = holdings.GetKnownRetainerFreeSlots(entry.TargetRetainerId);
-                                }
-
-                                if (remSlots > 0)
-                                {
-                                    destFreeSlotBudget[entry.TargetRetainerId] = remSlots - 1;
-                                    shouldWithdraw = true;
-                                }
-                            }
+                            var funnel = RetainerTransferPolicy.EvaluateCrossRetainerFunnel(
+                                activeId,
+                                entry.TargetRetainerId,
+                                baseId,
+                                hasNq: !isHq,
+                                hasHq: isHq,
+                                itemRow.Value.IsUnique,
+                                stackSize,
+                                capacityById,
+                                consumeBudget: true);
+                            shouldWithdraw = funnel.CanFunnel;
                         }
                     }
                 }
@@ -552,13 +527,12 @@ public sealed unsafe class RetainerSortPlanner
                     var itemRow = itemSheet.GetRowOrDefault(baseId);
                     if (itemRow is null
                         || ItemIdentity.IsSoulCrystal(itemRow.Value)
-                        || itemRow.Value.Rarity >= 4)
+                        || ItemIdentity.IsRelicRarity(itemRow.Value))
                     {
                         continue;
                     }
 
-                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedTop);
-                    // Only pull Market gear from Armoury at a Summoning Bell (Armoire/Glamour scan Armoury directly!)
+                    var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
                     if (effRoute != "Market")
                     {
                         continue;
@@ -592,7 +566,6 @@ public sealed unsafe class RetainerSortPlanner
             return bFromRet.CompareTo(aFromRet);
         });
 
-        var missingTracked = getMissingTrackedQuantities();
         var trackedWithdrawCandidates = new List<RetainerTransferCandidate>();
         if (missingTracked.Count > 0)
         {
@@ -714,61 +687,17 @@ public sealed unsafe class RetainerSortPlanner
                     withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
                     remainingNeeded[cand.BaseItemId] = 0;
 
-                    var capturedSrc = cand.SourceContainer;
-                    var capturedSlot = cand.SourceSlot;
-                    var capturedRawId = cand.RawItemId;
-                    var capturedFlags = cand.Flags;
-                    var capturedStack = cand.StackSize;
-                    var preQty = 0;
-
-                    steps.Add(new TransactionStep(
+                    steps.Add(BuildMoveStep(
                         $"Withdraw tracked {cand.ItemName}",
-                        ResolveActiveRetainerAddonName(),
-                        Dispatch: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
-                            {
-                                return false;
-                            }
-
-                            var src = InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot);
-                            if (src == null || src->ItemId != capturedRawId || src->Quantity <= 0)
-                            {
-                                return false;
-                            }
-
-                            if (!InventorySafetyEvaluator.FindDestinationSlot(
-                                    mgr,
-                                    InventorySafetyEvaluator.PlayerBagContainers,
-                                    capturedRawId,
-                                    capturedFlags,
-                                    capturedStack,
-                                    out var dstBag,
-                                    out var dstSlot,
-                                    routeCrystalsToCrystalBag: true))
-                            {
-                                return false;
-                            }
-
-                            preQty = src->Quantity;
-                            mgr->MoveItemSlot(capturedSrc, (ushort)capturedSlot, dstBag, (ushort)dstSlot, true);
-                            return true;
-                        },
-                        HasServerAck: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot) : null;
-                            if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
-                            {
-                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
-                                onStepCompleted();
-                                return true;
-                            }
-
-                            return false;
-                        },
-                        PacingProfile.StandardSlot));
+                        activeId,
+                        cand.SourceContainer,
+                        cand.SourceSlot,
+                        cand.RawItemId,
+                        cand.Flags,
+                        cand.StackSize,
+                        InventorySafetyEvaluator.PlayerBagContainers,
+                        checkSourceFlags: false,
+                        routeCrystalsToCrystalBag: true));
                     continue;
                 }
 
@@ -797,11 +726,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var splitTargetsEmptySlot = canSplit && !fitsCompletelyInPartial;
-                if (fitsCompletelyInPartial)
-                {
-                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, effectiveQty, out _);
-                }
-                else if (fitsAnyPartial && !canSplit)
+                if (fitsCompletelyInPartial || (fitsAnyPartial && !canSplit))
                 {
                     ConsumeFirstPartialRoom(playerPartialSlots, roomKey, effectiveQty, out _);
                 }
@@ -814,7 +739,7 @@ public sealed unsafe class RetainerSortPlanner
                     }
                 }
 
-                if ((!canSplit && fitsCompletelyInPartial) || (!canSplit && !fitsAnyPartial))
+                if (!canSplit && (fitsCompletelyInPartial || !fitsAnyPartial))
                 {
                     simulatedRetainerEmpty++;
                 }
@@ -838,219 +763,21 @@ public sealed unsafe class RetainerSortPlanner
                 trackedWithdrawSummary.Add($"{cand.ItemName} x{effectiveQty}{summaryNote}");
                 withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
 
-                var capturedSrcBag = cand.SourceContainer;
-                var capturedSlotIdx = cand.SourceSlot;
-                var capturedRaw = cand.RawItemId;
-                var capturedItemFlags = cand.Flags;
-                var capturedStackSize = cand.StackSize;
-
                 if (canSplit)
                 {
-                    var splitQty = takeQty;
-                    var preSourceQty = 0;
-                    var preOccupied = new HashSet<(InventoryType Container, int Slot)>();
-                    var splitFound = false;
-                    InventoryType splitContainer = default;
-                    var splitSlot = -1;
-                    var preSplitQty = 0;
-
-                    steps.Add(new TransactionStep(
-                        $"Split {cand.ItemName} (x{splitQty})",
-                        ResolveActiveRetainerAddonName(),
-                        Dispatch: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
-                            {
-                                return false;
-                            }
-
-                            var src = InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx);
-                            if (src == null || src->ItemId != capturedRaw || src->Flags != capturedItemFlags || src->Quantity <= splitQty)
-                            {
-                                return false;
-                            }
-
-                            preOccupied.Clear();
-                            var hasEmptyRetSlot = false;
-                            foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
-                            {
-                                var rc = mgr->GetInventoryContainer(retType);
-                                if (!InventorySafetyEvaluator.IsContainerReadable(rc))
-                                {
-                                    continue;
-                                }
-
-                                for (var i = 0; i < rc->Size; i++)
-                                {
-                                    var rs = InventorySafetyEvaluator.GetSlot(rc, i);
-                                    if (rs != null && rs->ItemId != 0 && rs->Quantity > 0)
-                                    {
-                                        preOccupied.Add((retType, i));
-                                    }
-                                    else if (rs != null)
-                                    {
-                                        hasEmptyRetSlot = true;
-                                    }
-                                }
-                            }
-
-                            if (!hasEmptyRetSlot)
-                            {
-                                return false;
-                            }
-
-                            preSourceQty = src->Quantity;
-                            splitFound = false;
-                            splitSlot = -1;
-                            mgr->SplitItem(capturedSrcBag, (ushort)capturedSlotIdx, splitQty);
-                            return true;
-                        },
-                        HasServerAck: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx) : null;
-                            if (src == null || src->ItemId != capturedRaw || src->Quantity >= preSourceQty)
-                            {
-                                return false;
-                            }
-
-                            foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
-                            {
-                                var rc = mgr->GetInventoryContainer(retType);
-                                if (!InventorySafetyEvaluator.IsContainerReadable(rc))
-                                {
-                                    continue;
-                                }
-
-                                for (var i = 0; i < rc->Size; i++)
-                                {
-                                    if (preOccupied.Contains((retType, i)))
-                                    {
-                                        continue;
-                                    }
-
-                                    var rs = InventorySafetyEvaluator.GetSlot(rc, i);
-                                    if (rs != null
-                                        && rs->ItemId == capturedRaw
-                                        && rs->Flags == capturedItemFlags
-                                        && rs->Quantity > 0)
-                                    {
-                                        splitContainer = retType;
-                                        splitSlot = i;
-                                        splitFound = true;
-                                        return true;
-                                    }
-                                }
-                            }
-
-                            return false;
-                        },
-                        PacingProfile.StandardSlot,
-                        SkipOnFailureCount: 1));
-
-                    var allowPartialMergeForSplit = !splitTargetsEmptySlot;
-                    steps.Add(new TransactionStep(
-                        $"Withdraw tracked {cand.ItemName} (x{splitQty})",
-                        ResolveActiveRetainerAddonName(),
-                        Dispatch: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            if (mgr == null || !splitFound || splitSlot < 0 || HoldingsService.GetActiveRetainerId() != activeId)
-                            {
-                                return false;
-                            }
-
-                            var src = InventorySafetyEvaluator.GetSlot(mgr, splitContainer, splitSlot);
-                            if (src == null || src->ItemId != capturedRaw || src->Flags != capturedItemFlags || src->Quantity <= 0)
-                            {
-                                return false;
-                            }
-
-                            // When moving a split stack that won't fit completely into an existing partial stack,
-                            // target an empty bag slot directly so the remainder isn't orphaned in the retainer.
-                            if (!InventorySafetyEvaluator.FindDestinationSlot(
-                                    mgr,
-                                    InventorySafetyEvaluator.PlayerBagContainers,
-                                    capturedRaw,
-                                    capturedItemFlags,
-                                    capturedStackSize,
-                                    out var dstBag,
-                                    out var dstSlot,
-                                    allowPartialMerge: allowPartialMergeForSplit))
-                            {
-                                return false;
-                            }
-
-                            preSplitQty = src->Quantity;
-                            mgr->MoveItemSlot(splitContainer, (ushort)splitSlot, dstBag, (ushort)dstSlot, true);
-                            return true;
-                        },
-                        HasServerAck: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, splitContainer, splitSlot) : null;
-                            if (src == null || src->ItemId == 0 || src->ItemId != capturedRaw || src->Quantity < preSplitQty)
-                            {
-                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
-                                onStepCompleted();
-                                return true;
-                            }
-
-                            return false;
-                        },
-                        PacingProfile.StandardSlot));
+                    AddSplitAndWithdrawSteps(steps, activeId, cand, takeQty, allowPartialMergeForSplit: !splitTargetsEmptySlot);
                 }
                 else
                 {
-                    var preQty = 0;
-                    steps.Add(new TransactionStep(
+                    steps.Add(BuildMoveStep(
                         $"Withdraw tracked {cand.ItemName}",
-                        ResolveActiveRetainerAddonName(),
-                        Dispatch: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
-                            {
-                                return false;
-                            }
-
-                            var src = InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx);
-                            if (src == null || src->ItemId != capturedRaw || src->Flags != capturedItemFlags || src->Quantity <= 0)
-                            {
-                                return false;
-                            }
-
-                            if (!InventorySafetyEvaluator.FindDestinationSlot(
-                                    mgr,
-                                    InventorySafetyEvaluator.PlayerBagContainers,
-                                    capturedRaw,
-                                    capturedItemFlags,
-                                    capturedStackSize,
-                                    out var dstBag,
-                                    out var dstSlot))
-                            {
-                                return false;
-                            }
-
-                            preQty = src->Quantity;
-                            mgr->MoveItemSlot(capturedSrcBag, (ushort)capturedSlotIdx, dstBag, (ushort)dstSlot, true);
-                            return true;
-                        },
-                        HasServerAck: () =>
-                        {
-                            var mgr = InventoryManager.Instance();
-                            var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx) : null;
-                            if (src == null || src->ItemId == 0 || src->ItemId != capturedRaw || src->Quantity < preQty)
-                            {
-                                holdings.CaptureActiveRetainerIfOpen(true, force: true);
-                                onStepCompleted();
-                                return true;
-                            }
-
-                            return false;
-                        },
-                        PacingProfile.StandardSlot));
+                        activeId,
+                        cand.SourceContainer,
+                        cand.SourceSlot,
+                        cand.RawItemId,
+                        cand.Flags,
+                        cand.StackSize,
+                        InventorySafetyEvaluator.PlayerBagContainers));
                 }
             }
         }
@@ -1108,66 +835,16 @@ public sealed unsafe class RetainerSortPlanner
                 depositCount++;
                 depositSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
                 depositSlots.Add((cand.SourceContainer, cand.SourceSlot));
-                var capturedBag = cand.SourceContainer;
-                var capturedSlot = cand.SourceSlot;
-                var capturedRawId = cand.RawItemId;
-                var capturedFlags = cand.Flags;
-                var capturedStack = cand.StackSize;
-                var preQty = 0;
 
-                steps.Add(new TransactionStep(
+                steps.Add(BuildMoveStep(
                     $"Deposit {cand.ItemName}",
-                    ResolveActiveRetainerAddonName(),
-                    Dispatch: () =>
-                    {
-                        var mgr = InventoryManager.Instance();
-                        if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
-                        {
-                            return false;
-                        }
-
-                        if (InventorySafetyEvaluator.IsArmouryContainer(capturedBag)
-                            && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard"))
-                        {
-                            return false;
-                        }
-
-                        var src = InventorySafetyEvaluator.GetSlot(mgr, capturedBag, capturedSlot);
-                        if (src == null || src->ItemId != capturedRawId || src->Flags != capturedFlags || src->Quantity <= 0)
-                        {
-                            return false;
-                        }
-
-                        if (!InventorySafetyEvaluator.FindDestinationSlot(
-                                mgr,
-                                InventorySafetyEvaluator.RetainerBagContainers,
-                                capturedRawId,
-                                capturedFlags,
-                                capturedStack,
-                                out var dstContainer,
-                                out var dstSlot))
-                        {
-                            return false;
-                        }
-
-                        preQty = src->Quantity;
-                        mgr->MoveItemSlot(capturedBag, (ushort)capturedSlot, dstContainer, (ushort)dstSlot, true);
-                        return true;
-                    },
-                    HasServerAck: () =>
-                    {
-                        var mgr = InventoryManager.Instance();
-                        var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedBag, capturedSlot) : null;
-                        if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
-                        {
-                            holdings.CaptureActiveRetainerIfOpen(true, force: true);
-                            onStepCompleted();
-                            return true;
-                        }
-
-                        return false;
-                    },
-                    PacingProfile.StandardSlot));
+                    activeId,
+                    cand.SourceContainer,
+                    cand.SourceSlot,
+                    cand.RawItemId,
+                    cand.Flags,
+                    cand.StackSize,
+                    InventorySafetyEvaluator.RetainerBagContainers));
             }
         }
 
@@ -1226,74 +903,23 @@ public sealed unsafe class RetainerSortPlanner
                 withdrawCount++;
                 sortWithdrawSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
                 withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
-                var capturedSrc = cand.SourceContainer;
-                var capturedSlot = cand.SourceSlot;
-                var capturedRawId = cand.RawItemId;
-                var capturedFlags = cand.Flags;
-                var capturedStack = cand.StackSize;
-                var preQty = 0;
-                var stepTitle = InventorySafetyEvaluator.IsArmouryContainer(capturedSrc)
+
+                var stepTitle = InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer)
                     ? $"Move {cand.ItemName} to inventory"
                     : $"Withdraw {cand.ItemName}";
 
-                steps.Add(new TransactionStep(
+                steps.Add(BuildMoveStep(
                     stepTitle,
-                    ResolveActiveRetainerAddonName(),
-                    Dispatch: () =>
-                    {
-                        var mgr = InventoryManager.Instance();
-                        if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
-                        {
-                            return false;
-                        }
-
-                        if (InventorySafetyEvaluator.IsArmouryContainer(capturedSrc)
-                            && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard"))
-                        {
-                            return false;
-                        }
-
-                        var src = InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot);
-                        if (src == null || src->ItemId != capturedRawId || src->Flags != capturedFlags || src->Quantity <= 0)
-                        {
-                            return false;
-                        }
-
-                        if (!InventorySafetyEvaluator.FindDestinationSlot(
-                                mgr,
-                                InventorySafetyEvaluator.PlayerBagContainers,
-                                capturedRawId,
-                                capturedFlags,
-                                capturedStack,
-                                out var dstBag,
-                                out var dstSlot))
-                        {
-                            return false;
-                        }
-
-                        preQty = src->Quantity;
-                        mgr->MoveItemSlot(capturedSrc, (ushort)capturedSlot, dstBag, (ushort)dstSlot, true);
-                        return true;
-                    },
-                    HasServerAck: () =>
-                    {
-                        var mgr = InventoryManager.Instance();
-                        var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrc, capturedSlot) : null;
-                        if (src == null || src->ItemId == 0 || src->ItemId != capturedRawId || src->Quantity < preQty)
-                        {
-                            holdings.CaptureActiveRetainerIfOpen(true, force: true);
-                            onStepCompleted();
-                            return true;
-                        }
-
-                        return false;
-                    },
-                    PacingProfile.StandardSlot));
+                    activeId,
+                    cand.SourceContainer,
+                    cand.SourceSlot,
+                    cand.RawItemId,
+                    cand.Flags,
+                    cand.StackSize,
+                    InventorySafetyEvaluator.PlayerBagContainers));
             }
         }
 
-        // When player bags are completely full (140/140) and we have deposits + retainer space,
-        // deposit FIRST to free bag slots so non-crystal tracked withdrawals aren't blocked!
         if (simulatedPlayerEmpty == 0 && depositCandidates.Count > 0 && simulatedRetainerEmpty > 0)
         {
             QueueDeposits();
@@ -1333,6 +959,430 @@ public sealed unsafe class RetainerSortPlanner
             sortWithdrawSummary,
             depositSlots,
             withdrawSlots);
+    }
+
+    private int ProjectLiveActiveRetainerWithdrawals(
+        InventoryManager* manager,
+        int baseFreeSlots,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds,
+        UnlockedJobGearProfile unlockedProfile,
+        HashSet<uint> playerUniqueBaseIds,
+        IReadOnlyDictionary<uint, int> missingTracked)
+    {
+        var projectedFreed = 0;
+        var remainingTracked = missingTracked.Count > 0 ? new Dictionary<uint, int>(missingTracked) : null;
+
+        foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainers)
+        {
+            var container = manager->GetInventoryContainer(retBag);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, slotIdx);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                {
+                    continue;
+                }
+
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+                if (baseId == 0 || ItemIdentity.IsCrystalItemId(baseId))
+                {
+                    continue;
+                }
+
+                if (remainingTracked != null && remainingTracked.TryGetValue(baseId, out var needQty) && needQty > 0)
+                {
+                    var tRow = itemSheet.GetRowOrDefault(baseId);
+                    if (tRow is not null && tRow.Value.IsUnique && playerUniqueBaseIds.Contains(baseId))
+                    {
+                        continue;
+                    }
+
+                    if (needQty == int.MaxValue || slot->Quantity <= needQty || baseFreeSlots == 0)
+                    {
+                        projectedFreed++;
+                    }
+
+                    if (needQty != int.MaxValue)
+                    {
+                        remainingTracked[baseId] = Math.Max(0, needQty - slot->Quantity);
+                    }
+
+                    continue;
+                }
+
+                if (manifestEntries.Count == 0
+                    || !ItemIdentity.CanLockOrTagBaseId(baseId)
+                    || gearsetIds.Contains(baseId)
+                    || safety.IsItemTracked(baseId)
+                    || !manifestEntries.TryGetValue(baseId, out var entry))
+                {
+                    continue;
+                }
+
+                var row = itemSheet.GetRowOrDefault(baseId);
+                if (row is null
+                    || ItemIdentity.IsCurrencyOrCrystal(baseId, row.Value)
+                    || ItemIdentity.IsSoulCrystal(row.Value)
+                    || ItemIdentity.IsRelicRarity(row.Value)
+                    || (row.Value.IsUnique && playerUniqueBaseIds.Contains(baseId)))
+                {
+                    continue;
+                }
+
+                if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (safety.HasExplicitKeepOverride(baseId))
+                    {
+                        projectedFreed++;
+                    }
+
+                    continue;
+                }
+
+                var effRoute = safety.ResolveEffectiveSlotRoute(entry, row.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
+                if (RetainerBellEvaluator.IsWithdrawableRoute(effRoute))
+                {
+                    projectedFreed++;
+                }
+            }
+        }
+
+        return projectedFreed;
+    }
+
+    private int ProjectDirectWithdrawalsForRetainer(
+        KnownRetainerInfo ret,
+        int baseFreeSlots,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds,
+        UnlockedJobGearProfile unlockedProfile,
+        HashSet<uint> playerUniqueBaseIds,
+        IReadOnlyDictionary<uint, int> missingTracked)
+    {
+        var projectedFreed = 0;
+        if (missingTracked.Count > 0)
+        {
+            foreach (var (trackedId, needQty) in missingTracked)
+            {
+                var retQty = ret.Quantities.GetValueOrDefault(trackedId);
+                if (needQty <= 0 || ItemIdentity.IsCrystalItemId(trackedId) || retQty <= 0)
+                {
+                    continue;
+                }
+
+                var tRow = itemSheet.GetRowOrDefault(trackedId);
+                if (tRow is not null && tRow.Value.IsUnique && playerUniqueBaseIds.Contains(trackedId))
+                {
+                    continue;
+                }
+
+                if (needQty == int.MaxValue || retQty <= needQty || baseFreeSlots == 0)
+                {
+                    projectedFreed++;
+                }
+            }
+        }
+
+        if (manifestEntries.Count == 0 || ret.Quantities.Count == 0)
+        {
+            return projectedFreed;
+        }
+
+        foreach (var (baseId, qty) in ret.Quantities)
+        {
+            if (qty <= 0
+                || !ItemIdentity.CanLockOrTagBaseId(baseId)
+                || gearsetIds.Contains(baseId)
+                || safety.IsItemTracked(baseId)
+                || !manifestEntries.TryGetValue(baseId, out var entry))
+            {
+                continue;
+            }
+
+            var row = itemSheet.GetRowOrDefault(baseId);
+            if (row is null
+                || ItemIdentity.IsCurrencyOrCrystal(baseId, row.Value)
+                || ItemIdentity.IsSoulCrystal(row.Value)
+                || ItemIdentity.IsRelicRarity(row.Value)
+                || (row.Value.IsUnique && playerUniqueBaseIds.Contains(baseId)))
+            {
+                continue;
+            }
+
+            if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+            {
+                if (safety.HasExplicitKeepOverride(baseId))
+                {
+                    projectedFreed++;
+                }
+
+                continue;
+            }
+
+            var hqQty = ret.HqQuantities?.GetValueOrDefault(baseId) ?? 0;
+            var effRoute = safety.ResolveEffectiveSlotRoute(
+                entry,
+                row.Value,
+                null,
+                manifestEntries,
+                gearsetIds,
+                unlockedProfile,
+                hasNq: qty > hqQty,
+                hasHq: hqQty > 0);
+            if (RetainerBellEvaluator.IsWithdrawableRoute(effRoute))
+            {
+                projectedFreed++;
+            }
+        }
+
+        return projectedFreed;
+    }
+
+    private TransactionStep BuildMoveStep(
+        string stepTitle,
+        ulong activeId,
+        InventoryType srcContainer,
+        int srcSlot,
+        uint rawItemId,
+        InventoryItem.ItemFlags flags,
+        int stackSize,
+        InventoryType[] destContainers,
+        bool checkSourceFlags = true,
+        bool allowPartialMerge = true,
+        bool routeCrystalsToCrystalBag = false)
+    {
+        var preQty = 0;
+        return new TransactionStep(
+            stepTitle,
+            ResolveActiveRetainerAddonName(),
+            Dispatch: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
+                {
+                    return false;
+                }
+
+                if (InventorySafetyEvaluator.IsArmouryContainer(srcContainer)
+                    && !NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard"))
+                {
+                    return false;
+                }
+
+                var src = InventorySafetyEvaluator.GetSlot(mgr, srcContainer, srcSlot);
+                if (src == null
+                    || src->ItemId != rawItemId
+                    || (checkSourceFlags && src->Flags != flags)
+                    || src->Quantity <= 0)
+                {
+                    return false;
+                }
+
+                if (!InventorySafetyEvaluator.FindDestinationSlot(
+                        mgr,
+                        destContainers,
+                        rawItemId,
+                        flags,
+                        stackSize,
+                        out var dstContainer,
+                        out var dstSlot,
+                        allowPartialMerge: allowPartialMerge,
+                        routeCrystalsToCrystalBag: routeCrystalsToCrystalBag,
+                        incomingQty: src->Quantity))
+                {
+                    return false;
+                }
+
+                preQty = src->Quantity;
+                mgr->MoveItemSlot(srcContainer, (ushort)srcSlot, dstContainer, (ushort)dstSlot, true);
+                return true;
+            },
+            HasServerAck: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, srcContainer, srcSlot) : null;
+                if (src == null || src->ItemId == 0 || src->ItemId != rawItemId || src->Quantity < preQty)
+                {
+                    onStepCompleted();
+                    return true;
+                }
+
+                return false;
+            },
+            PacingProfile.StandardSlot);
+    }
+
+    private void AddSplitAndWithdrawSteps(
+        List<TransactionStep> steps,
+        ulong activeId,
+        RetainerTransferCandidate cand,
+        int splitQty,
+        bool allowPartialMergeForSplit)
+    {
+        var capturedSrcBag = cand.SourceContainer;
+        var capturedSlotIdx = cand.SourceSlot;
+        var capturedRaw = cand.RawItemId;
+        var capturedItemFlags = cand.Flags;
+        var capturedStackSize = cand.StackSize;
+
+        var preSourceQty = 0;
+        var preOccupied = new HashSet<(InventoryType Container, int Slot)>();
+        var splitFound = false;
+        InventoryType splitContainer = default;
+        var splitSlot = -1;
+        var preSplitQty = 0;
+
+        steps.Add(new TransactionStep(
+            $"Split {cand.ItemName} (x{splitQty})",
+            ResolveActiveRetainerAddonName(),
+            Dispatch: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                if (mgr == null || HoldingsService.GetActiveRetainerId() != activeId)
+                {
+                    return false;
+                }
+
+                var src = InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx);
+                if (src == null || src->ItemId != capturedRaw || src->Flags != capturedItemFlags || src->Quantity <= splitQty)
+                {
+                    return false;
+                }
+
+                preOccupied.Clear();
+                var hasEmptyRetSlot = false;
+                foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
+                {
+                    var rc = mgr->GetInventoryContainer(retType);
+                    if (!InventorySafetyEvaluator.IsContainerReadable(rc))
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i < rc->Size; i++)
+                    {
+                        var rs = InventorySafetyEvaluator.GetSlot(rc, i);
+                        if (rs != null && rs->ItemId != 0 && rs->Quantity > 0)
+                        {
+                            preOccupied.Add((retType, i));
+                        }
+                        else if (rs != null)
+                        {
+                            hasEmptyRetSlot = true;
+                        }
+                    }
+                }
+
+                if (!hasEmptyRetSlot)
+                {
+                    return false;
+                }
+
+                preSourceQty = src->Quantity;
+                splitFound = false;
+                splitSlot = -1;
+                mgr->SplitItem(capturedSrcBag, (ushort)capturedSlotIdx, splitQty);
+                return true;
+            },
+            HasServerAck: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, capturedSrcBag, capturedSlotIdx) : null;
+                if (src == null || src->ItemId != capturedRaw || src->Quantity >= preSourceQty)
+                {
+                    return false;
+                }
+
+                foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
+                {
+                    var rc = mgr->GetInventoryContainer(retType);
+                    if (!InventorySafetyEvaluator.IsContainerReadable(rc))
+                    {
+                        continue;
+                    }
+
+                    for (var i = 0; i < rc->Size; i++)
+                    {
+                        if (preOccupied.Contains((retType, i)))
+                        {
+                            continue;
+                        }
+
+                        var rs = InventorySafetyEvaluator.GetSlot(rc, i);
+                        if (rs != null
+                            && rs->ItemId == capturedRaw
+                            && rs->Flags == capturedItemFlags
+                            && rs->Quantity > 0)
+                        {
+                            splitContainer = retType;
+                            splitSlot = i;
+                            splitFound = true;
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            },
+            PacingProfile.StandardSlot,
+            SkipOnFailureCount: 1));
+
+        steps.Add(new TransactionStep(
+            $"Withdraw tracked {cand.ItemName} (x{splitQty})",
+            ResolveActiveRetainerAddonName(),
+            Dispatch: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                if (mgr == null || !splitFound || splitSlot < 0 || HoldingsService.GetActiveRetainerId() != activeId)
+                {
+                    return false;
+                }
+
+                var src = InventorySafetyEvaluator.GetSlot(mgr, splitContainer, splitSlot);
+                if (src == null || src->ItemId != capturedRaw || src->Flags != capturedItemFlags || src->Quantity <= 0)
+                {
+                    return false;
+                }
+
+                if (!InventorySafetyEvaluator.FindDestinationSlot(
+                        mgr,
+                        InventorySafetyEvaluator.PlayerBagContainers,
+                        capturedRaw,
+                        capturedItemFlags,
+                        capturedStackSize,
+                        out var dstBag,
+                        out var dstSlot,
+                        allowPartialMerge: allowPartialMergeForSplit,
+                        incomingQty: src->Quantity))
+                {
+                    return false;
+                }
+
+                preSplitQty = src->Quantity;
+                mgr->MoveItemSlot(splitContainer, (ushort)splitSlot, dstBag, (ushort)dstSlot, true);
+                return true;
+            },
+            HasServerAck: () =>
+            {
+                var mgr = InventoryManager.Instance();
+                var src = mgr != null ? InventorySafetyEvaluator.GetSlot(mgr, splitContainer, splitSlot) : null;
+                if (src == null || src->ItemId == 0 || src->ItemId != capturedRaw || src->Quantity < preSplitQty)
+                {
+                    onStepCompleted();
+                    return true;
+                }
+
+                return false;
+            },
+            PacingProfile.StandardSlot));
     }
 
     private string ResolveActiveRetainerAddonName()

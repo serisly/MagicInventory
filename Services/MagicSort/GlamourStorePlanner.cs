@@ -17,12 +17,6 @@ public sealed record GlamourPlanItem(
     uint BaseItemId,
     string Name);
 
-/// <summary>
-/// Stores "Glamour"-tagged gear into the Glamour Dresser via the Glamour Creation window
-/// (MiragePrismPrismBoxCrystallize). Live-captured payload: callback (UInt 14, UInt listIndex, UInt 0)
-/// followed by a SelectYesno confirmation. The confirmation text must name the exact item before
-/// Yes is clicked; otherwise No is clicked and the batch stops (fail-closed).
-/// </summary>
 public sealed unsafe class GlamourStorePlanner
 {
     private const uint GlamourPrismItemId = 21800;
@@ -33,6 +27,8 @@ public sealed unsafe class GlamourStorePlanner
     private readonly IGameGui gameGui;
     private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
+    private readonly string glamourSingleConfirmLiteral;
+    private readonly string glamourOutfitConfirmLiteral;
 
     public GlamourStorePlanner(
         IDataManager dataManager,
@@ -44,6 +40,8 @@ public sealed unsafe class GlamourStorePlanner
         this.gameGui = gameGui;
         this.transactionQueue = transactionQueue;
         this.safety = safety;
+        glamourSingleConfirmLiteral = NativeUiHelpers.ExtractLongestAddonLiteral(dataManager, 11994);
+        glamourOutfitConfirmLiteral = NativeUiHelpers.ExtractLongestAddonLiteral(dataManager, 11995);
     }
 
     public List<GlamourPlanItem> PlanStores(
@@ -61,13 +59,18 @@ public sealed unsafe class GlamourStorePlanner
             return results;
         }
 
+        var data = agent->Data;
+        if (!data->IsAsyncLoadComplete || data->IsPopulatingList || !data->IsPopulatingComplete)
+        {
+            return results;
+        }
+
         var prisms = mgr->GetInventoryItemCount(GlamourPrismItemId, false, false, false);
-        var freeSpace = DresserCapacity - agent->Data->UsedSlots;
+        var freeSpace = DresserCapacity - data->UsedSlots;
         var budget = Math.Max(0, Math.Min(maxItems, Math.Min(prisms, freeSpace)));
 
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-        var data = agent->Data;
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
         var count = Math.Min((int)data->CrystallizeItemCount, data->CrystallizeItems.Length);
         var foundAnyCandidate = false;
         for (var i = 0; i < count; i++)
@@ -110,10 +113,9 @@ public sealed unsafe class GlamourStorePlanner
             }
 
             var itemRow = row.Value;
-            if (itemRow.Rarity >= 4
-                || ItemIdentity.IsSoulCrystal(itemRow)
+            if (ItemIdentity.IsSoulCrystal(itemRow)
                 || !string.Equals(
-                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedTop),
+                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile),
                     "Glamour",
                     StringComparison.OrdinalIgnoreCase))
             {
@@ -144,38 +146,27 @@ public sealed unsafe class GlamourStorePlanner
         return results;
     }
 
-    private static bool IsGlamourDresserConfirmPrompt(string prompt, string expectedItemName)
+    private bool IsGlamourDresserConfirmPrompt(string prompt)
     {
-        if (string.IsNullOrWhiteSpace(prompt))
+        var normalized = NativeUiHelpers.CollapseWhitespace(prompt);
+        if (string.IsNullOrEmpty(normalized))
         {
             return false;
         }
 
-        // Reject clearly unrelated destructive/other prompts immediately
-        if (prompt.Contains("discard", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("armoire", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("desynthesize", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("sell ", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("trade", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        // FFXIV's standard Glamour Dresser prompt ("Convert this item into a glamour and place it in the glamour dresser?")
-        // does not always include the item name. Accept localized glamour dresser prompts OR an exact item name match.
-        var normalizedItem = NativeUiHelpers.NormalizeItemLabel(expectedItemName);
-        if (!string.IsNullOrEmpty(normalizedItem)
-            && prompt.Contains(normalizedItem, StringComparison.OrdinalIgnoreCase))
+        if (!string.IsNullOrEmpty(glamourSingleConfirmLiteral)
+            && normalized.Contains(glamourSingleConfirmLiteral, StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
 
-        return prompt.Contains("glamour dresser", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("into a glamour", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("glamour", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("mirage", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("projektion", StringComparison.OrdinalIgnoreCase)
-            || prompt.Contains("ミラージュ", StringComparison.Ordinal);
+        if (!string.IsNullOrEmpty(glamourOutfitConfirmLiteral)
+            && normalized.Contains(glamourOutfitConfirmLiteral, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
     }
 
     public List<TransactionStep> BuildStoreSteps(IReadOnlyList<GlamourPlanItem> plans, System.Action onStepCompleted)
@@ -201,7 +192,13 @@ public sealed unsafe class GlamourStorePlanner
                     var addon = NativeUiHelpers.GetReadyAddon(gameGui, "MiragePrismPrismBoxCrystallize");
                     var mgr = InventoryManager.Instance();
                     var agent = AgentMiragePrismPrismBox.Instance();
-                    if (addon == null || mgr == null || agent == null || agent->Data == null)
+                    if (addon == null
+                        || mgr == null
+                        || agent == null
+                        || agent->Data == null
+                        || !agent->Data->IsAsyncLoadComplete
+                        || agent->Data->IsPopulatingList
+                        || !agent->Data->IsPopulatingComplete)
                     {
                         return false;
                     }
@@ -212,17 +209,23 @@ public sealed unsafe class GlamourStorePlanner
                         return false;
                     }
 
+                    var itemSheet = dataManager.GetExcelSheet<Item>();
+                    var itemRow = itemSheet?.GetRowOrDefault(captured.BaseItemId);
+                    var gearsetIds = safety.BuildGearsetItemIds();
                     var slot = InventorySafetyEvaluator.GetSlot(mgr, captured.Container, captured.Slot);
                     if (slot == null
+                        || itemRow is null
                         || slot->ItemId != captured.RawItemId
                         || slot->Quantity <= 0
                         || slot->GetMateriaCount() > 0
-                        || slot->Materia[0] != 0)
+                        || slot->Materia[0] != 0
+                        || InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot)
+                        || gearsetIds.Contains(captured.BaseItemId)
+                        || safety.IsItemTracked(captured.BaseItemId))
                     {
                         return false;
                     }
 
-                    // Resolve the CURRENT list index for this exact container/slot/baseId (list shifts after each store).
                     var data = agent->Data;
                     var count = Math.Min((int)data->CrystallizeItemCount, data->CrystallizeItems.Length);
                     var listIndex = -1;
@@ -270,7 +273,7 @@ public sealed unsafe class GlamourStorePlanner
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
                             var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
-                            if (!IsGlamourDresserConfirmPrompt(prompt, captured.Name))
+                            if (!IsGlamourDresserConfirmPrompt(prompt))
                             {
                                 if (yesNo->NoButton != null)
                                 {
@@ -284,9 +287,7 @@ public sealed unsafe class GlamourStorePlanner
                             var now = DateTime.UtcNow;
                             if (yesReadyUtc == DateTime.MinValue)
                             {
-                                var a = Random.Shared.Next(380, 681);
-                                var b = Random.Shared.Next(380, 681);
-                                yesReadyUtc = now.AddMilliseconds((a + b) / 2);
+                                yesReadyUtc = now.AddMilliseconds(SafeTransactionQueue.SampleDialogConfirmDelayMs());
                                 return false;
                             }
 

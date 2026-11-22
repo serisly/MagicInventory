@@ -1,4 +1,4 @@
-﻿using Dalamud.Game.ClientState.Conditions;
+using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -18,7 +18,11 @@ public sealed record ActiveRecipeInfo(
     uint RecipeId,
     uint ResultItemId,
     string Name,
-    IReadOnlyList<RecipeIngredientRequirement> Ingredients);
+    IReadOnlyList<RecipeIngredientRequirement> Ingredients,
+    IReadOnlyList<RecipeIngredientRequirement> Crystals)
+{
+    public IEnumerable<RecipeIngredientRequirement> AllRequirements => Ingredients.Concat(Crystals);
+}
 
 public sealed record TrackedMaterialLine(
     uint ItemId,
@@ -35,12 +39,6 @@ public sealed record TrackedMaterialLine(
     public bool IsCoveredByHoldings => (OwnedCount + ExternalOwnedCount) >= NeededCount;
 }
 
-public sealed record ContextButtonState(
-    bool IsVisible,
-    bool IsEnabled,
-    string Label,
-    string Tooltip);
-
 public sealed record TrackerSnapshot(
     string Title,
     IReadOnlyList<TrackedMaterialLine> Lines,
@@ -56,14 +54,10 @@ public sealed record TrackerSnapshot(
     int MatchingGearsetId = -1,
     bool CanQuickSynth = false);
 
-/// <summary>
-/// Pure read-only material & recipe tracking state service (per-character isolated).
-/// All actual retainer withdrawals and Market Board purchases are executed through
-/// RetainerSortPlanner and MarketBoardBuyPlanner with strict Server-ACK pacing.
-/// </summary>
-public sealed unsafe class MaterialTrackerService
+public sealed unsafe class MaterialTrackerService : IDisposable
 {
     private readonly IDalamudPluginInterface pluginInterface;
+    private readonly IFramework framework;
     private readonly Configuration config;
     private readonly HoldingsService holdings;
     private readonly IDataManager dataManager;
@@ -71,7 +65,6 @@ public sealed unsafe class MaterialTrackerService
     private readonly ICondition condition;
     private readonly IChatGui chatGui;
 
-    // CraftType 0..7 -> ClassJob RowId (CRP=8, BSM=9, ARM=10, GSM=11, LTW=12, WVR=13, ALC=14, CUL=15)
     private static readonly uint[] CraftTypeToClassJobId = [8, 9, 10, 11, 12, 13, 14, 15];
 
     private DateTime lastSnapshotUtc = DateTime.MinValue;
@@ -80,16 +73,17 @@ public sealed unsafe class MaterialTrackerService
     private bool dirty = true;
     private Dictionary<uint, List<uint>>? recipesByResultItemId;
 
-    // Self-terminating native Quick Synthesis starter (zero idle polling; 6s hard timeout)
     private enum PendingCraftStage { None, WaitingForRecipeNote, WaitingForQuickSynthDialog }
     private PendingCraftStage pendingCraftStage = PendingCraftStage.None;
     private uint pendingCraftRecipeId;
     private int pendingCraftCount;
+    private bool pendingCraftUseHq;
     private DateTime pendingCraftDeadlineUtc = DateTime.MinValue;
     private DateTime pendingCraftNextTickUtc = DateTime.MinValue;
 
     public MaterialTrackerService(
         IDalamudPluginInterface pluginInterface,
+        IFramework framework,
         Configuration config,
         HoldingsService holdings,
         IDataManager dataManager,
@@ -98,17 +92,26 @@ public sealed unsafe class MaterialTrackerService
         IChatGui chatGui)
     {
         this.pluginInterface = pluginInterface;
+        this.framework = framework;
         this.config = config;
         this.holdings = holdings;
         this.dataManager = dataManager;
         this.gameGui = gameGui;
         this.condition = condition;
         this.chatGui = chatGui;
+
+        this.framework.Update += OnFrameworkUpdate;
     }
 
     public event System.Action? TrackerChanged;
 
-    public bool HasPendingCraft => pendingCraftStage != PendingCraftStage.None;
+    public void Dispose()
+    {
+        framework.Update -= OnFrameworkUpdate;
+        pendingCraftStage = PendingCraftStage.None;
+    }
+
+    private void OnFrameworkUpdate(IFramework _) => TickPendingCraft();
 
     private CharacterProfile ActiveProfile
         => config.GetOrCreateCharacter(InventorySafetyEvaluator.GetCurrentContentId());
@@ -256,8 +259,7 @@ public sealed unsafe class MaterialTrackerService
             return null;
         }
 
-        var detailHeader = addon->GetNodeById(59);
-        if (detailHeader == null || !detailHeader->IsVisible())
+        if (addon->SelectedRecipeName == null || !addon->SelectedRecipeName->IsVisible())
         {
             return null;
         }
@@ -287,6 +289,11 @@ public sealed unsafe class MaterialTrackerService
                     }
 
                     var baseId = ItemIdentity.NormalizeBaseItemId(ing.ItemId);
+                    if (baseId == 0)
+                    {
+                        continue;
+                    }
+
                     var ingName = itemSheet.TryGetRow(baseId, out var itemRow)
                         ? itemRow.Name.ExtractText()
                         : ing.Name.ToString();
@@ -294,14 +301,40 @@ public sealed unsafe class MaterialTrackerService
                     entryIngredients.Add(new RecipeIngredientRequirement(baseId, ingName, ing.Amount));
                 }
 
-                if (entryIngredients.Count > 0)
+                var entryCrystals = new List<RecipeIngredientRequirement>(2);
+                if (recipeId != 0 && recipeSheet.TryGetRow(recipeId, out var recipeRowForCrystals))
+                {
+                    var maxIng = Math.Min(recipeRowForCrystals.Ingredient.Count, recipeRowForCrystals.AmountIngredient.Count);
+                    for (var c = 6; c < maxIng; c++)
+                    {
+                        var crysId = recipeRowForCrystals.Ingredient[c].RowId;
+                        var crysAmt = recipeRowForCrystals.AmountIngredient[c];
+                        if (crysId == 0 || crysAmt == 0)
+                        {
+                            continue;
+                        }
+
+                        var baseId = ItemIdentity.NormalizeBaseItemId(crysId);
+                        if (baseId == 0)
+                        {
+                            continue;
+                        }
+
+                        var crysName = itemSheet.TryGetRow(baseId, out var itemRow)
+                            ? itemRow.Name.ExtractText()
+                            : $"Crystal #{baseId}";
+                        entryCrystals.Add(new RecipeIngredientRequirement(baseId, crysName, crysAmt));
+                    }
+                }
+
+                if (entryIngredients.Count > 0 || entryCrystals.Count > 0)
                 {
                     var resultId = ItemIdentity.NormalizeBaseItemId(entry->ItemId);
                     var recipeName = itemSheet.TryGetRow(resultId, out var resRow)
                         ? resRow.Name.ExtractText()
                         : entry->ItemName.ToString();
 
-                    return new ActiveRecipeInfo(recipeId, resultId, recipeName, entryIngredients);
+                    return new ActiveRecipeInfo(recipeId, resultId, recipeName, entryIngredients, entryCrystals);
                 }
             }
         }
@@ -311,24 +344,8 @@ public sealed unsafe class MaterialTrackerService
             return null;
         }
 
-        var ingredients = new List<RecipeIngredientRequirement>(6);
-        var count = Math.Min(6, Math.Min(row.Ingredient.Count, row.AmountIngredient.Count));
-        for (var i = 0; i < count; i++)
-        {
-            var itemId = row.Ingredient[i].RowId;
-            var amount = row.AmountIngredient[i];
-            if (itemId == 0 || amount == 0)
-            {
-                continue;
-            }
-
-            var itemName = itemSheet.TryGetRow(itemId, out var itemRow)
-                ? itemRow.Name.ExtractText()
-                : $"Item #{itemId}";
-            ingredients.Add(new RecipeIngredientRequirement(itemId, itemName, amount));
-        }
-
-        if (ingredients.Count == 0)
+        var (ingredients, crystals) = ExtractRecipeRequirements(row, itemSheet);
+        if (ingredients.Count == 0 && crystals.Count == 0)
         {
             return null;
         }
@@ -338,7 +355,40 @@ public sealed unsafe class MaterialTrackerService
             ? resultItem.Name.ExtractText()
             : $"Recipe #{recipeId}";
 
-        return new ActiveRecipeInfo(recipeId, resultItemId, resultName, ingredients);
+        return new ActiveRecipeInfo(recipeId, resultItemId, resultName, ingredients, crystals);
+    }
+
+    private static (List<RecipeIngredientRequirement> Ingredients, List<RecipeIngredientRequirement> Crystals) ExtractRecipeRequirements(
+        Recipe row,
+        Lumina.Excel.ExcelSheet<Item> itemSheet)
+    {
+        var ingredients = new List<RecipeIngredientRequirement>(6);
+        var crystals = new List<RecipeIngredientRequirement>(2);
+        var count = Math.Min(row.Ingredient.Count, row.AmountIngredient.Count);
+        for (var i = 0; i < count; i++)
+        {
+            var itemId = row.Ingredient[i].RowId;
+            var amount = row.AmountIngredient[i];
+            if (!ItemIdentity.IsValidItemId(itemId) || amount == 0)
+            {
+                continue;
+            }
+
+            var itemName = itemSheet.TryGetRow(itemId, out var itemRow)
+                ? itemRow.Name.ExtractText()
+                : $"Item #{itemId}";
+            var req = new RecipeIngredientRequirement(itemId, itemName, amount);
+            if (ItemIdentity.IsCrystalItemId(itemId))
+            {
+                crystals.Add(req);
+            }
+            else
+            {
+                ingredients.Add(req);
+            }
+        }
+
+        return (ingredients, crystals);
     }
 
     public void ToggleRecipe(ActiveRecipeInfo recipe)
@@ -351,14 +401,36 @@ public sealed unsafe class MaterialTrackerService
 
         var profile = ActiveProfile;
         profile.TrackedItems.Clear();
-        foreach (var ing in recipe.Ingredients)
+        foreach (var req in recipe.AllRequirements)
         {
-            profile.TrackedItems[ing.ItemId] = profile.TrackedItems.GetValueOrDefault(ing.ItemId) + ing.Amount;
+            profile.TrackedItems[req.ItemId] = profile.TrackedItems.GetValueOrDefault(req.ItemId) + req.Amount;
         }
 
         profile.TrackedRecipeId = recipe.RecipeId;
         profile.TrackedTitle = recipe.Name;
         profile.TrackedCraftCount = 1;
+        profile.TrackWithdrawAllStacks = false;
+        config.Save(pluginInterface);
+        NotifyTrackerChanged();
+    }
+
+    public void AddRecipeToList(ActiveRecipeInfo recipe)
+    {
+        var profile = ActiveProfile;
+        if (profile.TrackedItems.Count == 0)
+        {
+            ToggleRecipe(recipe);
+            return;
+        }
+
+        FlattenCraftMultiplierIntoItems(profile);
+        foreach (var req in recipe.AllRequirements)
+        {
+            profile.TrackedItems[req.ItemId] = profile.TrackedItems.GetValueOrDefault(req.ItemId) + req.Amount;
+        }
+
+        profile.TrackedRecipeId = 0;
+        profile.TrackedTitle = $"Tracked List ({profile.TrackedItems.Count} items)";
         profile.TrackWithdrawAllStacks = false;
         config.Save(pluginInterface);
         NotifyTrackerChanged();
@@ -479,7 +551,6 @@ public sealed unsafe class MaterialTrackerService
 
     private static void FlattenCraftMultiplierIntoItems(CharacterProfile profile)
     {
-        // In "All" mode, TrackedCraftCount is not an explicit multiplier — never multiply existing targets!
         var mult = profile.TrackWithdrawAllStacks ? 1 : Math.Max(1, profile.TrackedCraftCount);
         if (mult > 1 && profile.TrackedItems.Count > 0)
         {
@@ -516,18 +587,11 @@ public sealed unsafe class MaterialTrackerService
             return false;
         }
 
-        var ingredients = new Dictionary<uint, int>();
-        var ingCount = Math.Min(6, Math.Min(recipe.Ingredient.Count, recipe.AmountIngredient.Count));
-        for (var i = 0; i < ingCount; i++)
+        var (reqIngs, reqCrystals) = ExtractRecipeRequirements(recipe, itemSheet);
+        var ingredients = new Dictionary<uint, int>(reqIngs.Count + reqCrystals.Count);
+        foreach (var req in reqIngs.Concat(reqCrystals))
         {
-            var ingId = recipe.Ingredient[i].RowId;
-            var amt = recipe.AmountIngredient[i];
-            if (ingId == 0 || amt == 0)
-            {
-                continue;
-            }
-
-            ingredients[ingId] = ingredients.GetValueOrDefault(ingId) + amt;
+            ingredients[req.ItemId] = ingredients.GetValueOrDefault(req.ItemId) + req.Amount;
         }
 
         if (ingredients.Count == 0)
@@ -603,14 +667,13 @@ public sealed unsafe class MaterialTrackerService
         FlattenCraftMultiplierIntoItems(profile);
         if (profile.TrackedItems.TryGetValue(baseItemId, out var existing))
         {
-            // Increment existing target by +1 cleanly (never jump to BagCount + 1!)
             profile.TrackedItems[baseItemId] = Math.Max(1, existing) + 1;
             statusMessage = $"Updated {itemName} in tracked list (target: {profile.TrackedItems[baseItemId]}).";
         }
         else
         {
             var summary = holdings.GetHoldingSummary(baseItemId);
-            profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
+            profile.TrackedItems[baseItemId] = ComputeSensibleInitialTarget(summary);
             statusMessage = $"Added {itemName} to tracked list ({profile.TrackedItems.Count} items).";
         }
 
@@ -644,10 +707,20 @@ public sealed unsafe class MaterialTrackerService
         profile.TrackedTitle = itemName;
         profile.TrackedCraftCount = 1;
         profile.TrackWithdrawAllStacks = false;
-        profile.TrackedItems[baseItemId] = Math.Max(summary.BagCount + 1, 1);
+        profile.TrackedItems[baseItemId] = ComputeSensibleInitialTarget(summary);
         config.Save(pluginInterface);
         NotifyTrackerChanged();
         statusMessage = $"Tracking only: {itemName}.";
+    }
+
+    public static int ComputeSensibleInitialTarget(ItemHoldingSummary summary)
+    {
+        if (summary.TotalExternalCount > 0)
+        {
+            return Math.Max(1, summary.BagCount + summary.TotalExternalCount);
+        }
+
+        return Math.Max(1, summary.BagCount);
     }
 
     public void RemoveItemFromList(uint rawItemId, out string statusMessage)
@@ -693,17 +766,6 @@ public sealed unsafe class MaterialTrackerService
 
         config.Save(pluginInterface);
         NotifyTrackerChanged();
-    }
-
-    public void ToggleSingleItem(uint rawItemId)
-    {
-        if (IsItemTracked(rawItemId))
-        {
-            RemoveItemFromList(rawItemId, out _);
-            return;
-        }
-
-        TrackItemOnly(rawItemId, out _);
     }
 
     public void ClearAll()
@@ -834,18 +896,11 @@ public sealed unsafe class MaterialTrackerService
         }
 
         var recipe = bestRecipe.Value;
-        var ingredients = new Dictionary<uint, int>();
-        var ingCount = Math.Min(6, Math.Min(recipe.Ingredient.Count, recipe.AmountIngredient.Count));
-        for (var i = 0; i < ingCount; i++)
+        var (reqIngs, reqCrystals) = ExtractRecipeRequirements(recipe, itemSheet);
+        var ingredients = new Dictionary<uint, int>(reqIngs.Count + reqCrystals.Count);
+        foreach (var req in reqIngs.Concat(reqCrystals))
         {
-            var ingId = recipe.Ingredient[i].RowId;
-            var amt = recipe.AmountIngredient[i];
-            if (ingId == 0 || amt == 0)
-            {
-                continue;
-            }
-
-            ingredients[ingId] = ingredients.GetValueOrDefault(ingId) + amt;
+            ingredients[req.ItemId] = ingredients.GetValueOrDefault(req.ItemId) + req.Amount;
         }
 
         if (ingredients.Count == 0)
@@ -995,10 +1050,12 @@ public sealed unsafe class MaterialTrackerService
         {
             pendingCraftRecipeId = snap.RecipeId;
             pendingCraftCount = Math.Clamp(snap.CraftCount, 1, 99);
+            pendingCraftUseHq = HasAnyHqTrackedIngredientsInBags(snap.Lines);
             pendingCraftStage = PendingCraftStage.WaitingForRecipeNote;
             pendingCraftNextTickUtc = DateTime.UtcNow.AddMilliseconds(550);
             pendingCraftDeadlineUtc = DateTime.UtcNow.AddSeconds(6);
-            message = $"Opening {snap.Title} (x{pendingCraftCount}) for Quick Synthesis...";
+            var capNote = snap.CraftCount > 99 ? " (Quick Synthesis max is 99 per batch)" : string.Empty;
+            message = $"Opening {snap.Title} (x{pendingCraftCount}) for Quick Synthesis...{capNote}";
         }
         else
         {
@@ -1008,6 +1065,32 @@ public sealed unsafe class MaterialTrackerService
 
         return true;
     }
+
+    private static bool HasAnyHqTrackedIngredientsInBags(IReadOnlyList<TrackedMaterialLine> lines)
+    {
+        var manager = InventoryManager.Instance();
+        if (manager == null)
+        {
+            return false;
+        }
+
+        foreach (var line in lines)
+        {
+            if (ItemIdentity.IsCrystalItemId(line.ItemId))
+            {
+                continue;
+            }
+
+            if (manager->GetInventoryItemCount(line.ItemId, isHq: true, checkEquipped: false, checkArmory: false) > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public bool IsPendingCraftActive => pendingCraftStage != PendingCraftStage.None;
 
     public bool StopPendingCraft()
     {
@@ -1044,42 +1127,36 @@ public sealed unsafe class MaterialTrackerService
 
         if (pendingCraftStage == PendingCraftStage.WaitingForRecipeNote)
         {
-            var rn = NativeUiHelpers.GetReadyAddon(gameGui, "RecipeNote");
+            var rn = (AddonRecipeNote*)NativeUiHelpers.GetReadyAddon(gameGui, "RecipeNote");
             if (rn == null)
             {
                 pendingCraftNextTickUtc = now.AddMilliseconds(250);
                 return;
             }
 
-            // Fail-closed: verify RecipeNote actually selected the intended recipe before clicking Quick Synthesis!
-            var activeRecipe = GetActiveRecipe((AddonRecipeNote*)rn);
+            var activeRecipe = GetActiveRecipe(rn);
             if (activeRecipe == null || activeRecipe.RecipeId != pendingCraftRecipeId)
             {
                 pendingCraftNextTickUtc = now.AddMilliseconds(250);
                 return;
             }
 
-            // Native Quick Synthesis button on RecipeNote is NodeId 103
-            var qsNode = rn->GetNodeById(103);
-            if (qsNode == null || !qsNode->IsVisible())
+            var btn = rn->QuickSynthesisButton;
+            if (btn == null || btn->AtkComponentBase.OwnerNode == null || !btn->AtkComponentBase.OwnerNode->AtkResNode.IsVisible())
             {
                 pendingCraftStage = PendingCraftStage.None;
-                chatGui.PrintError("Quick Synthesis is not available for this recipe — craft it from the open Crafting Log.");
+                chatGui.PrintError("Quick Synthesis is not available for this recipe. Craft it from the Crafting Log.");
                 return;
             }
 
-            var btn = qsNode->GetAsAtkComponentButton();
-            if (btn == null || !btn->IsEnabled)
+            if (!btn->IsEnabled)
             {
-                // Quick Synthesis locked/unavailable for this recipe; leave Crafting Log cleanly open on the recipe
                 pendingCraftStage = PendingCraftStage.None;
                 chatGui.PrintError("Quick Synthesis is unavailable (unlock Quick Synthesis or craft manually from the Crafting Log).");
                 return;
             }
 
-            var args = stackalloc AtkValue[1];
-            args[0] = NativeUiHelpers.IntValue(13);
-            if (NativeUiHelpers.FireCallback(rn, true, new ReadOnlySpan<AtkValue>(args, 1)))
+            if (NativeUiHelpers.ClickAddonButton((AtkUnitBase*)rn, btn))
             {
                 pendingCraftStage = PendingCraftStage.WaitingForQuickSynthDialog;
                 pendingCraftNextTickUtc = now.AddMilliseconds(550);
@@ -1099,10 +1176,11 @@ public sealed unsafe class MaterialTrackerService
                 return;
             }
 
-            var args = stackalloc AtkValue[2];
+            var args = stackalloc AtkValue[3];
             args[0] = NativeUiHelpers.IntValue(pendingCraftCount);
-            args[1] = NativeUiHelpers.IntValue(0);
-            NativeUiHelpers.FireCallback(dialog, true, new ReadOnlySpan<AtkValue>(args, 2));
+            args[1] = NativeUiHelpers.BoolValue(pendingCraftUseHq);
+            args[2] = NativeUiHelpers.BoolValue(true);
+            NativeUiHelpers.FireCallback(dialog, true, new ReadOnlySpan<AtkValue>(args, 3));
             pendingCraftStage = PendingCraftStage.None;
         }
     }
@@ -1161,9 +1239,15 @@ public sealed unsafe class MaterialTrackerService
             }
 
             var retainerNote = string.Empty;
-            if (summary.BagCount < effectiveNeeded && summary.Retainers.Count > 0)
+            if (summary.BagCount < effectiveNeeded && (summary.Retainers.Count > 0 || summary.SaddlebagCount > 0))
             {
-                var rawNote = string.Join(", ", summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}"));
+                var parts = summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}").ToList();
+                if (summary.SaddlebagCount > 0)
+                {
+                    parts.Add($"Saddlebag: {summary.SaddlebagCount}");
+                }
+
+                var rawNote = string.Join(", ", parts);
                 retainerNote = rawNote.Length > 38 ? rawNote[..35] + "..." : rawNote;
             }
 
@@ -1172,7 +1256,7 @@ public sealed unsafe class MaterialTrackerService
                 itemName,
                 summary.BagCount,
                 effectiveNeeded,
-                summary.TotalRetainerCount,
+                summary.TotalExternalCount,
                 retainerNote,
                 openRetainerQty));
         }
@@ -1297,8 +1381,8 @@ public sealed unsafe class MaterialTrackerService
         {
             var active = GetActiveRecipe((AddonRecipeNote*)rnPtr.Address);
             if (active != null
-                && active.Ingredients.Count == profile.TrackedItems.Count
-                && active.Ingredients.All(i => profile.TrackedItems.TryGetValue(i.ItemId, out var q) && q == i.Amount))
+                && active.AllRequirements.Count() == profile.TrackedItems.Count
+                && active.AllRequirements.All(i => profile.TrackedItems.TryGetValue(i.ItemId, out var q) && q == i.Amount))
             {
                 return active.Name;
             }
@@ -1309,7 +1393,4 @@ public sealed unsafe class MaterialTrackerService
 
     public string? GetOpenRetainerAddonName()
         => NativeUiHelpers.GetOpenRetainerAddonName(gameGui);
-
-    public bool IsAddonOpenAndReady(string addonName)
-        => NativeUiHelpers.IsAddonOpenAndReady(gameGui, addonName);
 }

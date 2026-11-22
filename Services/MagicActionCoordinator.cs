@@ -1,4 +1,6 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Game.ClientState.Objects.Enums;
@@ -20,23 +22,23 @@ public enum MagicActionIntent
     Sort,
     Sell,
     Buy,
+    Use,
     Stop,
 }
 
-/// <summary>
-/// Single-owner command and station coordinator for /magic and /m commands.
-/// Resolves already-open station windows first, then safely performs a single-shot
-/// in-range interaction (zero movement, zero retry) with the nearest matching station.
-/// Also owns the master StopAll() kill-switch across all active orchestrators.
-/// </summary>
 public sealed unsafe class MagicActionCoordinator : IDisposable
 {
     private const float EventObjectInteractRangeYalms = 3.5f;
     private const float NpcInteractRangeYalms = 5.0f;
     private const float MovementToleranceSq = 0.04f;
     private const double StationOpenTimeoutSeconds = 4.5;
-    private const uint GilShopHighWord = 4u;
-    private const uint TopicSelectHighWord = 50u;
+    private const double GlamourCrystallizeSettleGraceSeconds = 1.2;
+    private const int MaxTalkAdvances = 3;
+
+    private const uint SummoningBellCanonicalEObjId = 2000401;
+    private const uint ArmoireCanonicalEObjId = 2001407;
+    private const uint GlamourDresserCanonicalEObjId = 2009439;
+    private const uint MarketBoardCanonicalEObjId = 2000402;
 
     private readonly IFramework framework;
     private readonly IClientState clientState;
@@ -49,6 +51,16 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     private readonly MagicSortService magicSort;
     private readonly BellSweepService bellSweep;
     private readonly MarketBoardBuyPlanner marketBoardBuy;
+    private readonly MaterialTrackerService materialTracker;
+
+    private readonly HashSet<uint> summoningBellIds;
+    private readonly HashSet<uint> armoireIds;
+    private readonly HashSet<uint> glamourDresserIds;
+    private readonly HashSet<uint> marketBoardIds;
+    private readonly string summoningBellLocalizedName;
+    private readonly string armoireLocalizedName;
+    private readonly string glamourDresserLocalizedName;
+    private readonly string marketBoardLocalizedName;
 
     private PendingStationRequest? pendingStation;
 
@@ -70,6 +82,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         public required Vector3 OriginPosition { get; init; }
         public required DateTime StartedUtc { get; set; }
         public DateTime ReadyAtUtc { get; set; } = DateTime.MinValue;
+        public DateTime PrismBoxSeenUtc { get; set; } = DateTime.MinValue;
+        public int TalkAdvances { get; set; }
         public bool ClickedSubMenu { get; set; }
         public bool SwitchedGcTab { get; set; }
     }
@@ -85,7 +99,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         SafeTransactionQueue transactionQueue,
         MagicSortService magicSort,
         BellSweepService bellSweep,
-        MarketBoardBuyPlanner marketBoardBuy)
+        MarketBoardBuyPlanner marketBoardBuy,
+        MaterialTrackerService materialTracker)
     {
         this.framework = framework;
         this.clientState = clientState;
@@ -98,6 +113,12 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         this.magicSort = magicSort;
         this.bellSweep = bellSweep;
         this.marketBoardBuy = marketBoardBuy;
+        this.materialTracker = materialTracker;
+
+        (summoningBellIds, summoningBellLocalizedName) = BuildEObjStationLookup(dataManager, SummoningBellCanonicalEObjId, "Summoning Bell");
+        (armoireIds, armoireLocalizedName) = BuildEObjStationLookup(dataManager, ArmoireCanonicalEObjId, "Armoire");
+        (glamourDresserIds, glamourDresserLocalizedName) = BuildEObjStationLookup(dataManager, GlamourDresserCanonicalEObjId, "Glamour Dresser");
+        (marketBoardIds, marketBoardLocalizedName) = BuildEObjStationLookup(dataManager, MarketBoardCanonicalEObjId, "Market Board");
 
         this.magicSort.IsOrchestratorActive = () => IsAnyOrchestratorActive;
         this.magicSort.OnUserStopRequested = () => StopAll("Stopped.");
@@ -108,7 +129,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     public bool IsAnyOrchestratorActive
         => pendingStation != null
             || bellSweep.IsRunning
-            || marketBoardBuy.IsAutoBuying;
+            || marketBoardBuy.IsAutoBuying
+            || materialTracker.IsPendingCraftActive;
 
     public bool IsAnythingActive => IsAnyOrchestratorActive || transactionQueue.IsBusy;
 
@@ -119,6 +141,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
         bellSweep.Stop(null);
         marketBoardBuy.StopAutoBuy(null);
+        materialTracker.StopPendingCraft();
         transactionQueue.Cancel(null, QueueBatchOutcome.CancelledByUser);
         magicSort.InvalidateButtonCache();
 
@@ -148,13 +171,17 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             return;
         }
 
-        // 1. Check already-open station windows first (zero world interaction needed)
+        if (intent == MagicActionIntent.Use)
+        {
+            magicSort.ExecuteUseAll();
+            return;
+        }
+
         if (TryDispatchOpenStation(intent))
         {
             return;
         }
 
-        // 2. Otherwise check for an in-range interactable station (zero movement, single-shot)
         if (!CanSafelyInteractWorld(out var player, out var blockReason))
         {
             chatGui.PrintError(blockReason);
@@ -374,8 +401,15 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 }
                 else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBox"))
                 {
-                    pendingStation = null;
-                    chatGui.Print("Open the Glamour Creation list inside the Glamour Dresser, then click Magic Store.");
+                    if (req.PrismBoxSeenUtc == DateTime.MinValue)
+                    {
+                        req.PrismBoxSeenUtc = now;
+                    }
+                    else if ((now - req.PrismBoxSeenUtc).TotalSeconds >= GlamourCrystallizeSettleGraceSeconds)
+                    {
+                        pendingStation = null;
+                        chatGui.Print("Open the Glamour Creation list inside the Glamour Dresser, then click Magic Store.");
+                    }
                 }
 
                 break;
@@ -405,9 +439,17 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 {
                     if (WaitHumanBeat(req, now))
                     {
-                        TryAdvanceTalkDialog();
-                        req.ReadyAtUtc = DateTime.MinValue;
-                        req.StartedUtc = now;
+                        if (req.TalkAdvances >= MaxTalkAdvances)
+                        {
+                            pendingStation = null;
+                            chatGui.Print($"Stopped: {req.StationName} dialogue did not open a shop window.");
+                        }
+                        else
+                        {
+                            req.TalkAdvances++;
+                            TryAdvanceTalkDialog();
+                            req.ReadyAtUtc = DateTime.MinValue;
+                        }
                     }
                 }
                 else if (!req.ClickedSubMenu
@@ -447,7 +489,6 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                             }
                             else
                             {
-                                // One-shot switch to Expert Delivery tab, then wait a beat and deliver automatically
                                 req.SwitchedGcTab = true;
                                 magicSort.ExecuteGrandCompanySort();
                                 req.ReadyAtUtc = DateTime.MinValue;
@@ -465,9 +506,17 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 {
                     if (WaitHumanBeat(req, now))
                     {
-                        TryAdvanceTalkDialog();
-                        req.ReadyAtUtc = DateTime.MinValue;
-                        req.StartedUtc = now;
+                        if (req.TalkAdvances >= MaxTalkAdvances)
+                        {
+                            pendingStation = null;
+                            chatGui.Print("Stopped: Grand Company dialogue did not open supply menu.");
+                        }
+                        else
+                        {
+                            req.TalkAdvances++;
+                            TryAdvanceTalkDialog();
+                            req.ReadyAtUtc = DateTime.MinValue;
+                        }
                     }
                 }
                 else if (!req.ClickedSubMenu
@@ -518,12 +567,23 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     }
 
     private static bool MatchesShopSubMenu(string text)
-        => text.Contains("Purchase", StringComparison.OrdinalIgnoreCase)
+    {
+        if (string.IsNullOrWhiteSpace(text)
+            || text.Contains("Buyback", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Rückkauf", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Racheter", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("買い戻", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return text.Contains("Purchase", StringComparison.OrdinalIgnoreCase)
             || text.Contains("Shop", StringComparison.OrdinalIgnoreCase)
             || text.Contains("Buy", StringComparison.OrdinalIgnoreCase)
             || text.Contains("Kaufen", StringComparison.OrdinalIgnoreCase)
             || text.Contains("Acheter", StringComparison.OrdinalIgnoreCase)
             || text.Contains("購入", StringComparison.Ordinal);
+    }
 
     private bool TryClickShopPurchaseSubMenu()
     {
@@ -657,6 +717,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             || condition[ConditionFlag.OccupiedInQuestEvent]
             || condition[ConditionFlag.Casting]
             || condition[ConditionFlag.Mounted]
+            || condition[ConditionFlag.RidingPillion]
             || condition[ConditionFlag.Unconscious])
         {
             reason = "Cannot interact right now (busy, in duty, mounted, casting, or in combat).";
@@ -669,18 +730,29 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
     private bool HasEligibleWorkForStation(StationKind kind, MagicActionIntent intent)
     {
-        if (intent != MagicActionIntent.Sell)
+        if (intent == MagicActionIntent.Sell)
         {
-            return true;
+            return kind switch
+            {
+                StationKind.SummoningBell => magicSort.CountPendingBagMarketItems() > 0,
+                StationKind.VendorNpc => magicSort.CountBagVendorItems() > 0,
+                StationKind.GrandCompanyNpc => magicSort.CountBagGcItems() > 0,
+                _ => true,
+            };
         }
 
-        return kind switch
+        if (intent == MagicActionIntent.Sort)
         {
-            StationKind.SummoningBell => magicSort.CountBagMarketItems() > 0,
-            StationKind.VendorNpc => magicSort.CountBagVendorItems() > 0,
-            StationKind.GrandCompanyNpc => magicSort.CountBagGcItems() > 0,
-            _ => true,
-        };
+            return kind switch
+            {
+                StationKind.Armoire => magicSort.HasArmoireWork(),
+                StationKind.GlamourDresser => magicSort.HasGlamourRouteItems(),
+                StationKind.SummoningBell => magicSort.EvaluateAllBellWork().Values.Any(s => s.HasAnyWork),
+                _ => true,
+            };
+        }
+
+        return true;
     }
 
     private bool TryFindNearestInRangeStation(
@@ -745,7 +817,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         if (obj.ObjectKind == ObjectKind.EventObj)
         {
             if ((intent is MagicActionIntent.Sort or MagicActionIntent.Sell)
-                && (obj.BaseId is 2000401 or 2000403 or 196630 || string.Equals(name, "Summoning Bell", StringComparison.OrdinalIgnoreCase)))
+                && (summoningBellIds.Contains(obj.BaseId)
+                    || string.Equals(name, summoningBellLocalizedName, StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.SummoningBell;
                 maxRange = EventObjectInteractRangeYalms;
@@ -753,7 +826,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             }
 
             if (intent == MagicActionIntent.Sort
-                && (obj.BaseId == 2001407 || string.Equals(name, "Armoire", StringComparison.OrdinalIgnoreCase)))
+                && (armoireIds.Contains(obj.BaseId)
+                    || string.Equals(name, armoireLocalizedName, StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.Armoire;
                 maxRange = EventObjectInteractRangeYalms;
@@ -761,7 +835,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             }
 
             if (intent == MagicActionIntent.Sort
-                && (obj.BaseId is 2009184 or 2009185 || name.Contains("Glamour Dresser", StringComparison.OrdinalIgnoreCase)))
+                && (glamourDresserIds.Contains(obj.BaseId)
+                    || string.Equals(name, glamourDresserLocalizedName, StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.GlamourDresser;
                 maxRange = EventObjectInteractRangeYalms;
@@ -769,7 +844,8 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             }
 
             if (intent == MagicActionIntent.Buy
-                && (obj.BaseId is 2000402 or 2000440 || string.Equals(name, "Market Board", StringComparison.OrdinalIgnoreCase)))
+                && (marketBoardIds.Contains(obj.BaseId)
+                    || string.Equals(name, marketBoardLocalizedName, StringComparison.OrdinalIgnoreCase)))
             {
                 kind = StationKind.MarketBoard;
                 maxRange = EventObjectInteractRangeYalms;
@@ -800,6 +876,40 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         return false;
     }
 
+    private static (HashSet<uint> Ids, string LocalizedName) BuildEObjStationLookup(
+        IDataManager dataManager,
+        uint canonicalRowId,
+        string fallbackName)
+    {
+        var ids = new HashSet<uint> { canonicalRowId };
+        var eobjSheet = dataManager.GetExcelSheet<EObjName>();
+        if (eobjSheet == null)
+        {
+            return (ids, fallbackName);
+        }
+
+        var canonicalName = eobjSheet.GetRowOrDefault(canonicalRowId)?.Singular.ExtractText()?.Trim();
+        if (string.IsNullOrWhiteSpace(canonicalName))
+        {
+            return (ids, fallbackName);
+        }
+
+        foreach (var row in eobjSheet)
+        {
+            if (row.RowId == 0)
+            {
+                continue;
+            }
+
+            if (string.Equals(row.Singular.ExtractText().Trim(), canonicalName, StringComparison.OrdinalIgnoreCase))
+            {
+                ids.Add(row.RowId);
+            }
+        }
+
+        return (ids, canonicalName);
+    }
+
     private bool HasGilShopHandler(uint enpcId)
     {
         var enpcSheet = dataManager.GetExcelSheet<ENpcBase>();
@@ -809,7 +919,38 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             return false;
         }
 
+        var gilShopSheet = dataManager.GetExcelSheet<GilShop>();
         var topicSheet = dataManager.GetExcelSheet<TopicSelect>();
+        var preHandlerSheet = dataManager.GetExcelSheet<PreHandler>();
+        if (gilShopSheet == null)
+        {
+            return false;
+        }
+
+        bool IsGilShopOrWrapped(uint handlerId)
+        {
+            if (handlerId == 0)
+            {
+                return false;
+            }
+
+            if (gilShopSheet.HasRow(handlerId))
+            {
+                return true;
+            }
+
+            if (preHandlerSheet != null && preHandlerSheet.TryGetRow(handlerId, out var pre))
+            {
+                var targetId = pre.Target.RowId;
+                if (targetId != 0 && gilShopSheet.HasRow(targetId))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         foreach (var dataRef in row.Value.ENpcData)
         {
             var id = dataRef.RowId;
@@ -818,23 +959,18 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 continue;
             }
 
-            var high = id >> 16;
-            if (high == GilShopHighWord)
+            if (IsGilShopOrWrapped(id))
             {
                 return true;
             }
 
-            if (high == TopicSelectHighWord && topicSheet != null)
+            if (topicSheet != null && topicSheet.TryGetRow(id, out var topic))
             {
-                var topic = topicSheet.GetRowOrDefault(id);
-                if (topic is not null)
+                foreach (var shopRef in topic.Shop)
                 {
-                    foreach (var shopRef in topic.Value.Shop)
+                    if (IsGilShopOrWrapped(shopRef.RowId))
                     {
-                        if ((shopRef.RowId >> 16) == GilShopHighWord)
-                        {
-                            return true;
-                        }
+                        return true;
                     }
                 }
             }

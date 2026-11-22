@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Memory;
@@ -63,71 +63,6 @@ public static unsafe class NativeUiHelpers
     public static string NormalizeItemLabel(string raw)
         => raw.Trim().TrimEnd('\uE03C', ' ');
 
-    public static AtkComponentButton* FindEnabledButtonByLabel(
-        AtkUnitBase* addon,
-        string expectedLabel,
-        uint? fallbackNodeId = null)
-    {
-        if (addon == null || addon->UldManager.NodeList == null)
-        {
-            return null;
-        }
-
-        var trimmedExpected = expectedLabel.Trim();
-        if (!string.IsNullOrEmpty(trimmedExpected))
-        {
-            for (var i = 0; i < addon->UldManager.NodeListCount; i++)
-            {
-                var node = addon->UldManager.NodeList[i];
-                if (node == null || !node->IsVisible())
-                {
-                    continue;
-                }
-
-                var compNode = node->GetAsAtkComponentNode();
-                if (compNode == null
-                    || compNode->Component == null
-                    || compNode->Component->GetComponentType() != ComponentType.Button)
-                {
-                    continue;
-                }
-
-                var btn = (AtkComponentButton*)compNode->Component;
-                if (btn == null || !btn->IsEnabled)
-                {
-                    continue;
-                }
-
-                var label = ReadTextNodeValue(btn->ButtonTextNode);
-                if (string.Equals(label, trimmedExpected, StringComparison.OrdinalIgnoreCase))
-                {
-                    return btn;
-                }
-            }
-        }
-
-        if (fallbackNodeId.HasValue)
-        {
-            var fallback = addon->GetComponentButtonById(fallbackNodeId.Value);
-            if (fallback != null && fallback->IsEnabled)
-            {
-                return fallback;
-            }
-        }
-
-        return null;
-    }
-
-    public static bool ClickButtonById(AtkUnitBase* addon, uint nodeId)
-    {
-        if (addon == null)
-        {
-            return false;
-        }
-
-        return ClickAddonButton(addon, addon->GetComponentButtonById(nodeId));
-    }
-
     public static bool ClickAddonButton(AtkUnitBase* addon, AtkComponentButton* button)
     {
         if (addon == null || !addon->IsVisible || !addon->IsReady || button == null || !button->IsEnabled)
@@ -141,8 +76,6 @@ public static unsafe class NativeUiHelpers
             return false;
         }
 
-        // Walk the AtkEvent linked list for an actual ButtonClick event owned by this addon
-        // so we never blindly fire an unrelated hover/focus/injected head event.
         var evt = owner->AtkResNode.AtkEventManager.Event;
         AtkEvent* matched = null;
         AtkEvent* fallbackClick = null;
@@ -157,7 +90,7 @@ public static unsafe class NativeUiHelpers
                     break;
                 }
 
-                if (fallbackClick == null)
+                if (fallbackClick == null && evt->Listener != null)
                 {
                     fallbackClick = evt;
                 }
@@ -167,13 +100,13 @@ public static unsafe class NativeUiHelpers
         }
 
         var target = matched != null ? matched : fallbackClick;
-        if (target == null)
+        if (target == null || target->Listener == null)
         {
             return false;
         }
 
         var eventData = default(AtkEventData);
-        addon->ReceiveEvent(target->State.EventType, (int)target->Param, target, &eventData);
+        target->Listener->ReceiveEvent(target->State.EventType, (int)target->Param, target, &eventData);
         return true;
     }
 
@@ -190,8 +123,6 @@ public static unsafe class NativeUiHelpers
             buffer[i] = values[i];
         }
 
-        // FFXIV's AtkUnitBase::FireCallback returns a native handler flag (often false even on
-        // valid dispatch, e.g. RetainerList selection). Callers verify outcomes via state/ACK.
         addon->FireCallback((uint)values.Length, buffer, updateState);
         return true;
     }
@@ -376,5 +307,97 @@ public static unsafe class NativeUiHelpers
             ? Math.Max(16f, rootW - width - 18f)
             : 18f;
         return (new Vector2(fallbackX, targetY), new Vector2(width, height));
+    }
+
+    public static string ExtractLongestAddonLiteral(IDataManager dataManager, uint addonRowId)
+    {
+        var row = dataManager.GetExcelSheet<Lumina.Excel.Sheets.Addon>()?.GetRowOrDefault(addonRowId);
+        if (row is null)
+        {
+            return string.Empty;
+        }
+
+        var macro = row.Value.Text.ToMacroString();
+        if (string.IsNullOrWhiteSpace(macro))
+        {
+            return string.Empty;
+        }
+
+        var best = string.Empty;
+        var span = macro.AsSpan();
+        var segStart = 0;
+        var depth = 0;
+        for (var i = 0; i < span.Length; i++)
+        {
+            var c = span[i];
+            if (c == '<')
+            {
+                if (depth == 0 && i > segStart)
+                {
+                    var candidate = CollapseWhitespace(span[segStart..i]);
+                    if (candidate.Length > best.Length)
+                    {
+                        best = candidate;
+                    }
+                }
+
+                depth++;
+            }
+            else if (c == '>' && depth > 0)
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    segStart = i + 1;
+                }
+            }
+        }
+
+        if (depth == 0 && segStart < span.Length)
+        {
+            var candidate = CollapseWhitespace(span[segStart..]);
+            if (candidate.Length > best.Length)
+            {
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    public static string CollapseWhitespace(ReadOnlySpan<char> input)
+    {
+        if (input.IsEmpty)
+        {
+            return string.Empty;
+        }
+
+        Span<char> buffer = input.Length <= 512 ? stackalloc char[input.Length] : new char[input.Length];
+        var outLen = 0;
+        var prevSpace = true;
+        for (var i = 0; i < input.Length; i++)
+        {
+            var c = input[i];
+            if (char.IsWhiteSpace(c))
+            {
+                if (!prevSpace)
+                {
+                    buffer[outLen++] = ' ';
+                    prevSpace = true;
+                }
+            }
+            else
+            {
+                buffer[outLen++] = c;
+                prevSpace = false;
+            }
+        }
+
+        if (outLen > 0 && buffer[outLen - 1] == ' ')
+        {
+            outLen--;
+        }
+
+        return outLen == 0 ? string.Empty : new string(buffer[..outLen]);
     }
 }

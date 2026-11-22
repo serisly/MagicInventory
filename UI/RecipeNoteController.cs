@@ -1,4 +1,6 @@
+using System;
 using System.Numerics;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
@@ -16,8 +18,8 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private const uint IngredientsContainerNodeId = 88;
     private const int IngredientSlotCount = 6;
 
-    private const float ButtonX = 252f;
-    private const float ButtonY = 152f;
+    private const float DefaultButtonX = 252f;
+    private const float DefaultButtonY = 152f;
     private const float ButtonWidth = 116f;
     private const float ButtonHeight = 28f;
 
@@ -37,6 +39,8 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private readonly string[] lastLabelTexts = new string[IngredientSlotCount];
 
     private TextButtonNode? trackButton;
+    private nint attachedAddonAddress;
+    private bool setupAttemptedForInstance;
     private uint lastRecipeId;
     private bool? lastTrackedState;
     private DateTime lastHoldingsRefreshUtc = DateTime.MinValue;
@@ -61,6 +65,8 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private void OnSetup(AddonRecipeNote* addon)
     {
         DetachNodes();
+        attachedAddonAddress = (nint)addon;
+        setupAttemptedForInstance = true;
 
         if (addon == null)
         {
@@ -73,9 +79,18 @@ public sealed unsafe class RecipeNoteController : IDisposable
             return;
         }
 
+        var maxX = Math.Max(8f, detailsContainer->Width > ButtonWidth + 8f
+            ? detailsContainer->Width - ButtonWidth - 6f
+            : DefaultButtonX);
+        var maxY = Math.Max(8f, detailsContainer->Height > ButtonHeight + 8f
+            ? detailsContainer->Height - ButtonHeight - 6f
+            : DefaultButtonY);
+        var btnX = Math.Clamp(DefaultButtonX, 8f, maxX);
+        var btnY = Math.Clamp(DefaultButtonY, 8f, maxY);
+
         trackButton = new TextButtonNode
         {
-            Position = new Vector2(ButtonX, ButtonY),
+            Position = new Vector2(btnX, btnY),
             Size = new Vector2(ButtonWidth, ButtonHeight),
             String = "Track",
             IsVisible = false,
@@ -120,9 +135,14 @@ public sealed unsafe class RecipeNoteController : IDisposable
             return;
         }
 
-        if (trackButton == null)
+        if (!setupAttemptedForInstance || attachedAddonAddress != (nint)addon)
         {
             OnSetup(addon);
+            return;
+        }
+
+        if (trackButton == null)
+        {
             return;
         }
 
@@ -155,7 +175,7 @@ public sealed unsafe class RecipeNoteController : IDisposable
             trackButton.String = isTracked ? "Untrack" : "Track";
             trackButton.TextTooltip = isTracked
                 ? $"Stop tracking {recipe.Name}."
-                : $"Track materials for {recipe.Name} (use right-click -> Track -> Add to List to stack multiple items).";
+                : $"Click to track {recipe.Name}. Shift+Click to add its materials to your current tracked list.";
         }
 
         var now = DateTime.UtcNow;
@@ -234,7 +254,6 @@ public sealed unsafe class RecipeNoteController : IDisposable
 
     private void OnTrackClicked()
     {
-        // Resolve the live RecipeNote addon at click time instead of capturing a raw pointer from OnSetup
         var addon = (AddonRecipeNote*)NativeUiHelpers.GetReadyAddon(gameGui, "RecipeNote");
         if (addon == null)
         {
@@ -247,7 +266,15 @@ public sealed unsafe class RecipeNoteController : IDisposable
             return;
         }
 
-        tracker.ToggleRecipe(recipe);
+        if (ImGui.GetIO().KeyShift)
+        {
+            tracker.AddRecipeToList(recipe);
+        }
+        else
+        {
+            tracker.ToggleRecipe(recipe);
+        }
+
         lastTrackedState = null;
         SyncState(addon);
     }
@@ -255,6 +282,8 @@ public sealed unsafe class RecipeNoteController : IDisposable
     private void OnFinalize(AddonRecipeNote* _)
     {
         DetachNodes();
+        attachedAddonAddress = nint.Zero;
+        setupAttemptedForInstance = false;
     }
 
     private void DetachNodes()

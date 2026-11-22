@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text.Json;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -11,9 +11,15 @@ namespace MagicInventory.Services;
 
 public sealed record RetainerHolding(ulong RetainerId, string RetainerName, int Quantity);
 
-public sealed record ItemHoldingSummary(uint ItemId, int BagCount, IReadOnlyList<RetainerHolding> Retainers)
+public sealed record ItemHoldingSummary(
+    uint ItemId,
+    int BagCount,
+    IReadOnlyList<RetainerHolding> Retainers,
+    int SaddlebagCount = 0)
 {
     public int TotalRetainerCount => Retainers.Sum(r => r.Quantity);
+
+    public int TotalExternalCount => TotalRetainerCount + SaddlebagCount;
 }
 
 public sealed record KnownRetainerInfo(
@@ -23,13 +29,20 @@ public sealed record KnownRetainerInfo(
     int MarketItemCount,
     bool IsVisited,
     IReadOnlyDictionary<uint, int> Quantities,
-    IReadOnlyDictionary<string, int> CategoryCounts,
+    IReadOnlyDictionary<uint, int> CategoryCounts,
     IReadOnlyDictionary<uint, int>? HqQuantities = null);
 
-public sealed unsafe class HoldingsService
+public sealed unsafe class HoldingsService : IDisposable
 {
     public const int MaxRetainerBagSlots = 175;
-    private const ulong SaddlebagPseudoOwnerId = ulong.MaxValue - 1;
+
+    private static readonly InventoryType[] SaddlebagContainers =
+    [
+        InventoryType.SaddleBag1,
+        InventoryType.SaddleBag2,
+        InventoryType.PremiumSaddleBag1,
+        InventoryType.PremiumSaddleBag2,
+    ];
 
     private sealed record LiveRetainerSnapshot(
         ulong CharacterContentId,
@@ -38,7 +51,7 @@ public sealed unsafe class HoldingsService
         int UsedBagSlots,
         HashSet<(uint BaseItemId, bool IsHq)> PartialStacks,
         Dictionary<uint, int> Quantities,
-        Dictionary<string, int> CategoryCounts,
+        Dictionary<uint, int> CategoryCounts,
         Dictionary<uint, int> HqQuantities);
 
     private readonly string nativeCachePath;
@@ -49,6 +62,7 @@ public sealed unsafe class HoldingsService
     private readonly IPluginLog log;
 
     private long saveGeneration;
+    private volatile bool nativeCacheDirty;
     private DateTime lastExternalPollUtc = DateTime.MinValue;
     private DateTime lastCsvWriteUtc = DateTime.MinValue;
     private DateTime lastJsonWriteUtc = DateTime.MinValue;
@@ -56,11 +70,16 @@ public sealed unsafe class HoldingsService
 
     private Dictionary<ulong, string> ownerNames = new();
     private Dictionary<uint, List<RetainerHolding>> cachedExternalHoldings = new();
+    private Dictionary<ulong, Dictionary<uint, int>> cachedCsvQuantitiesByOwner = new();
+    private Dictionary<ulong, Dictionary<uint, int>> cachedCsvCategoryIdsByOwner = new();
     private Dictionary<(ulong CharacterId, uint ItemId), int> cachedSaddlebagByChar = new();
     private Dictionary<ulong, Dictionary<uint, int>> cachedRetainerHqQuantities = new();
     private Dictionary<ulong, int> cachedRetainerUsedSlots = new();
     private Dictionary<ulong, HashSet<(uint BaseItemId, bool IsHq)>> cachedRetainerPartialStacks = new();
     private readonly Dictionary<ulong, LiveRetainerSnapshot> liveRetainerSnapshots = new();
+
+    private static readonly IReadOnlyDictionary<uint, int> EmptyCategoryMap = new Dictionary<uint, int>(0);
+    private static readonly IReadOnlyDictionary<uint, int> EmptyQuantityMap = new Dictionary<uint, int>(0);
 
     public HoldingsService(IDalamudPluginInterface pluginInterface, IDataManager dataManager, IPluginLog log)
     {
@@ -72,6 +91,14 @@ public sealed unsafe class HoldingsService
         inventoriesCsvPath = Path.Combine(configRoot, "InventoryTools", "inventories.csv");
 
         LoadNativeCache();
+    }
+
+    public void Dispose()
+    {
+        if (nativeCacheDirty)
+        {
+            SaveNativeCache(synchronous: true);
+        }
     }
 
     public event System.Action? RetainerSnapshotUpdated;
@@ -107,8 +134,6 @@ public sealed unsafe class HoldingsService
             return;
         }
 
-        // Verify ALL 7 regular retainer pages are actually loaded from the server before snapshotting
-        // so an early frame with only Page 1 loaded never wipes pages 2..7 from the retainer cache.
         foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainers)
         {
             var c = manager->GetInventoryContainer(containerType);
@@ -131,7 +156,7 @@ public sealed unsafe class HoldingsService
         var partialStacks = new HashSet<(uint BaseItemId, bool IsHq)>();
         var counts = new Dictionary<uint, int>();
         var hqCounts = new Dictionary<uint, int>();
-        var categoryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var categoryCounts = new Dictionary<uint, int>();
         foreach (var containerType in InventorySafetyEvaluator.RetainerBagContainersWithCrystals)
         {
             var container = manager->GetInventoryContainer(containerType);
@@ -168,10 +193,10 @@ public sealed unsafe class HoldingsService
                     var row = itemSheet?.GetRowOrDefault(normalized);
                     if (row is not null)
                     {
-                        var uiCat = row.Value.ItemUICategory.ValueNullable?.Name.ExtractText();
-                        if (!string.IsNullOrWhiteSpace(uiCat))
+                        var uiCatId = row.Value.ItemUICategory.RowId;
+                        if (uiCatId != 0)
                         {
-                            categoryCounts[uiCat] = categoryCounts.GetValueOrDefault(uiCat) + 1;
+                            categoryCounts[uiCatId] = categoryCounts.GetValueOrDefault(uiCatId) + 1;
                         }
                     }
 
@@ -249,7 +274,6 @@ public sealed unsafe class HoldingsService
                     continue;
                 }
 
-                // Mark unavailable/dismissed retainers as seen so fallback snapshots never resurrect them
                 seen.Add(ret->RetainerId);
                 if (!ret->Available)
                 {
@@ -274,7 +298,8 @@ public sealed unsafe class HoldingsService
                 }
                 else
                 {
-                    var csvCounts = BuildCsvRetainerQuantities(ret->RetainerId, out var csvCategories);
+                    var csvCounts = cachedCsvQuantitiesByOwner.TryGetValue(ret->RetainerId, out var qMap) ? qMap : EmptyQuantityMap;
+                    var csvCategories = cachedCsvCategoryIdsByOwner.TryGetValue(ret->RetainerId, out var cMap) ? cMap : EmptyCategoryMap;
                     var hasCsv = csvCounts.Count > 0 || cachedRetainerUsedSlots.ContainsKey(ret->RetainerId);
                     var used = cachedRetainerUsedSlots.GetValueOrDefault(ret->RetainerId, 0);
                     cachedRetainerHqQuantities.TryGetValue(ret->RetainerId, out var csvHq);
@@ -291,7 +316,6 @@ public sealed unsafe class HoldingsService
             }
         }
 
-        // Only fall back to persisted snapshots if RetainerManager wasn't ready yet
         if (!rmReady)
         {
             foreach (var (retId, snap) in liveRetainerSnapshots)
@@ -379,6 +403,18 @@ public sealed unsafe class HoldingsService
         return false;
     }
 
+    public bool IsRetainerVisited(ulong retainerId)
+    {
+        if (retainerId == 0)
+        {
+            return false;
+        }
+
+        RefreshRetainerCacheIfChanged();
+        return liveRetainerSnapshots.ContainsKey(retainerId)
+            || cachedRetainerUsedSlots.ContainsKey(retainerId);
+    }
+
     public int GetKnownRetainerFreeSlots(ulong retainerId)
     {
         if (retainerId == 0)
@@ -397,7 +433,7 @@ public sealed unsafe class HoldingsService
             return Math.Max(0, MaxRetainerBagSlots - csvUsed);
         }
 
-        return 0;
+        return MaxRetainerBagSlots;
     }
 
     public bool HasPartialStackOnRetainer(ulong retainerId, uint baseItemId, bool isHq)
@@ -427,11 +463,11 @@ public sealed unsafe class HoldingsService
         var bagCount = GetLiveBagCount(normalized);
         var currentCid = InventorySafetyEvaluator.GetCurrentContentId();
 
-        // Restrict strictly to available retainers belonging to the active character (prevents cross-alt bleed & expired retainers!)
         var currentCharRetainerIds = new HashSet<ulong>();
         var unavailableRetainerIds = new HashSet<ulong>();
         var rm = RetainerManager.Instance();
-        if (rm != null && rm->IsReady)
+        var rmReady = rm != null && rm->IsReady;
+        if (rmReady)
         {
             var count = rm->GetRetainerCount();
             for (uint i = 0; i < count; i++)
@@ -452,32 +488,30 @@ public sealed unsafe class HoldingsService
                 }
             }
         }
-
-        foreach (var (retId, snap) in liveRetainerSnapshots)
+        else
         {
-            if (unavailableRetainerIds.Contains(retId))
+            foreach (var (retId, snap) in liveRetainerSnapshots)
             {
-                continue;
-            }
-
-            if (currentCid == 0 || snap.CharacterContentId == 0 || snap.CharacterContentId == currentCid)
-            {
-                currentCharRetainerIds.Add(retId);
-            }
-        }
-
-        var merged = new List<RetainerHolding>(4);
-        if (cachedExternalHoldings.TryGetValue(normalized, out var cachedList))
-        {
-            foreach (var entry in cachedList)
-            {
-                if (liveRetainerSnapshots.ContainsKey(entry.RetainerId)
-                    || unavailableRetainerIds.Contains(entry.RetainerId))
+                if (unavailableRetainerIds.Contains(retId))
                 {
                     continue;
                 }
 
-                if (currentCharRetainerIds.Count > 0 && !currentCharRetainerIds.Contains(entry.RetainerId))
+                if (currentCid == 0 || snap.CharacterContentId == 0 || snap.CharacterContentId == currentCid)
+                {
+                    currentCharRetainerIds.Add(retId);
+                }
+            }
+        }
+
+        var merged = new List<RetainerHolding>(4);
+        if (currentCharRetainerIds.Count > 0 && cachedExternalHoldings.TryGetValue(normalized, out var cachedList))
+        {
+            foreach (var entry in cachedList)
+            {
+                if (liveRetainerSnapshots.ContainsKey(entry.RetainerId)
+                    || unavailableRetainerIds.Contains(entry.RetainerId)
+                    || !currentCharRetainerIds.Contains(entry.RetainerId))
                 {
                     continue;
                 }
@@ -486,9 +520,10 @@ public sealed unsafe class HoldingsService
             }
         }
 
-        if (currentCid != 0 && cachedSaddlebagByChar.TryGetValue((currentCid, normalized), out var sbQty) && sbQty > 0)
+        var saddlebagCount = GetLiveSaddlebagCount(normalized, out var anySaddlebagLoaded);
+        if (!anySaddlebagLoaded && currentCid != 0 && cachedSaddlebagByChar.TryGetValue((currentCid, normalized), out var sbQty))
         {
-            merged.Add(new RetainerHolding(SaddlebagPseudoOwnerId, "Saddlebag", sbQty));
+            saddlebagCount = sbQty;
         }
 
         foreach (var (retainerId, snap) in liveRetainerSnapshots)
@@ -498,7 +533,12 @@ public sealed unsafe class HoldingsService
                 continue;
             }
 
-            if (currentCid != 0 && snap.CharacterContentId != 0 && snap.CharacterContentId != currentCid)
+            if (rmReady && !currentCharRetainerIds.Contains(retainerId))
+            {
+                continue;
+            }
+
+            if (!rmReady && currentCid != 0 && snap.CharacterContentId != 0 && snap.CharacterContentId != currentCid)
             {
                 continue;
             }
@@ -509,26 +549,29 @@ public sealed unsafe class HoldingsService
             }
         }
 
-        return new ItemHoldingSummary(normalized, bagCount, merged);
+        return new ItemHoldingSummary(normalized, bagCount, merged, saddlebagCount);
     }
 
     public string FormatExternalOwnership(uint baseItemId, int maxChars = 26)
     {
         var summary = GetHoldingSummary(baseItemId);
-        if (summary.Retainers.Count == 0)
+        if (summary.Retainers.Count == 0 && summary.SaddlebagCount <= 0)
         {
             return string.Empty;
         }
 
-        var joined = string.Join(", ", summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}"));
+        var parts = summary.Retainers.Select(r => $"{r.RetainerName}: {r.Quantity}").ToList();
+        if (summary.SaddlebagCount > 0)
+        {
+            parts.Add($"Saddlebag: {summary.SaddlebagCount}");
+        }
+
+        var joined = string.Join(", ", parts);
         return joined.Length <= maxChars
             ? joined
-            : $"Stored: {summary.TotalRetainerCount}";
+            : $"Stored: {summary.TotalExternalCount}";
     }
 
-    /// <summary>
-    /// Single-pass map of where every owned item currently lives (Equipped, Armoury, Bag, and/or Retainers).
-    /// </summary>
     public Dictionary<uint, string> BuildOwnedLocationsMap()
     {
         var partsByItem = new Dictionary<uint, List<string>>(512);
@@ -571,10 +614,10 @@ public sealed unsafe class HoldingsService
                 }
             }
 
-            foreach (var bagType in InventorySafetyEvaluator.PlayerBagContainers)
+            foreach (var bagType in InventorySafetyEvaluator.PlayerBagContainersWithCrystals)
             {
                 var c = mgr->GetInventoryContainer(bagType);
-                if (c == null || c->Items == null)
+                if (!InventorySafetyEvaluator.IsContainerReadable(c))
                 {
                     continue;
                 }
@@ -586,6 +629,50 @@ public sealed unsafe class HoldingsService
                     {
                         var id = ItemIdentity.NormalizeBaseItemId(s->ItemId);
                         bagCounts[id] = bagCounts.GetValueOrDefault(id) + (int)s->Quantity;
+                    }
+                }
+            }
+
+            var liveSaddlebagCounts = new Dictionary<uint, int>();
+            var anySbLoaded = false;
+            foreach (var sbType in SaddlebagContainers)
+            {
+                var c = mgr->GetInventoryContainer(sbType);
+                if (!InventorySafetyEvaluator.IsContainerReadable(c))
+                {
+                    continue;
+                }
+
+                anySbLoaded = true;
+                for (var i = 0; i < c->Size; i++)
+                {
+                    var s = c->GetInventorySlot(i);
+                    if (s != null && s->ItemId != 0 && s->Quantity > 0)
+                    {
+                        var id = ItemIdentity.NormalizeBaseItemId(s->ItemId);
+                        liveSaddlebagCounts[id] = liveSaddlebagCounts.GetValueOrDefault(id) + (int)s->Quantity;
+                    }
+                }
+            }
+
+            if (anySbLoaded)
+            {
+                foreach (var (id, qty) in liveSaddlebagCounts)
+                {
+                    AddLoc(id, qty > 1 ? $"Saddlebag ({qty})" : "Saddlebag");
+                }
+            }
+            else
+            {
+                var cid = InventorySafetyEvaluator.GetCurrentContentId();
+                if (cid != 0)
+                {
+                    foreach (var ((ownerCid, id), qty) in cachedSaddlebagByChar)
+                    {
+                        if (ownerCid == cid && id != 0 && qty > 0)
+                        {
+                            AddLoc(id, qty > 1 ? $"Saddlebag ({qty})" : "Saddlebag");
+                        }
                     }
                 }
             }
@@ -673,6 +760,39 @@ public sealed unsafe class HoldingsService
         return active != null ? active->RetainerId : 0;
     }
 
+    private static int GetLiveSaddlebagCount(uint baseItemId, out bool anyContainerLoaded)
+    {
+        anyContainerLoaded = false;
+        var manager = InventoryManager.Instance();
+        if (manager == null || baseItemId == 0)
+        {
+            return 0;
+        }
+
+        var normalized = ItemIdentity.NormalizeBaseItemId(baseItemId);
+        var total = 0;
+        foreach (var sbType in SaddlebagContainers)
+        {
+            var container = manager->GetInventoryContainer(sbType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
+            {
+                continue;
+            }
+
+            anyContainerLoaded = true;
+            for (var i = 0; i < container->Size; i++)
+            {
+                var slot = container->Items + i;
+                if (slot != null && slot->Quantity > 0 && ItemIdentity.NormalizeBaseItemId(slot->ItemId) == normalized)
+                {
+                    total += slot->Quantity;
+                }
+            }
+        }
+
+        return total;
+    }
+
     private static int CountInContainers(uint baseItemId, ReadOnlySpan<InventoryType> containers)
     {
         var manager = InventoryManager.Instance();
@@ -687,11 +807,6 @@ public sealed unsafe class HoldingsService
         {
             var container = manager->GetInventoryContainer(containerType);
             if (!InventorySafetyEvaluator.IsContainerReadable(container))
-            {
-                continue;
-            }
-
-            if (InventorySafetyEvaluator.IsRetainerContainer(containerType) && !container->IsLoaded)
             {
                 continue;
             }
@@ -737,7 +852,7 @@ public sealed unsafe class HoldingsService
                 var csvWrite = File.GetLastWriteTimeUtc(inventoriesCsvPath);
                 if (csvWrite != lastCsvWriteUtc)
                 {
-                    LoadRetainerCsv(csvWrite);
+                    LoadRetainerCsv();
                     lastCsvWriteUtc = csvWrite;
                 }
             }
@@ -780,10 +895,77 @@ public sealed unsafe class HoldingsService
         ownerNames = map;
     }
 
-    private void LoadRetainerCsv(DateTime csvWriteUtc)
+    public static List<string> SplitCsvLine(string line)
+    {
+        var fields = new List<string>(26);
+        var i = 0;
+        var len = line.Length;
+        while (i <= len)
+        {
+            if (i < len && line[i] == '"')
+            {
+                i++;
+                var sb = new System.Text.StringBuilder();
+                while (i < len)
+                {
+                    if (line[i] == '"')
+                    {
+                        if (i + 1 < len && line[i + 1] == '"')
+                        {
+                            sb.Append('"');
+                            i += 2;
+                        }
+                        else
+                        {
+                            i++;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        sb.Append(line[i++]);
+                    }
+                }
+
+                fields.Add(sb.ToString());
+                if (i < len && line[i] == ',')
+                {
+                    i++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+            else
+            {
+                var start = i;
+                while (i < len && line[i] != ',')
+                {
+                    i++;
+                }
+
+                fields.Add(line.Substring(start, i - start));
+                if (i < len && line[i] == ',')
+                {
+                    i++;
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+
+        return fields;
+    }
+
+    private void LoadRetainerCsv()
     {
         var itemSheet = dataManager.GetExcelSheet<Item>();
         var totalsByItemAndOwner = new Dictionary<(uint ItemId, ulong OwnerId), int>();
+        var quantitiesByOwner = new Dictionary<ulong, Dictionary<uint, int>>();
+        var categoryIdsByOwner = new Dictionary<ulong, Dictionary<uint, int>>();
         var nextSaddlebagByChar = new Dictionary<(ulong CharacterId, uint ItemId), int>();
         var hqByOwner = new Dictionary<ulong, Dictionary<uint, int>>();
         var usedSlotsByOwner = new Dictionary<ulong, int>();
@@ -799,13 +981,13 @@ public sealed unsafe class HoldingsService
                 continue;
             }
 
-            var cols = line.Split(',');
-            if (cols.Length < 24)
+            var cols = SplitCsvLine(line);
+            if (cols.Count < 24)
             {
                 continue;
             }
 
-            if (!int.TryParse(cols[0].Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var container))
+            if (!int.TryParse(cols[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var container))
             {
                 continue;
             }
@@ -818,17 +1000,17 @@ public sealed unsafe class HoldingsService
                 continue;
             }
 
-            if (!uint.TryParse(cols[2].Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemId) || itemId == 0)
+            if (!uint.TryParse(cols[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var itemId) || itemId == 0)
             {
                 continue;
             }
 
-            if (!int.TryParse(cols[3].Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var qty) || qty <= 0)
+            if (!int.TryParse(cols[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out var qty) || qty <= 0)
             {
                 continue;
             }
 
-            if (!ulong.TryParse(cols[23].Trim('"'), NumberStyles.None, CultureInfo.InvariantCulture, out var ownerId) || ownerId == 0)
+            if (!ulong.TryParse(cols[23], NumberStyles.None, CultureInfo.InvariantCulture, out var ownerId) || ownerId == 0)
             {
                 continue;
             }
@@ -841,7 +1023,6 @@ public sealed unsafe class HoldingsService
 
             if (isSaddlebag)
             {
-                // Scope Saddlebag holdings strictly to their owning character ContentId (prevents cross-alt bleed!)
                 var sbKey = (ownerId, normalized);
                 nextSaddlebagByChar[sbKey] = nextSaddlebagByChar.GetValueOrDefault(sbKey) + qty;
                 continue;
@@ -850,11 +1031,19 @@ public sealed unsafe class HoldingsService
             var key = (normalized, ownerId);
             totalsByItemAndOwner[key] = totalsByItemAndOwner.GetValueOrDefault(key) + qty;
 
+            if (!quantitiesByOwner.TryGetValue(ownerId, out var ownerQtyMap))
+            {
+                ownerQtyMap = new Dictionary<uint, int>();
+                quantitiesByOwner[ownerId] = ownerQtyMap;
+            }
+
+            ownerQtyMap[normalized] = ownerQtyMap.GetValueOrDefault(normalized) + qty;
+
             if (isRegularRetainerPage)
             {
                 usedSlotsByOwner[ownerId] = usedSlotsByOwner.GetValueOrDefault(ownerId) + 1;
-                var flagsVal = cols.Length > 6
-                    && int.TryParse(cols[6].Trim('"'), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedFlags)
+                var flagsVal = cols.Count > 6
+                    && int.TryParse(cols[6], NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedFlags)
                     ? parsedFlags
                     : 0;
                 var isHq = ItemIdentity.IsHighQuality(itemId, (InventoryItem.ItemFlags)flagsVal);
@@ -870,8 +1059,21 @@ public sealed unsafe class HoldingsService
                 }
 
                 var row = itemSheet?.GetRowOrDefault(normalized);
+                if (row is not null && row.Value.ItemUICategory.RowId != 0)
+                {
+                    if (!categoryIdsByOwner.TryGetValue(ownerId, out var catDict))
+                    {
+                        catDict = new Dictionary<uint, int>();
+                        categoryIdsByOwner[ownerId] = catDict;
+                    }
+
+                    var catId = row.Value.ItemUICategory.RowId;
+                    catDict[catId] = catDict.GetValueOrDefault(catId) + 1;
+                }
+
                 var stackSize = row is not null ? (int)Math.Max(1, row.Value.StackSize) : 1;
-                if (stackSize > 1 && (flagsVal & 8) == 0 && qty < stackSize)
+                var isCollectable = ItemIdentity.IsCollectable(itemId, (InventoryItem.ItemFlags)flagsVal);
+                if (stackSize > 1 && !isCollectable && qty < stackSize)
                 {
                     if (!partialsByOwner.TryGetValue(ownerId, out var set))
                     {
@@ -887,10 +1089,7 @@ public sealed unsafe class HoldingsService
         var nextHoldings = new Dictionary<uint, List<RetainerHolding>>();
         foreach (var ((itemId, ownerId), qty) in totalsByItemAndOwner)
         {
-            var name = ownerId == SaddlebagPseudoOwnerId
-                ? "Saddlebag"
-                : ownerNames.GetValueOrDefault(ownerId, $"Retainer {ownerId % 10000}");
-
+            var name = ownerNames.GetValueOrDefault(ownerId, $"Retainer {ownerId % 10000}");
             if (!nextHoldings.TryGetValue(itemId, out var list))
             {
                 list = new List<RetainerHolding>();
@@ -901,47 +1100,12 @@ public sealed unsafe class HoldingsService
         }
 
         cachedExternalHoldings = nextHoldings;
+        cachedCsvQuantitiesByOwner = quantitiesByOwner;
+        cachedCsvCategoryIdsByOwner = categoryIdsByOwner;
         cachedSaddlebagByChar = nextSaddlebagByChar;
         cachedRetainerHqQuantities = hqByOwner;
         cachedRetainerUsedSlots = usedSlotsByOwner;
         cachedRetainerPartialStacks = partialsByOwner;
-
-        // Evict stale native snapshots whenever Allagan Tools CSV is strictly newer for that retainer
-        foreach (var (retId, snap) in liveRetainerSnapshots.ToArray())
-        {
-            if (snap.CapturedUtc <= csvWriteUtc && usedSlotsByOwner.ContainsKey(retId))
-            {
-                liveRetainerSnapshots.Remove(retId);
-            }
-        }
-    }
-
-    private Dictionary<uint, int> BuildCsvRetainerQuantities(ulong retainerId, out Dictionary<string, int> categoryCounts)
-    {
-        var quantities = new Dictionary<uint, int>();
-        categoryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        var itemSheet = dataManager.GetExcelSheet<Item>();
-
-        foreach (var (itemId, list) in cachedExternalHoldings)
-        {
-            foreach (var h in list)
-            {
-                if (h.RetainerId != retainerId || h.Quantity <= 0)
-                {
-                    continue;
-                }
-
-                quantities[itemId] = quantities.GetValueOrDefault(itemId) + h.Quantity;
-                var row = itemSheet?.GetRowOrDefault(itemId);
-                var uiCat = row?.ItemUICategory.ValueNullable?.Name.ExtractText();
-                if (!string.IsNullOrWhiteSpace(uiCat))
-                {
-                    categoryCounts[uiCat] = categoryCounts.GetValueOrDefault(uiCat) + 1;
-                }
-            }
-        }
-
-        return quantities;
     }
 
     private sealed class NativeRetainerDto
@@ -954,7 +1118,8 @@ public sealed unsafe class HoldingsService
         public Dictionary<uint, int> Quantities { get; set; } = new();
         public Dictionary<uint, int>? HqQuantities { get; set; }
         public List<string> PartialStackKeys { get; set; } = new();
-        public Dictionary<string, int> CategoryCounts { get; set; } = new();
+        public Dictionary<uint, int>? CategoryIdCounts { get; set; }
+        public Dictionary<string, int>? CategoryCounts { get; set; }
     }
 
     private void LoadNativeCache()
@@ -970,6 +1135,21 @@ public sealed unsafe class HoldingsService
             if (dtos == null)
             {
                 return;
+            }
+
+            Dictionary<string, uint>? catNameToId = null;
+            var uiCatSheet = dataManager.GetExcelSheet<ItemUICategory>();
+            if (uiCatSheet != null)
+            {
+                catNameToId = new Dictionary<string, uint>(StringComparer.OrdinalIgnoreCase);
+                foreach (var row in uiCatSheet)
+                {
+                    var n = row.Name.ExtractText();
+                    if (row.RowId != 0 && !string.IsNullOrWhiteSpace(n))
+                    {
+                        catNameToId.TryAdd(n, row.RowId);
+                    }
+                }
             }
 
             foreach (var dto in dtos)
@@ -989,6 +1169,20 @@ public sealed unsafe class HoldingsService
                     }
                 }
 
+                var catIdCounts = dto.CategoryIdCounts != null
+                    ? new Dictionary<uint, int>(dto.CategoryIdCounts)
+                    : new Dictionary<uint, int>();
+                if (catIdCounts.Count == 0 && dto.CategoryCounts != null && catNameToId != null)
+                {
+                    foreach (var (legacyName, count) in dto.CategoryCounts)
+                    {
+                        if (catNameToId.TryGetValue(legacyName, out var catId))
+                        {
+                            catIdCounts[catId] = catIdCounts.GetValueOrDefault(catId) + count;
+                        }
+                    }
+                }
+
                 liveRetainerSnapshots[dto.RetainerId] = new LiveRetainerSnapshot(
                     dto.CharacterContentId,
                     dto.CapturedUtc,
@@ -996,7 +1190,7 @@ public sealed unsafe class HoldingsService
                     dto.UsedBagSlots,
                     partials,
                     dto.Quantities ?? new Dictionary<uint, int>(),
-                    new Dictionary<string, int>(dto.CategoryCounts ?? new Dictionary<string, int>(), StringComparer.OrdinalIgnoreCase),
+                    catIdCounts,
                     dto.HqQuantities ?? new Dictionary<uint, int>());
             }
         }
@@ -1006,7 +1200,7 @@ public sealed unsafe class HoldingsService
         }
     }
 
-    private void SaveNativeCache()
+    private void SaveNativeCache(bool synchronous = false)
     {
         try
         {
@@ -1023,17 +1217,19 @@ public sealed unsafe class HoldingsService
                     Quantities = new Dictionary<uint, int>(snap.Quantities),
                     HqQuantities = new Dictionary<uint, int>(snap.HqQuantities),
                     PartialStackKeys = snap.PartialStacks.Select(p => $"{p.BaseItemId}:{(p.IsHq ? 1 : 0)}").ToList(),
-                    CategoryCounts = new Dictionary<string, int>(snap.CategoryCounts),
+                    CategoryIdCounts = new Dictionary<uint, int>(snap.CategoryCounts),
                 });
             }
 
             var targetPath = nativeCachePath;
             var gen = System.Threading.Interlocked.Increment(ref saveGeneration);
-            _ = System.Threading.Tasks.Task.Run(() =>
+            nativeCacheDirty = true;
+
+            void WriteAction()
             {
                 lock (nativeCacheSaveGate)
                 {
-                    if (gen != System.Threading.Volatile.Read(ref saveGeneration))
+                    if (!synchronous && gen != System.Threading.Volatile.Read(ref saveGeneration))
                     {
                         return;
                     }
@@ -1049,13 +1245,26 @@ public sealed unsafe class HoldingsService
                         var temp = targetPath + ".tmp";
                         File.WriteAllText(temp, JsonSerializer.Serialize(dtos));
                         File.Move(temp, targetPath, overwrite: true);
+                        if (gen == System.Threading.Volatile.Read(ref saveGeneration))
+                        {
+                            nativeCacheDirty = false;
+                        }
                     }
                     catch (Exception ex)
                     {
                         log.Debug(ex, "Failed to save native retainer_cache.json.");
                     }
                 }
-            });
+            }
+
+            if (synchronous)
+            {
+                WriteAction();
+            }
+            else
+            {
+                _ = System.Threading.Tasks.Task.Run(WriteAction);
+            }
         }
         catch (Exception ex)
         {

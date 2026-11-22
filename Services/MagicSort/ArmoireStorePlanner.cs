@@ -18,10 +18,6 @@ public sealed record ArmoirePlanItem(
     uint CabinetId,
     string Name);
 
-/// <summary>
-/// Safely stores eligible "Armoire"-tagged gear from Bags and Armoury Chest into the Inn Armoire
-/// via native Cabinet.StoreCabinetItem with 100%-condition, unmelded, and Server-ACK verification.
-/// </summary>
 public sealed unsafe class ArmoireStorePlanner
 {
     private readonly IDataManager dataManager;
@@ -29,6 +25,7 @@ public sealed unsafe class ArmoireStorePlanner
     private readonly SafeTransactionQueue transactionQueue;
     private readonly InventorySafetyEvaluator safety;
     private readonly Dictionary<uint, uint> cabinetRowByItemId = new();
+    private readonly string armoireStoreConfirmLiteral;
 
     public ArmoireStorePlanner(
         IDataManager dataManager,
@@ -40,6 +37,7 @@ public sealed unsafe class ArmoireStorePlanner
         this.gameGui = gameGui;
         this.transactionQueue = transactionQueue;
         this.safety = safety;
+        armoireStoreConfirmLiteral = NativeUiHelpers.ExtractLongestAddonLiteral(dataManager, 4650);
         LoadCabinetLookup();
     }
 
@@ -60,9 +58,14 @@ public sealed unsafe class ArmoireStorePlanner
             return results;
         }
 
-        var cabinetLoaded = uiState->Cabinet.IsCabinetLoaded();
+        if (!uiState->Cabinet.IsCabinetLoaded())
+        {
+            return results;
+        }
+
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+        var unlockedProfile = safety.BuildUnlockedJobGearProfile();
+        var unsafeDuplicateBaseIds = FindUnsafeCabinetBaseIds(manager, itemSheet, gearsetIds);
         var seenCabinetIds = new HashSet<uint>();
 
         var repairNeeded = 0;
@@ -104,7 +107,7 @@ public sealed unsafe class ArmoireStorePlanner
                     continue;
                 }
 
-                if (cabinetLoaded && uiState->Cabinet.IsItemInCabinet(cabinetId))
+                if (uiState->Cabinet.IsItemInCabinet(cabinetId))
                 {
                     continue;
                 }
@@ -116,8 +119,7 @@ public sealed unsafe class ArmoireStorePlanner
                 }
 
                 var itemRow = row.Value;
-                if (itemRow.Rarity >= 4
-                    || ItemIdentity.IsSoulCrystal(itemRow)
+                if (ItemIdentity.IsSoulCrystal(itemRow)
                     || InventorySafetyEvaluator.IsMateriaExtractable(itemRow, slot))
                 {
                     continue;
@@ -129,8 +131,13 @@ public sealed unsafe class ArmoireStorePlanner
                     continue;
                 }
 
+                if (unsafeDuplicateBaseIds.Contains(baseId))
+                {
+                    continue;
+                }
+
                 if (!string.Equals(
-                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedTop),
+                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile),
                     "Armoire",
                     StringComparison.OrdinalIgnoreCase))
                 {
@@ -196,27 +203,33 @@ public sealed unsafe class ArmoireStorePlanner
 
                     var mgr = InventoryManager.Instance();
                     var uiState = UIState.Instance();
-                    if (mgr == null || uiState == null)
+                    var itemSheet = dataManager.GetExcelSheet<Item>();
+                    if (mgr == null || uiState == null || itemSheet == null || !uiState->Cabinet.IsCabinetLoaded())
                     {
                         return false;
                     }
 
-                    if (uiState->Cabinet.IsCabinetLoaded() && uiState->Cabinet.IsItemInCabinet(captured.CabinetId))
+                    if (uiState->Cabinet.IsItemInCabinet(captured.CabinetId))
                     {
                         dispatched = true;
                         return true;
                     }
 
                     var slot = InventorySafetyEvaluator.GetSlot(mgr, captured.Container, captured.Slot);
-                    var itemRow = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(captured.BaseItemId);
+                    var itemRow = itemSheet.GetRowOrDefault(captured.BaseItemId);
+                    var gearsetIds = safety.BuildGearsetItemIds();
+                    var manualArmoire = HasManualArmoireOverride(captured.BaseItemId);
+                    var slotDyedOrGlamoured = slot != null && (slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0);
                     if (slot == null
                         || itemRow is null
                         || slot->ItemId != captured.RawItemId
                         || slot->Condition < 30000
                         || slot->GetMateriaCount() > 0
                         || slot->Materia[0] != 0
+                        || (!manualArmoire && slotDyedOrGlamoured)
                         || InventorySafetyEvaluator.IsMateriaExtractable(itemRow.Value, slot)
-                        || safety.BuildGearsetItemIds().Contains(captured.BaseItemId))
+                        || gearsetIds.Contains(captured.BaseItemId)
+                        || HasAnyUnsafeCopyOfBaseId(mgr, itemSheet, captured.BaseItemId, gearsetIds))
                     {
                         return false;
                     }
@@ -244,10 +257,12 @@ public sealed unsafe class ArmoireStorePlanner
                         var yesNo = (AddonSelectYesno*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectYesno");
                         if (yesNo != null && yesNo->YesButton != null && yesNo->YesButton->IsEnabled)
                         {
-                            // Require exact normalized item name in prompt (never blind-click Yes on unrelated armoire/dye warnings)
-                            var promptText = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
+                            var promptText = NativeUiHelpers.CollapseWhitespace(NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText));
                             var expectedName = NativeUiHelpers.NormalizeItemLabel(captured.Name);
+                            var matchesLiteral = string.IsNullOrEmpty(armoireStoreConfirmLiteral)
+                                || promptText.Contains(armoireStoreConfirmLiteral, StringComparison.OrdinalIgnoreCase);
                             if (string.IsNullOrEmpty(expectedName)
+                                || !matchesLiteral
                                 || !promptText.Contains(expectedName, StringComparison.OrdinalIgnoreCase))
                             {
                                 if (yesNo->NoButton != null)
@@ -262,9 +277,7 @@ public sealed unsafe class ArmoireStorePlanner
                             var now = DateTime.UtcNow;
                             if (yesReadyUtc == DateTime.MinValue)
                             {
-                                var a = Random.Shared.Next(360, 621);
-                                var b = Random.Shared.Next(360, 621);
-                                yesReadyUtc = now.AddMilliseconds((a + b) / 2);
+                                yesReadyUtc = now.AddMilliseconds(SafeTransactionQueue.SampleDialogConfirmDelayMs());
                                 return false;
                             }
 
@@ -311,6 +324,136 @@ public sealed unsafe class ArmoireStorePlanner
 
         return steps;
     }
+
+    private HashSet<uint> FindUnsafeCabinetBaseIds(
+        InventoryManager* manager,
+        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds)
+    {
+        var unsafeIds = new HashSet<uint>();
+        void Scan(InventoryType containerType)
+        {
+            var c = manager->GetInventoryContainer(containerType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(c))
+            {
+                return;
+            }
+
+            for (var i = 0; i < c->Size; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(c, i);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                {
+                    continue;
+                }
+
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+                if (!cabinetRowByItemId.ContainsKey(baseId))
+                {
+                    continue;
+                }
+
+                var row = itemSheet.GetRowOrDefault(baseId);
+                var manualArmoire = HasManualArmoireOverride(baseId);
+                var dyedOrGlamoured = slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0;
+                if (row is null
+                    || gearsetIds.Contains(baseId)
+                    || slot->GetMateriaCount() > 0
+                    || slot->Materia[0] != 0
+                    || (!manualArmoire && dyedOrGlamoured)
+                    || InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
+                {
+                    unsafeIds.Add(baseId);
+                }
+            }
+        }
+
+        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
+        {
+            Scan(bag);
+        }
+
+        foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
+        {
+            Scan(arm);
+        }
+
+        return unsafeIds;
+    }
+
+    private bool HasAnyUnsafeCopyOfBaseId(
+        InventoryManager* manager,
+        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        uint targetBaseId,
+        HashSet<uint> gearsetIds)
+    {
+        if (gearsetIds.Contains(targetBaseId))
+        {
+            return true;
+        }
+
+        var row = itemSheet.GetRowOrDefault(targetBaseId);
+        if (row is null)
+        {
+            return true;
+        }
+
+        bool Scan(InventoryType containerType)
+        {
+            var c = manager->GetInventoryContainer(containerType);
+            if (!InventorySafetyEvaluator.IsContainerReadable(c))
+            {
+                return false;
+            }
+
+            for (var i = 0; i < c->Size; i++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(c, i);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
+                {
+                    continue;
+                }
+
+                if (ItemIdentity.NormalizeBaseItemId(slot->ItemId) != targetBaseId)
+                {
+                    continue;
+                }
+
+                var manualArmoire = HasManualArmoireOverride(targetBaseId);
+                var dyedOrGlamoured = slot->GlamourId != 0 || slot->GetStain(0) != 0 || slot->GetStain(1) != 0;
+                if (slot->GetMateriaCount() > 0
+                    || slot->Materia[0] != 0
+                    || (!manualArmoire && dyedOrGlamoured)
+                    || InventorySafetyEvaluator.IsMateriaExtractable(row.Value, slot))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
+        {
+            if (Scan(bag))
+            {
+                return true;
+            }
+        }
+
+        foreach (var arm in InventorySafetyEvaluator.ArmouryGearContainers)
+        {
+            if (Scan(arm))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool HasManualArmoireOverride(uint baseItemId)
+        => safety.HasManualRouteOverride(baseItemId, "Armoire");
 
     private void LoadCabinetLookup()
     {

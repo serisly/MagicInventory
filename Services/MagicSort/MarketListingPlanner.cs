@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Dalamud.Memory;
 using Dalamud.Plugin.Services;
@@ -84,7 +84,8 @@ public sealed unsafe class MarketListingPlanner
 
         var candidates = new List<MarketPlanItem>(32);
         var gearsetIds = safety.BuildGearsetItemIds();
-        var unlockedTop = safety.BuildUnlockedJobTopIlvl();
+        var jobProfile = safety.BuildUnlockedJobGearProfile();
+        var cid = InventorySafetyEvaluator.GetCurrentContentId();
 
         foreach (var containerType in containers)
         {
@@ -112,13 +113,12 @@ public sealed unsafe class MarketListingPlanner
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
                 if (itemRow is null
-                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, unlockedTop))
+                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, jobProfile))
                 {
                     continue;
                 }
 
                 var isHq = ItemIdentity.IsHighQuality(slot);
-                // Fail-closed: HQ uses ONLY TargetPriceHq; NQ uses ONLY TargetPriceNq (never cross-list NQ at HQ price!)
                 var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
 
                 var minAllowed = MarketViabilityEvaluator.ComputeVendorBreakevenPrice(itemRow.Value.PriceLow);
@@ -127,8 +127,7 @@ public sealed unsafe class MarketListingPlanner
                     continue;
                 }
 
-                // Per-slot value floor: prevent listing tiny 1x 60g leftovers just because total owned across retainers was large
-                var isManualMarket = configuration.ManualRouteOverrides.TryGetValue(baseId, out var manualSpec)
+                var isManualMarket = configuration.TryGetManualRouteOverride(cid, baseId, out var manualSpec)
                     && string.Equals(manualSpec, "Market", StringComparison.OrdinalIgnoreCase);
                 var slotStackValue = unitPrice * Math.Max(1, (int)slot->Quantity);
                 if (!isManualMarket
@@ -150,7 +149,6 @@ public sealed unsafe class MarketListingPlanner
             }
         }
 
-        // List higher-priority Market items first, then higher total stack value first
         candidates.Sort((a, b) =>
         {
             var prioCmp = safety.GetMarketPriority(b.BaseItemId).CompareTo(safety.GetMarketPriority(a.BaseItemId));
@@ -175,13 +173,15 @@ public sealed unsafe class MarketListingPlanner
     public List<TransactionStep> BuildListingSteps(
         IReadOnlyList<MarketPlanItem> plans,
         Func<IReadOnlyDictionary<uint, MagicSortEntry>> getManifest,
-        bool reviewOnly = false)
+        bool reviewOnly = false,
+        System.Action? onItemListed = null)
     {
         var stepsPerItem = reviewOnly ? 2 : 3;
         var steps = new List<TransactionStep>(plans.Count * stepsPerItem);
         foreach (var plan in plans)
         {
             var captured = plan;
+            var expectedHq = ItemIdentity.IsHighQuality(captured.RawItemId, captured.Flags);
             var preQty = 0;
             var preMarketCount = 0;
             var targetUnitPrice = Math.Clamp((int)captured.UnitPrice, 2, 999_999_999);
@@ -228,8 +228,8 @@ public sealed unsafe class MarketListingPlanner
                     }
 
                     var gearsetIds = safety.BuildGearsetItemIds();
-                    var unlockedTop = safety.BuildUnlockedJobTopIlvl();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", getManifest(), gearsetIds, unlockedTop))
+                    var jobProfile = safety.BuildUnlockedJobGearProfile();
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", getManifest(), gearsetIds, jobProfile))
                     {
                         return false;
                     }
@@ -252,12 +252,15 @@ public sealed unsafe class MarketListingPlanner
                     agent->OpenRetainerSell(captured.Container, (ushort)captured.Slot);
                     return true;
                 },
-                HasServerAck: () => NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"),
+                HasServerAck: () =>
+                {
+                    var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
+                    return sellAddon != null && RetainerSellAddonHelper.MatchesItem(sellAddon, captured.Name, expectedHq);
+                },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSell",
                 SkipOnFailureCount: reviewOnly ? 1 : 2));
 
-            var expectedHq = captured.Flags.HasFlag(InventoryItem.ItemFlags.HighQuality);
             var autoCompareInReview = reviewOnly && configuration.MarketAutoComparePricesInReview;
 
             steps.Add(new TransactionStep(
@@ -271,7 +274,7 @@ public sealed unsafe class MarketListingPlanner
                         return false;
                     }
 
-                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name, expectedHq))
+                    if (!RetainerSellAddonHelper.MatchesItem(sellAddon, captured.Name, expectedHq))
                     {
                         transactionQueue.Cancel("Item mismatch in market listing dialog.", QueueBatchOutcome.AbortedOnError);
                         return false;
@@ -286,13 +289,7 @@ public sealed unsafe class MarketListingPlanner
 
                     if (autoCompareInReview)
                     {
-                        var compareBtn = sellAddon->ComparePrices != null
-                            ? sellAddon->ComparePrices
-                            : sellAddon->AtkUnitBase.GetComponentButtonById(4);
-                        if (compareBtn != null && compareBtn->IsEnabled)
-                        {
-                            NativeUiHelpers.ClickAddonButton((AtkUnitBase*)sellAddon, compareBtn);
-                        }
+                        RetainerSellAddonHelper.TryClickComparePrices(sellAddon);
                     }
 
                     return true;
@@ -300,7 +297,9 @@ public sealed unsafe class MarketListingPlanner
                 HasServerAck: () =>
                 {
                     var sellAddon = (AddonRetainerSell*)NativeUiHelpers.GetReadyAddon(gameGui, "RetainerSell");
-                    return sellAddon != null && DoesAskingPriceMatch(sellAddon->AskingPrice, targetUnitPrice);
+                    return sellAddon != null
+                        && RetainerSellAddonHelper.TryReadAskingPrice(sellAddon, out var livePrice)
+                        && livePrice == targetUnitPrice;
                 },
                 PacingProfile.MarketFormEntry,
                 SecondaryRequiredAddon: "RetainerSellList",
@@ -308,11 +307,10 @@ public sealed unsafe class MarketListingPlanner
 
             if (reviewOnly)
             {
-                // Review mode: stop with RetainerSell open, price prefilled (and Compare Prices triggered if enabled)
-                // so the user inspects live prices and clicks Confirm themselves.
                 continue;
             }
 
+            var listedNotified = false;
             steps.Add(new TransactionStep(
                 $"Confirm {captured.Name} for {captured.UnitPrice:N0}g",
                 "RetainerSell",
@@ -324,13 +322,14 @@ public sealed unsafe class MarketListingPlanner
                         return false;
                     }
 
-                    if (!DoesRetainerSellMatchItem(sellAddon, captured.Name, expectedHq))
+                    if (!RetainerSellAddonHelper.MatchesItem(sellAddon, captured.Name, expectedHq))
                     {
                         transactionQueue.Cancel("Item mismatch in market listing dialog.", QueueBatchOutcome.AbortedOnError);
                         return false;
                     }
 
-                    if (!DoesAskingPriceMatch(sellAddon->AskingPrice, targetUnitPrice))
+                    if (!RetainerSellAddonHelper.TryReadAskingPrice(sellAddon, out var livePrice)
+                        || livePrice != targetUnitPrice)
                     {
                         transactionQueue.Cancel($"Asking price mismatch for {captured.Name} (expected {targetUnitPrice:N0}g).", QueueBatchOutcome.AbortedOnError);
                         return false;
@@ -356,19 +355,24 @@ public sealed unsafe class MarketListingPlanner
 
                     var retainerMgr = RetainerManager.Instance();
                     var activeRetainer = retainerMgr != null && retainerMgr->IsReady ? retainerMgr->GetActiveRetainer() : null;
-                    if (InventorySafetyEvaluator.GetLiveRetainerMarketCount(manager, activeRetainer) > preMarketCount)
+                    var acked = InventorySafetyEvaluator.GetLiveRetainerMarketCount(manager, activeRetainer) > preMarketCount;
+                    if (!acked)
                     {
-                        return true;
+                        var container = manager->GetInventoryContainer(captured.Container);
+                        if (InventorySafetyEvaluator.IsContainerReadable(container))
+                        {
+                            var slot = InventorySafetyEvaluator.GetSlot(container, captured.Slot);
+                            acked = slot != null && (slot->ItemId != captured.RawItemId || slot->Flags != captured.Flags || slot->Quantity < preQty);
+                        }
                     }
 
-                    var container = manager->GetInventoryContainer(captured.Container);
-                    if (!InventorySafetyEvaluator.IsContainerReadable(container))
+                    if (acked && !listedNotified)
                     {
-                        return false;
+                        listedNotified = true;
+                        onItemListed?.Invoke();
                     }
 
-                    var slot = InventorySafetyEvaluator.GetSlot(container, captured.Slot);
-                    return slot != null && (slot->ItemId != captured.RawItemId || slot->Flags != captured.Flags || slot->Quantity < preQty);
+                    return acked;
                 },
                 PacingProfile.MarketListing,
                 SecondaryRequiredAddon: "RetainerSellList"));
@@ -411,72 +415,5 @@ public sealed unsafe class MarketListingPlanner
         return InventorySafetyEvaluator.IsRetainerContainer(container)
             ? IsAnyRetainerInventoryAddonOpen()
             : IsAnyPlayerInventoryAddonOpen();
-    }
-
-    private static bool DoesRetainerSellMatchItem(AddonRetainerSell* sellAddon, string expectedName, bool expectedHq)
-    {
-        if (sellAddon == null || string.IsNullOrWhiteSpace(expectedName))
-        {
-            return false;
-        }
-
-        var nameNode = sellAddon->ItemName != null
-            ? sellAddon->ItemName
-            : sellAddon->AtkUnitBase.GetTextNodeById(7);
-        if (nameNode == null)
-        {
-            return false;
-        }
-
-        var rawDisplayed = NativeUiHelpers.ReadTextNodeValue(nameNode);
-        if (string.IsNullOrWhiteSpace(rawDisplayed))
-        {
-            return false;
-        }
-
-        if (rawDisplayed.Contains('\uE03C') != expectedHq)
-        {
-            return false;
-        }
-
-        var displayed = NativeUiHelpers.NormalizeItemLabel(rawDisplayed);
-        var cleanExpected = NativeUiHelpers.NormalizeItemLabel(expectedName);
-        return string.Equals(displayed, cleanExpected, StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool DoesAskingPriceMatch(AtkComponentNumericInput* input, int expectedPrice)
-    {
-        if (input == null || expectedPrice <= 0)
-        {
-            return false;
-        }
-
-        if (input->AtkTextNode == null)
-        {
-            return false;
-        }
-
-        var raw = NativeUiHelpers.ReadTextNodeValue(input->AtkTextNode);
-        if (string.IsNullOrWhiteSpace(raw))
-        {
-            return false;
-        }
-
-        long parsed = 0;
-        var sawDigit = false;
-        foreach (var ch in raw)
-        {
-            if (ch is >= '0' and <= '9')
-            {
-                sawDigit = true;
-                parsed = parsed * 10 + (ch - '0');
-                if (parsed > 999_999_999L)
-                {
-                    return false;
-                }
-            }
-        }
-
-        return sawDigit && parsed == expectedPrice;
     }
 }

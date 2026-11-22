@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -13,10 +14,6 @@ using MagicInventory.Services.Triage;
 
 namespace MagicInventory.UI;
 
-/// <summary>
-/// On-demand Settings & Item Search window for Magic Inventory.
-/// Hidden by default; opens via /magic, /m, or Dalamud's Plugin Config gear icon.
-/// </summary>
 public sealed class SettingsWindow : Window
 {
     private static readonly (uint RowId, string FallbackName)[] SpecialtyCategoryDefs =
@@ -75,10 +72,14 @@ public sealed class SettingsWindow : Window
     private readonly MaterialTrackerService materialTracker;
     private readonly System.Action? onResetTrackerPosition;
     private readonly (uint RowId, string Name)[] specialtyCategories;
+    private readonly Dictionary<uint, string> uiCategoryNamesById;
 
     private string searchQuery = string.Empty;
     private int selectedFilterIndex;
-    private string lastGameSearchQuery = string.Empty;
+    private string pendingGameSearchQuery = string.Empty;
+    private DateTime lastGameSearchInputUtc = DateTime.MinValue;
+    private string lastExecutedGameSearchQuery = string.Empty;
+    private (uint RowId, string Name)[]? allTaggableItemsIndex;
     private List<uint> cachedGameSearchIds = new();
     private List<MagicSortEntry> cachedGameSearchResults = new();
     private DateTime lastGameSearchClassifiedUtc = DateTime.MinValue;
@@ -90,6 +91,18 @@ public sealed class SettingsWindow : Window
     private ulong lastContentId;
     private int sortColumnIndex;
     private bool sortDescending;
+
+    private List<MagicSortEntry> cachedDisplayRows = new();
+    private string lastRowsQuery = string.Empty;
+    private int lastRowsFilter = -1;
+    private int lastRowsSortCol = -1;
+    private bool lastRowsSortDesc;
+    private int lastRowsEntryCount = -1;
+    private DateTime lastRowsBuiltUtc = DateTime.MinValue;
+
+    private DateTime lastPluginCheckUtc = DateTime.MinValue;
+    private bool cachedHasPennyPincher;
+    private bool cachedHasLifestream;
 
     public SettingsWindow(
         IDalamudPluginInterface pluginInterface,
@@ -113,13 +126,9 @@ public sealed class SettingsWindow : Window
         this.materialTracker = materialTracker;
         this.onResetTrackerPosition = onResetTrackerPosition;
         specialtyCategories = BuildLocalizedSpecialtyCategories(dataManager);
+        uiCategoryNamesById = BuildUiCategoryNameMap(dataManager);
 
-        SizeConstraints = new WindowSizeConstraints
-        {
-            MinimumSize = new Vector2(640, 440),
-            MaximumSize = new Vector2(1400, 960),
-        };
-        Size = new Vector2(780, 540);
+        Size = new Vector2(800, 560);
         SizeCondition = ImGuiCond.FirstUseEver;
     }
 
@@ -137,12 +146,49 @@ public sealed class SettingsWindow : Window
         return list;
     }
 
+    private static Dictionary<uint, string> BuildUiCategoryNameMap(IDataManager dataManager)
+    {
+        var map = new Dictionary<uint, string>(128);
+        var sheet = dataManager.GetExcelSheet<ItemUICategory>();
+        if (sheet == null)
+        {
+            return map;
+        }
+
+        foreach (var row in sheet)
+        {
+            if (row.RowId == 0)
+            {
+                continue;
+            }
+
+            var name = row.Name.ExtractText();
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                map[row.RowId] = name;
+            }
+        }
+
+        return map;
+    }
+
     private void InvalidateLocalCaches()
     {
         lastLocationsMapUtc = DateTime.MinValue;
         lastGameSearchClassifiedUtc = DateTime.MinValue;
         lastUnownedCustomRulesUtc = DateTime.MinValue;
         lastCustomRuleCount = -1;
+        lastRowsBuiltUtc = DateTime.MinValue;
+    }
+
+    public override void PreDraw()
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(640f * scale, 440f * scale),
+            MaximumSize = new Vector2(1450f * scale, 980f * scale),
+        };
     }
 
     public override void Draw()
@@ -154,6 +200,7 @@ public sealed class SettingsWindow : Window
             cachedLocationsMap.Clear();
             cachedGameSearchResults.Clear();
             cachedUnownedCustomRuleEntries.Clear();
+            cachedDisplayRows.Clear();
             InvalidateLocalCaches();
         }
 
@@ -170,19 +217,19 @@ public sealed class SettingsWindow : Window
 
         if (ImGui.BeginTabItem("Items"))
         {
-            DrawItemSearchTab();
+            DrawItemSearchTab(cid);
             ImGui.EndTabItem();
         }
 
         if (ImGui.BeginTabItem("Retainers"))
         {
-            DrawRetainersTab();
+            DrawRetainersTab(cid);
             ImGui.EndTabItem();
         }
 
         if (ImGui.BeginTabItem("Settings"))
         {
-            DrawSettingsTab();
+            DrawSettingsTab(cid);
             ImGui.EndTabItem();
         }
 
@@ -191,15 +238,16 @@ public sealed class SettingsWindow : Window
 
     private void DrawOverviewTab()
     {
+        var scale = ImGuiHelpers.GlobalScale;
         var entries = triageEngine.GetCurrentEntries();
         var world = triageEngine.ActiveWorldName;
         var dc = triageEngine.ActiveDataCenterName;
         var retainers = holdings.GetKnownRetainersForCurrentCharacter();
 
         ImGui.TextUnformatted($"World: {(string.IsNullOrEmpty(world) ? "Not logged in" : $"{world} ({dc})")}");
-        ImGui.SameLine(0, 20f);
+        ImGui.SameLine(0, 20f * scale);
         ImGui.TextColored(ColorMuted, $"Cached prices: {universalis.CachedEntryCount:N0}");
-        ImGui.SameLine(0, 20f);
+        ImGui.SameLine(0, 20f * scale);
         ImGui.TextColored(ColorGold, $"Sell mode: {FormatSellModeName(config.SellMode)}");
 
         if (universalis.LastScanUtc != DateTime.MinValue)
@@ -219,7 +267,7 @@ public sealed class SettingsWindow : Window
             ImGui.BeginDisabled();
         }
 
-        if (ImGui.Button("Refresh Market Prices", new Vector2(185, 30)))
+        if (ImGui.Button("Refresh Market Prices", new Vector2(185f * scale, 30f * scale)))
         {
             triageEngine.TriggerFullScan(forceRefreshPrices: true);
         }
@@ -230,12 +278,12 @@ public sealed class SettingsWindow : Window
             var total = Math.Max(1, universalis.TotalQueuedInScan);
             var done = Math.Clamp(universalis.CompletedInScan, 0, total);
             ImGui.SameLine();
-            ImGui.ProgressBar((float)done / total, new Vector2(220, 26), $"Checking {done}/{total}...");
+            ImGui.ProgressBar((float)done / total, new Vector2(220f * scale, 26f * scale), $"Checking {done}/{total}...");
         }
         else
         {
             ImGui.SameLine();
-            if (ImGui.Button("Rescan Bags", new Vector2(120, 30)))
+            if (ImGui.Button("Rescan Bags", new Vector2(125f * scale, 30f * scale)))
             {
                 triageEngine.Invalidate();
                 magicSort.InvalidateButtonCache();
@@ -286,19 +334,19 @@ public sealed class SettingsWindow : Window
         ImGui.TextUnformatted($"Your Items ({entries.Count})");
         if (ImGui.BeginTable("RouteSummaryTable", 3, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.SizingStretchProp))
         {
-            ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 125f);
-            ImGui.TableSetupColumn("Items", ImGuiTableColumnFlags.WidthFixed, 60f);
+            ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 130f * scale);
+            ImGui.TableSetupColumn("Items", ImGuiTableColumnFlags.WidthFixed, 62f * scale);
             ImGui.TableSetupColumn("What Happens", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableHeadersRow();
 
             DrawSummaryRow("Retainers", counts.GetValueOrDefault("Retainer"), "Stored in your retainers with /m sort");
-            DrawSummaryRow("Market", counts.GetValueOrDefault("Market"), "Listed on the Market Board with /m sell");
+            DrawSummaryRow("Market", counts.GetValueOrDefault("Market"), "Prepped or listed on the Market Board with /m sell");
             DrawSummaryRow("Vendor", counts.GetValueOrDefault("Vendor"), "Sold to any Gil vendor with /m sell");
             DrawSummaryRow("GC Seals", counts.GetValueOrDefault("GrandCompany"), "Turned in for GC Seals with /m sell");
-            DrawSummaryRow("Gold Saucer", counts.GetValueOrDefault("GoldSaucer"), "Duplicate Triple Triad cards to trade for MGP at Gold Saucer");
-            DrawSummaryRow("Extract Materia", counts.GetValueOrDefault("Materia"), "100% Spiritbond gear — extract free materia in Materialize");
-            DrawSummaryRow("Use", counts.GetValueOrDefault("Use"), "Stays in bags — use all at once with Use All");
-            DrawSummaryRow("Armoire", counts.GetValueOrDefault("Armoire"), "Can be stored in your Inn Armoire");
+            DrawSummaryRow("Gold Saucer", counts.GetValueOrDefault("GoldSaucer"), "Owned duplicate Triple Triad cards to trade for MGP");
+            DrawSummaryRow("Extract Materia", counts.GetValueOrDefault("Materia"), "100% Spiritbond gear (extract materia in Materialize)");
+            DrawSummaryRow("Use", counts.GetValueOrDefault("Use"), "Untradable unowned unlockables & MGP cards (never Gear Coffers)");
+            DrawSummaryRow("Armoire", counts.GetValueOrDefault("Armoire"), "Stored in your Inn Armoire");
             DrawSummaryRow("Glamour Dresser", counts.GetValueOrDefault("Glamour"), "Lv. 1 glamour gear for your Inn Glamour Dresser");
             DrawSummaryRow("Keep", counts.GetValueOrDefault("Keep"), "Stays where it is (Bag, Armoury, or Equipped)");
 
@@ -327,8 +375,8 @@ public sealed class SettingsWindow : Window
         ImGui.BulletText("/m sell                 - Sell at a Vendor, Grand Company, or Summoning Bell");
         ImGui.BulletText("/m buy                  - Buy tracked recipe mats at a Market Board");
         ImGui.BulletText("/m track <recipe> [qty] - Track a crafting recipe (e.g. /m track fish soup 5)");
-        ImGui.BulletText("/m use                  - Use unlockables & coffers in your bags");
-        ImGui.BulletText("/m stop                 - Cancel any running sort, sell, buy, or use action");
+        ImGui.BulletText("/m use                  - Use unowned untradable unlockables & MGP cards in your bags");
+        ImGui.BulletText("/m stop                 - Cancel any running sort, sell, buy, use, or Quick Synth action");
         ImGui.BulletText("/m scan                 - Refresh Market Board prices");
         ImGui.BulletText("/m status               - Print current inventory, rule, and tracker counts");
     }
@@ -352,56 +400,22 @@ public sealed class SettingsWindow : Window
         ImGui.TextColored(ColorMuted, desc);
     }
 
-    private void DrawItemSearchTab()
+    private void DrawItemSearchTab(ulong cid)
     {
-        ImGui.SetNextItemWidth(260f);
+        var scale = ImGuiHelpers.GlobalScale;
+        ImGui.SetNextItemWidth(260f * scale);
         ImGui.InputTextWithHint("##ItemSearchInput", "Search item name or ID...", ref searchQuery, 128);
         ImGui.SameLine();
-        ImGui.SetNextItemWidth(170f);
+        ImGui.SetNextItemWidth(175f * scale);
         ImGui.Combo("##ItemFilterCombo", ref selectedFilterIndex, FilterOptions, FilterOptions.Length);
 
         var filter = FilterOptions[selectedFilterIndex];
         var world = triageEngine.ActiveWorldName;
         var retainers = holdings.GetKnownRetainersForCurrentCharacter();
         var entries = triageEngine.GetCurrentEntries();
+        var overrides = config.GetManualRouteOverrides(cid);
+        var priorities = config.GetMarketListingPriorities(cid);
         var q = searchQuery.Trim();
-
-        List<MagicSortEntry> rows;
-        if (filter == "All Game Items")
-        {
-            rows = BuildAllGameItemsResults(searchQuery);
-        }
-        else
-        {
-            rows = new List<MagicSortEntry>(entries.Count);
-            foreach (var entry in entries.Values)
-            {
-                if (!MatchesOwnedFilter(entry, filter))
-                {
-                    continue;
-                }
-
-                if (!MatchesSearchQuery(entry, q))
-                {
-                    continue;
-                }
-
-                rows.Add(entry);
-            }
-
-            if (filter == "Custom Rules")
-            {
-                foreach (var unownedEntry in BuildUnownedCustomRuleEntries(entries))
-                {
-                    if (MatchesSearchQuery(unownedEntry, q))
-                    {
-                        rows.Add(unownedEntry);
-                    }
-                }
-            }
-
-            rows.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
-        }
 
         var nowUtc = DateTime.UtcNow;
         if ((nowUtc - lastLocationsMapUtc).TotalSeconds >= 2.0)
@@ -409,6 +423,26 @@ public sealed class SettingsWindow : Window
             lastLocationsMapUtc = nowUtc;
             cachedLocationsMap = holdings.BuildOwnedLocationsMap();
         }
+
+        var pendingAllItemsDebounceReady = filter == "All Game Items"
+            && (q.Length >= 2 || uint.TryParse(q, out _))
+            && !string.Equals(q, lastExecutedGameSearchQuery, StringComparison.OrdinalIgnoreCase)
+            && (nowUtc - lastGameSearchInputUtc).TotalMilliseconds >= 200.0;
+
+        var needsRowRebuild = lastRowsFilter != selectedFilterIndex
+            || !string.Equals(lastRowsQuery, q, StringComparison.OrdinalIgnoreCase)
+            || lastRowsSortCol != sortColumnIndex
+            || lastRowsSortDesc != sortDescending
+            || lastRowsEntryCount != entries.Count
+            || pendingAllItemsDebounceReady
+            || (nowUtc - lastRowsBuiltUtc).TotalMilliseconds >= 1000.0;
+
+        if (needsRowRebuild)
+        {
+            RebuildDisplayRows(filter, q, world, retainers, entries, overrides, priorities, nowUtc);
+        }
+
+        var rows = cachedDisplayRows;
 
         ImGui.SameLine();
         ImGui.TextColored(ColorMuted, $"{rows.Count} shown");
@@ -432,89 +466,148 @@ public sealed class SettingsWindow : Window
 
         ImGui.TableSetupScrollFreeze(0, 1);
         ImGui.TableSetupColumn("Item", ImGuiTableColumnFlags.WidthStretch | ImGuiTableColumnFlags.DefaultSort, 1.25f, 0);
-        ImGui.TableSetupColumn("Where", ImGuiTableColumnFlags.WidthFixed, 115f, 1);
-        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 105f, 2);
-        ImGui.TableSetupColumn("Market", ImGuiTableColumnFlags.WidthFixed, 100f, 3);
+        ImGui.TableSetupColumn("Where", ImGuiTableColumnFlags.WidthFixed, 118f * scale, 1);
+        ImGui.TableSetupColumn("Destination", ImGuiTableColumnFlags.WidthFixed, 108f * scale, 2);
+        ImGui.TableSetupColumn("Market", ImGuiTableColumnFlags.WidthFixed, 105f * scale, 3);
         ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch, 1.45f, 4);
-        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 130f, 5);
+        ImGui.TableSetupColumn("Rule", ImGuiTableColumnFlags.WidthFixed, 134f * scale, 5);
         ImGui.TableHeadersRow();
 
         var sortSpecs = ImGui.TableGetSortSpecs();
-        if (sortSpecs.SpecsCount > 0)
+        if (sortSpecs.SpecsCount > 0 && sortSpecs.SpecsDirty)
         {
             var spec = sortSpecs.Specs;
             sortColumnIndex = spec.ColumnIndex;
             sortDescending = spec.SortDirection == ImGuiSortDirection.Descending;
-            if (sortSpecs.SpecsDirty)
-            {
-                sortSpecs.SpecsDirty = false;
-            }
+            sortSpecs.SpecsDirty = false;
+            RebuildDisplayRows(filter, q, world, retainers, entries, overrides, priorities, nowUtc);
+            rows = cachedDisplayRows;
         }
 
-        SortItemRows(rows, world, retainers);
-
-        for (var i = 0; i < rows.Count; i++)
+        var clipper = ImGui.ImGuiListClipper();
+        clipper.Begin(rows.Count);
+        while (clipper.Step())
         {
-            var entry = rows[i];
-            ImGui.PushID((int)entry.ItemId);
-            ImGui.TableNextRow();
-
-            ImGui.TableSetColumnIndex(0);
-            ImGui.TextUnformatted(entry.Name);
-            if (materialTracker.IsItemTracked(entry.ItemId))
+            for (var i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
             {
-                ImGui.SameLine(0f, 6f);
-                ImGui.TextColored(RoutePresentation.ColorTracked, "[Tracked]");
-            }
+                var entry = rows[i];
+                ImGui.PushID((int)entry.ItemId);
+                ImGui.TableNextRow();
 
-            ImGui.TableSetColumnIndex(1);
-            var whereText = cachedLocationsMap.GetValueOrDefault(entry.ItemId, "Not owned");
-            ImGui.TextColored(whereText == "Not owned" ? ColorMuted : new Vector4(0.86f, 0.88f, 0.92f, 1f), whereText);
-            if (ImGui.IsItemHovered() && whereText.Length > 14)
-            {
-                ImGui.SetTooltip(whereText);
-            }
-
-            ImGui.TableSetColumnIndex(2);
-            var routeDisplay = RoutePresentation.FormatDestinationLabel(entry);
-            ImGui.TextColored(GetRouteColor(entry.Route), routeDisplay);
-
-            ImGui.TableSetColumnIndex(3);
-            if (!entry.Untradable && !string.IsNullOrEmpty(world) && universalis.TryGetAnyCachedPrice(world, entry.ItemId, out var snap))
-            {
-                if (snap.ListingCount == 0)
+                ImGui.TableSetColumnIndex(0);
+                ImGui.TextUnformatted(entry.Name);
+                if (materialTracker.IsItemTracked(entry.ItemId))
                 {
-                    ImGui.TextColored(ColorGold, "0 listed");
+                    ImGui.SameLine(0f, 6f * scale);
+                    ImGui.TextColored(RoutePresentation.ColorTracked, "[Tracked]");
                 }
-                else
+
+                ImGui.TableSetColumnIndex(1);
+                var whereText = cachedLocationsMap.GetValueOrDefault(entry.ItemId, "Not owned");
+                ImGui.TextColored(whereText == "Not owned" ? ColorMuted : new Vector4(0.86f, 0.88f, 0.92f, 1f), whereText);
+                if (ImGui.IsItemHovered() && whereText.Length > 14)
                 {
-                    var minP = snap.MinPriceNq > 0 ? snap.MinPriceNq : (snap.MinPriceHq > 0 ? snap.MinPriceHq : snap.MinPriceAny);
-                    ImGui.TextUnformatted($"{minP:N0}g | {snap.RegularSaleVelocity:F1}/d");
+                    ImGui.SetTooltip(whereText);
                 }
-            }
-            else if (entry.Untradable)
-            {
-                ImGui.TextColored(ColorMuted, "Untradable");
-            }
-            else if (ImGui.SmallButton("Check"))
-            {
-                universalis.QueueMissing(world, [entry.ItemId], forceRefresh: true);
-            }
 
-            ImGui.TableSetColumnIndex(4);
-            ImGui.TextColored(ColorMuted, entry.Reason);
-            if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(entry.Reason))
-            {
-                ImGui.SetTooltip(entry.Reason);
+                ImGui.TableSetColumnIndex(2);
+                var routeDisplay = RoutePresentation.FormatDestinationLabel(entry);
+                ImGui.TextColored(GetRouteColor(entry.Route), routeDisplay);
+
+                ImGui.TableSetColumnIndex(3);
+                if (!entry.Untradable && !string.IsNullOrEmpty(world) && universalis.TryGetAnyCachedPrice(world, entry.ItemId, out var snap))
+                {
+                    if (snap.ListingCount == 0)
+                    {
+                        ImGui.TextColored(ColorGold, "0 listed");
+                    }
+                    else
+                    {
+                        var minP = snap.MinPriceNq > 0 ? snap.MinPriceNq : (snap.MinPriceHq > 0 ? snap.MinPriceHq : snap.MinPriceAny);
+                        ImGui.TextUnformatted($"{minP:N0}g | {snap.RegularSaleVelocity:F1}/d");
+                    }
+                }
+                else if (entry.Untradable)
+                {
+                    ImGui.TextColored(ColorMuted, "Untradable");
+                }
+                else if (ImGui.SmallButton("Check"))
+                {
+                    universalis.QueueMissing(world, [entry.ItemId], forceRefresh: true);
+                }
+
+                ImGui.TableSetColumnIndex(4);
+                ImGui.TextColored(ColorMuted, entry.Reason);
+                if (ImGui.IsItemHovered() && !string.IsNullOrEmpty(entry.Reason))
+                {
+                    ImGui.SetTooltip(entry.Reason);
+                }
+
+                ImGui.TableSetColumnIndex(5);
+                DrawOverrideCombo(entry.ItemId, retainers, overrides, priorities);
+
+                ImGui.PopID();
             }
-
-            ImGui.TableSetColumnIndex(5);
-            DrawOverrideCombo(entry.ItemId, retainers);
-
-            ImGui.PopID();
         }
 
+        clipper.Destroy();
         ImGui.EndTable();
+    }
+
+    private void RebuildDisplayRows(
+        string filter,
+        string q,
+        string world,
+        IReadOnlyList<KnownRetainerInfo> retainers,
+        IReadOnlyDictionary<uint, MagicSortEntry> entries,
+        Dictionary<uint, string> overrides,
+        Dictionary<uint, int> priorities,
+        DateTime nowUtc)
+    {
+        lastRowsFilter = selectedFilterIndex;
+        lastRowsQuery = q;
+        lastRowsSortCol = sortColumnIndex;
+        lastRowsSortDesc = sortDescending;
+        lastRowsEntryCount = entries.Count;
+        lastRowsBuiltUtc = nowUtc;
+
+        List<MagicSortEntry> rows;
+        if (filter == "All Game Items")
+        {
+            rows = BuildAllGameItemsResults(q, nowUtc);
+        }
+        else
+        {
+            rows = new List<MagicSortEntry>(entries.Count);
+            foreach (var entry in entries.Values)
+            {
+                if (!MatchesOwnedFilter(entry, filter, overrides))
+                {
+                    continue;
+                }
+
+                if (!MatchesSearchQuery(entry, q))
+                {
+                    continue;
+                }
+
+                rows.Add(entry);
+            }
+
+            if (filter == "Custom Rules")
+            {
+                foreach (var unownedEntry in BuildUnownedCustomRuleEntries(entries, overrides))
+                {
+                    if (MatchesSearchQuery(unownedEntry, q))
+                    {
+                        rows.Add(unownedEntry);
+                    }
+                }
+            }
+        }
+
+        SortItemRows(rows, world, retainers, overrides, priorities);
+        cachedDisplayRows = rows;
     }
 
     private static bool MatchesSearchQuery(MagicSortEntry entry, string trimmedQuery)
@@ -528,16 +621,18 @@ public sealed class SettingsWindow : Window
             || entry.ItemId.ToString().Contains(trimmedQuery, StringComparison.OrdinalIgnoreCase);
     }
 
-    private List<MagicSortEntry> BuildUnownedCustomRuleEntries(IReadOnlyDictionary<uint, MagicSortEntry> ownedEntries)
+    private List<MagicSortEntry> BuildUnownedCustomRuleEntries(
+        IReadOnlyDictionary<uint, MagicSortEntry> ownedEntries,
+        Dictionary<uint, string> overrides)
     {
         var now = DateTime.UtcNow;
-        if (config.ManualRouteOverrides.Count != lastCustomRuleCount
+        if (overrides.Count != lastCustomRuleCount
             || (now - lastUnownedCustomRulesUtc).TotalMilliseconds >= 1500.0)
         {
-            lastCustomRuleCount = config.ManualRouteOverrides.Count;
+            lastCustomRuleCount = overrides.Count;
             lastUnownedCustomRulesUtc = now;
             cachedUnownedCustomRuleEntries = new List<MagicSortEntry>();
-            foreach (var itemId in config.ManualRouteOverrides.Keys)
+            foreach (var itemId in overrides.Keys)
             {
                 if (ownedEntries.ContainsKey(itemId))
                 {
@@ -555,7 +650,12 @@ public sealed class SettingsWindow : Window
         return cachedUnownedCustomRuleEntries;
     }
 
-    private void SortItemRows(List<MagicSortEntry> rows, string world, IReadOnlyList<KnownRetainerInfo> retainers)
+    private void SortItemRows(
+        List<MagicSortEntry> rows,
+        string world,
+        IReadOnlyList<KnownRetainerInfo> retainers,
+        Dictionary<uint, string> overrides,
+        Dictionary<uint, int> priorities)
     {
         rows.Sort((a, b) =>
         {
@@ -569,8 +669,8 @@ public sealed class SettingsWindow : Window
                 3 => GetSortableMarketPrice(a, world).CompareTo(GetSortableMarketPrice(b, world)),
                 4 => string.Compare(a.Reason, b.Reason, StringComparison.OrdinalIgnoreCase),
                 5 => string.Compare(
-                    FormatOverrideLabel(a.ItemId, config.ManualRouteOverrides.GetValueOrDefault(a.ItemId, string.Empty), retainers),
-                    FormatOverrideLabel(b.ItemId, config.ManualRouteOverrides.GetValueOrDefault(b.ItemId, string.Empty), retainers),
+                    FormatOverrideLabel(a.ItemId, overrides.GetValueOrDefault(a.ItemId, string.Empty), retainers, priorities),
+                    FormatOverrideLabel(b.ItemId, overrides.GetValueOrDefault(b.ItemId, string.Empty), retainers, priorities),
                     StringComparison.OrdinalIgnoreCase),
                 _ => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase),
             };
@@ -604,54 +704,84 @@ public sealed class SettingsWindow : Window
         return snap.MinPriceNq > 0 ? snap.MinPriceNq : (snap.MinPriceHq > 0 ? snap.MinPriceHq : snap.MinPriceAny);
     }
 
-    private List<MagicSortEntry> BuildAllGameItemsResults(string rawQuery)
+    private void EnsureAllTaggableItemsIndex()
     {
-        var q = rawQuery.Trim();
+        if (allTaggableItemsIndex != null)
+        {
+            return;
+        }
+
+        var sheet = dataManager.GetExcelSheet<Item>();
+        if (sheet == null)
+        {
+            allTaggableItemsIndex = Array.Empty<(uint, string)>();
+            return;
+        }
+
+        var list = new List<(uint, string)>(32_000);
+        foreach (var row in sheet)
+        {
+            if (!ItemIdentity.CanLockOrTagItem(row.RowId, row))
+            {
+                continue;
+            }
+
+            var itemName = row.Name.ExtractText();
+            if (!string.IsNullOrEmpty(itemName))
+            {
+                list.Add((row.RowId, itemName));
+            }
+        }
+
+        allTaggableItemsIndex = list.ToArray();
+    }
+
+    private List<MagicSortEntry> BuildAllGameItemsResults(string q, DateTime now)
+    {
         var results = new List<MagicSortEntry>();
         if (q.Length < 2 && !uint.TryParse(q, out _))
         {
             return results;
         }
 
-        var queryChanged = !string.Equals(q, lastGameSearchQuery, StringComparison.OrdinalIgnoreCase);
-        if (queryChanged)
+        if (!string.Equals(q, pendingGameSearchQuery, StringComparison.OrdinalIgnoreCase))
         {
-            lastGameSearchQuery = q;
+            pendingGameSearchQuery = q;
+            lastGameSearchInputUtc = now;
+        }
+
+        var queryNeedsExecution = !string.Equals(q, lastExecutedGameSearchQuery, StringComparison.OrdinalIgnoreCase);
+        if (queryNeedsExecution && (now - lastGameSearchInputUtc).TotalMilliseconds >= 200.0)
+        {
+            lastExecutedGameSearchQuery = q;
+            EnsureAllTaggableItemsIndex();
             cachedGameSearchIds = new List<uint>(64);
-            var sheet = dataManager.GetExcelSheet<Item>();
-            if (sheet != null)
+            var index = allTaggableItemsIndex!;
+            var parsedId = uint.TryParse(q, out var exactId) ? exactId : 0u;
+
+            for (var i = 0; i < index.Length; i++)
             {
-                var parsedId = uint.TryParse(q, out var exactId) ? exactId : 0u;
-                foreach (var row in sheet)
+                var (rowId, itemName) = index[i];
+                if (parsedId > 0 && rowId == parsedId)
                 {
-                    if (!ItemIdentity.CanLockOrTagItem(row.RowId, row))
-                    {
-                        continue;
-                    }
+                    cachedGameSearchIds.Add(rowId);
+                    break;
+                }
 
-                    if (parsedId > 0 && row.RowId == parsedId)
+                if (itemName.Contains(q, StringComparison.OrdinalIgnoreCase))
+                {
+                    cachedGameSearchIds.Add(rowId);
+                    if (cachedGameSearchIds.Count >= 80)
                     {
-                        cachedGameSearchIds.Add(row.RowId);
                         break;
-                    }
-
-                    var itemName = row.Name.ExtractText();
-                    if (!string.IsNullOrEmpty(itemName)
-                        && itemName.Contains(q, StringComparison.OrdinalIgnoreCase))
-                    {
-                        cachedGameSearchIds.Add(row.RowId);
-                        if (cachedGameSearchIds.Count >= 80)
-                        {
-                            break;
-                        }
                     }
                 }
             }
+
+            lastGameSearchClassifiedUtc = DateTime.MinValue;
         }
 
-        // Cache classified entries for 1.5s instead of running up to 80 full-character scans every frame!
-        var now = DateTime.UtcNow;
-        if (queryChanged || (now - lastGameSearchClassifiedUtc).TotalMilliseconds >= 1500.0)
+        if ((now - lastGameSearchClassifiedUtc).TotalMilliseconds >= 1500.0)
         {
             lastGameSearchClassifiedUtc = now;
             cachedGameSearchResults = new List<MagicSortEntry>(cachedGameSearchIds.Count);
@@ -669,7 +799,7 @@ public sealed class SettingsWindow : Window
         return results;
     }
 
-    private bool MatchesOwnedFilter(MagicSortEntry entry, string filter)
+    private static bool MatchesOwnedFilter(MagicSortEntry entry, string filter, Dictionary<uint, string> overrides)
     {
         return filter switch
         {
@@ -679,16 +809,20 @@ public sealed class SettingsWindow : Window
             "Gold Saucer" => string.Equals(entry.Route, "GoldSaucer", StringComparison.OrdinalIgnoreCase),
             "Extract Materia" => string.Equals(entry.Route, "Materia", StringComparison.OrdinalIgnoreCase),
             "Glamour Dresser" => string.Equals(entry.Route, "Glamour", StringComparison.OrdinalIgnoreCase),
-            "Custom Rules" => config.ManualRouteOverrides.ContainsKey(entry.ItemId),
+            "Custom Rules" => overrides.ContainsKey(entry.ItemId),
             _ => string.Equals(entry.Route, filter, StringComparison.OrdinalIgnoreCase),
         };
     }
 
-    private void DrawOverrideCombo(uint itemId, IReadOnlyList<KnownRetainerInfo> retainers)
+    private void DrawOverrideCombo(
+        uint itemId,
+        IReadOnlyList<KnownRetainerInfo> retainers,
+        Dictionary<uint, string> overrides,
+        Dictionary<uint, int> priorities)
     {
-        var currentVal = config.ManualRouteOverrides.GetValueOrDefault(itemId, string.Empty);
-        var currentPrio = config.MarketListingPriorities.GetValueOrDefault(itemId, 0);
-        var currentLabel = FormatOverrideLabel(itemId, currentVal, retainers);
+        var currentVal = overrides.GetValueOrDefault(itemId, string.Empty);
+        var currentPrio = priorities.GetValueOrDefault(itemId, 0);
+        var currentLabel = FormatOverrideLabel(itemId, currentVal, retainers, priorities);
 
         ImGui.SetNextItemWidth(-1);
         if (!ImGui.BeginCombo("##ov", currentLabel))
@@ -754,27 +888,28 @@ public sealed class SettingsWindow : Window
         if (ImGui.Selectable($"{label}##ov_{optionId}", selected))
         {
             magicSort.SetItemOverride(itemId, value, marketPriority);
-            lastGameSearchClassifiedUtc = DateTime.MinValue;
-            lastUnownedCustomRulesUtc = DateTime.MinValue;
-            lastCustomRuleCount = -1;
+            InvalidateLocalCaches();
         }
     }
 
-    private string FormatOverrideLabel(uint itemId, string value, IReadOnlyList<KnownRetainerInfo> retainers)
+    private static string FormatOverrideLabel(
+        uint itemId,
+        string value,
+        IReadOnlyList<KnownRetainerInfo> retainers,
+        Dictionary<uint, int> priorities)
     {
         return RoutePresentation.FormatOverrideSpec(
             value,
             rid => retainers.FirstOrDefault(r => r.RetainerId == rid)?.Name,
-            config.MarketListingPriorities.GetValueOrDefault(itemId, 0));
+            priorities.GetValueOrDefault(itemId, 0));
     }
 
     private static Vector4 GetRouteColor(string route)
         => RoutePresentation.GetRouteColor(route);
 
-    private void DrawRetainersTab()
+    private void DrawRetainersTab(ulong cid)
     {
         var retainers = holdings.GetKnownRetainersForCurrentCharacter();
-        var cid = InventorySafetyEvaluator.GetCurrentContentId();
         var profile = config.GetOrCreateCharacter(cid);
 
         if (retainers.Count == 0)
@@ -787,13 +922,25 @@ public sealed class SettingsWindow : Window
         ImGui.TextWrapped("Pick which categories each retainer should hold. Anything unchecked follows where you already keep most of that type, and overflows to another retainer with free space when full.");
         ImGui.Spacing();
 
+        var ownerByCatId = new Dictionary<uint, (ulong RetainerId, string Name)>();
+        foreach (var r in retainers)
+        {
+            if (profile.RetainerSpecialtyCategoryIds.TryGetValue(r.RetainerId, out var catIds))
+            {
+                foreach (var catId in catIds)
+                {
+                    ownerByCatId[catId] = (r.RetainerId, r.Name);
+                }
+            }
+        }
+
         foreach (var ret in retainers)
         {
             ImGui.PushID(ret.RetainerId.ToString());
             var status = !ret.IsVisited
                 ? "Not visited yet"
                 : (ret.UsedBagSlots >= HoldingsService.MaxRetainerBagSlots ? $"{ret.UsedBagSlots}/175 slots (FULL)" : $"{ret.UsedBagSlots}/175 slots");
-            var header = $"{ret.Name}  —  {status}  |  Market: {ret.MarketItemCount}/20###ret_{ret.RetainerId}";
+            var header = $"{ret.Name}  ({status})  |  Market: {ret.MarketItemCount}/20###ret_{ret.RetainerId}";
             if (ImGui.CollapsingHeader(header, ImGuiTreeNodeFlags.DefaultOpen))
             {
                 var drewTopLine = false;
@@ -802,12 +949,16 @@ public sealed class SettingsWindow : Window
                     var topCats = ret.CategoryCounts
                         .OrderByDescending(kv => kv.Value)
                         .Take(6)
-                        .Select(kv => $"{kv.Key} ({kv.Value})");
+                        .Select(kv =>
+                        {
+                            var catName = uiCategoryNamesById.GetValueOrDefault(kv.Key, $"Category #{kv.Key}");
+                            return $"{catName} ({kv.Value})";
+                        });
                     ImGui.TextColored(ColorMuted, $"Mostly holds: {string.Join(", ", topCats)}");
                     drewTopLine = true;
                 }
 
-                profile.RetainerSpecialties.TryGetValue(ret.RetainerId, out var assigned);
+                profile.RetainerSpecialtyCategoryIds.TryGetValue(ret.RetainerId, out var assigned);
                 var hasCustom = assigned is { Count: > 0 };
                 if (hasCustom)
                 {
@@ -818,15 +969,17 @@ public sealed class SettingsWindow : Window
 
                     if (ImGui.SmallButton("Reset to Auto"))
                     {
+                        profile.RetainerSpecialtyCategoryIds.Remove(ret.RetainerId);
                         profile.RetainerSpecialties.Remove(ret.RetainerId);
                         config.Save(pluginInterface);
                         triageEngine.Invalidate();
                         magicSort.InvalidateButtonCache();
+                        InvalidateLocalCaches();
                     }
                 }
 
                 ImGui.Spacing();
-                var cols = 4;
+                const int cols = 4;
                 if (ImGui.BeginTable($"SpecTable_{ret.RetainerId}", cols, ImGuiTableFlags.SizingStretchSame))
                 {
                     for (var i = 0; i < specialtyCategories.Length; i++)
@@ -838,32 +991,41 @@ public sealed class SettingsWindow : Window
 
                         ImGui.TableSetColumnIndex(i % cols);
                         var (catId, cat) = specialtyCategories[i];
-                        var isChecked = assigned != null && assigned.Contains(cat, StringComparer.OrdinalIgnoreCase);
-                        if (ImGui.Checkbox($"{cat}##spec_{catId}", ref isChecked))
-                        {
-                            var set = Configuration.GetOrCreateRetainerSpecialtySet(profile, ret.RetainerId);
+                        var isChecked = assigned != null && assigned.Contains(catId);
+                        var ownedByOther = !isChecked
+                            && ownerByCatId.TryGetValue(catId, out var otherOwner)
+                            && otherOwner.RetainerId != ret.RetainerId;
+                        var label = ownedByOther ? $"{cat}*" : cat;
 
+                        if (ImGui.Checkbox($"{label}##spec_{catId}", ref isChecked))
+                        {
+                            var set = Configuration.GetOrCreateRetainerSpecialtyCategoryIds(profile, ret.RetainerId);
                             if (isChecked)
                             {
-                                // Enforce exclusive category ownership across retainers so two retainers never conflict
-                                foreach (var otherRetId in profile.RetainerSpecialties.Keys.ToList())
+                                foreach (var otherRetId in profile.RetainerSpecialtyCategoryIds.Keys.ToList())
                                 {
                                     if (otherRetId != ret.RetainerId)
                                     {
-                                        Configuration.GetOrCreateRetainerSpecialtySet(profile, otherRetId).Remove(cat);
+                                        profile.RetainerSpecialtyCategoryIds[otherRetId].Remove(catId);
                                     }
                                 }
 
-                                set.Add(cat);
+                                set.Add(catId);
                             }
                             else
                             {
-                                set.Remove(cat);
+                                set.Remove(catId);
                             }
 
                             config.Save(pluginInterface);
                             triageEngine.Invalidate();
                             magicSort.InvalidateButtonCache();
+                            InvalidateLocalCaches();
+                        }
+
+                        if (ownedByOther && ImGui.IsItemHovered())
+                        {
+                            ImGui.SetTooltip($"Currently assigned to {ownerByCatId[catId].Name}. Checking this moves {cat} to {ret.Name}.");
                         }
                     }
 
@@ -877,35 +1039,71 @@ public sealed class SettingsWindow : Window
         }
     }
 
-    private void DrawSettingsTab()
+    private void RefreshInstalledPluginsCache()
     {
-        var changed = false;
+        var now = DateTime.UtcNow;
+        if ((now - lastPluginCheckUtc).TotalSeconds < 10.0)
+        {
+            return;
+        }
+
+        lastPluginCheckUtc = now;
+        cachedHasPennyPincher = false;
+        cachedHasLifestream = false;
+        foreach (var p in pluginInterface.InstalledPlugins)
+        {
+            if (!p.IsLoaded)
+            {
+                continue;
+            }
+
+            if (string.Equals(p.InternalName, "PennyPincher", StringComparison.OrdinalIgnoreCase))
+            {
+                cachedHasPennyPincher = true;
+            }
+            else if (string.Equals(p.InternalName, "Lifestream", StringComparison.OrdinalIgnoreCase))
+            {
+                cachedHasLifestream = true;
+            }
+        }
+    }
+
+    private void DrawSettingsTab(ulong cid)
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        var inputWidth = 165f * scale;
+        var indentWidth = 18f * scale;
+        var triageChanged = false;
+        var uiOnlyChanged = false;
+
+        RefreshInstalledPluginsCache();
 
         ImGui.TextUnformatted("Sell Mode");
         ImGui.TextColored(ColorMuted, "Controls how aggressively /m sell tags items for Vendors, Grand Company, and the Market Board.");
+        ImGui.TextColored(ColorMuted, "Note: switching Sell Mode resets the Advanced price thresholds below to that preset.");
         ImGui.Spacing();
 
         var mode = config.SellMode;
-        if (ImGui.RadioButton("Safe  —  Junk & clear Market wins only", mode == SellMode.Safe))
+        if (ImGui.RadioButton("Safe: junk and clear Market wins only", mode == SellMode.Safe))
         {
             config.ApplySellModePresets(SellMode.Safe);
-            changed = true;
+            triageChanged = true;
         }
 
         ImGui.TextColored(ColorMuted, "    Sells Allagan pieces, old white gear, cheap city-vendor clutter, green dungeon gear, and high-value Market items.");
 
-        if (ImGui.RadioButton("Balanced  —  Clear low-value clutter & good Market flips", mode == SellMode.Balanced))
+        if (ImGui.RadioButton("Balanced: clear low-value clutter and good Market flips", mode == SellMode.Balanced))
         {
             config.ApplySellModePresets(SellMode.Balanced);
-            changed = true;
+            triageChanged = true;
         }
 
         ImGui.TextColored(ColorMuted, "    Also turns in outgeared blue gear and sells cheap common drops while keeping crafting mats and rare items.");
 
-        if (ImGui.RadioButton("Clear Space  —  Sell anything cheap you can easily re-buy", mode == SellMode.Purge))
+        if (ImGui.RadioButton("Clear Space: sell cheap items you can easily re-buy", mode == SellMode.Purge))
         {
             config.ApplySellModePresets(SellMode.Purge);
-            changed = true;
+            triageChanged = true;
         }
 
         ImGui.TextColored(ColorMuted, "    Liquidates cheap city-vendor mats and abundant low-price Market items to free bag & retainer slots.");
@@ -917,129 +1115,133 @@ public sealed class SettingsWindow : Window
         ImGui.Spacing();
 
         ImGui.TextUnformatted("Market Board");
-        ImGui.SetNextItemWidth(160f);
+        ImGui.SetNextItemWidth(inputWidth);
         var undercut = config.MarketUndercutGil;
         if (ImGui.InputInt("Undercut by (Gil)", ref undercut, 1, 10))
         {
             config.MarketUndercutGil = Math.Clamp(undercut, 0, 10_000);
-            changed = true;
+            triageChanged = true;
         }
 
-        ImGui.SetNextItemWidth(160f);
+        ImGui.SetNextItemWidth(inputWidth);
         var maxBuy = config.BuyMaxGilPerPurchase;
         if (ImGui.InputInt("Max Gil per Magic Buy purchase", ref maxBuy, 5_000, 25_000))
         {
             config.BuyMaxGilPerPurchase = Math.Clamp(maxBuy, 1_000, 10_000_000);
-            changed = true;
+            uiOnlyChanged = true;
         }
 
-        ImGui.SetNextItemWidth(160f);
+        ImGui.SetNextItemWidth(inputWidth);
         var outlier = config.BuyOutlierMultiplier;
         if (ImGui.InputFloat("Skip listings above (x recent price)", ref outlier, 0.1f, 0.5f, "%.1f"))
         {
             config.BuyOutlierMultiplier = Math.Clamp(outlier, 1.2f, 10f);
-            changed = true;
+            uiOnlyChanged = true;
         }
 
-        var reviewBeforeConfirm = config.MarketReviewBeforeConfirm;
-        if (ImGui.Checkbox("Review price before confirming (Magic Sell prefills price without submitting)", ref reviewBeforeConfirm))
+        ImGui.Spacing();
+        ImGui.TextUnformatted("Market Listing Workflow");
+        var workflowMode = config.MarketReviewBeforeConfirm
+            ? 0
+            : (config.MarketOneListingPerClick ? 1 : 2);
+
+        if (ImGui.RadioButton("Review before confirming (Recommended)", workflowMode == 0))
         {
-            config.MarketReviewBeforeConfirm = reviewBeforeConfirm;
-            changed = true;
+            config.MarketReviewBeforeConfirm = true;
+            uiOnlyChanged = true;
         }
 
-        ImGui.TextColored(ColorMuted, "    Opens Retainer Sell and sets the undercut price so you inspect and click Confirm yourself.");
+        ImGui.TextColored(ColorMuted, "    Prep Sell opens 1 item and fills the undercut price; you inspect and click Confirm yourself.");
 
-        ImGui.BeginDisabled(!config.MarketReviewBeforeConfirm);
-        ImGui.Indent(18f);
-        var autoCompareInReview = config.MarketAutoComparePricesInReview;
-        if (ImGui.Checkbox("Auto-open Compare Prices in Review Mode", ref autoCompareInReview))
+        if (workflowMode == 0)
         {
-            config.MarketAutoComparePricesInReview = autoCompareInReview;
-            changed = true;
+            ImGui.Indent(indentWidth);
+            var autoCompareInReview = config.MarketAutoComparePricesInReview;
+            if (ImGui.Checkbox("Auto-open Compare Prices in Review Mode", ref autoCompareInReview))
+            {
+                config.MarketAutoComparePricesInReview = autoCompareInReview;
+                uiOnlyChanged = true;
+            }
+
+            ImGui.Unindent(indentWidth);
         }
 
-        ImGui.TextColored(ColorMuted, "    Pulls live server prices automatically when Prep Sell opens Retainer Sell, then waits for Confirm.");
-        ImGui.Unindent(18f);
-        ImGui.EndDisabled();
+        if (ImGui.RadioButton("Auto-list 1 item per click", workflowMode == 1))
+        {
+            config.MarketReviewBeforeConfirm = false;
+            config.MarketOneListingPerClick = true;
+            uiOnlyChanged = true;
+        }
 
+        if (ImGui.RadioButton("Auto-list batch (up to 8 per click)", workflowMode == 2))
+        {
+            config.MarketReviewBeforeConfirm = false;
+            config.MarketOneListingPerClick = false;
+            uiOnlyChanged = true;
+        }
+
+        ImGui.Spacing();
         var autoFillSell = config.MarketAutoFillRetainerSell;
-        if (ImGui.Checkbox("Auto-fill undercut price when opening Retainer Sell / Compare Prices", ref autoFillSell))
+        if (ImGui.Checkbox("Auto-fill undercut price when opening Retainer Sell / Compare Prices manually", ref autoFillSell))
         {
             config.MarketAutoFillRetainerSell = autoFillSell;
-            changed = true;
+            uiOnlyChanged = true;
         }
 
         ImGui.TextColored(ColorMuted, "    Sets the asking price from live Compare Prices (excluding your own retainers) or world history.");
 
-        var hasPennyPincher = pluginInterface.InstalledPlugins.Any(p =>
-            string.Equals(p.InternalName, "PennyPincher", StringComparison.OrdinalIgnoreCase) && p.IsLoaded);
-        if (hasPennyPincher && config.MarketAutoFillRetainerSell)
+        if (cachedHasPennyPincher && config.MarketAutoFillRetainerSell)
         {
-            ImGui.TextColored(ColorGold, "    PennyPincher is also loaded — disable auto-fill in one of them to avoid competing price edits.");
+            ImGui.TextColored(ColorGold, "    PennyPincher is also loaded. Turn off auto-fill in one of them so they do not fight over prices.");
         }
 
         var promptStale = config.MarketPromptStaleListings;
         if (ImGui.Checkbox("Prompt to remove or reprice stale / unrealistic active listings", ref promptStale))
         {
             config.MarketPromptStaleListings = promptStale;
-            changed = true;
+            uiOnlyChanged = true;
         }
 
         ImGui.TextColored(ColorMuted, "    Flags dead, below-vendor, or heavily overpriced listings in Retainer Sell List.");
 
-        ImGui.BeginDisabled(config.MarketReviewBeforeConfirm);
-        var onePerClick = config.MarketOneListingPerClick;
-        if (ImGui.Checkbox("Magic Sell lists one item per click (auto-confirm mode)", ref onePerClick))
-        {
-            config.MarketOneListingPerClick = onePerClick;
-            changed = true;
-        }
-
-        ImGui.EndDisabled();
-
-        ImGui.TextColored(ColorMuted, "    Only applies when auto-confirm is enabled. Review mode always prepares one item at a time.");
-
-        ImGui.SetNextItemWidth(160f);
+        ImGui.SetNextItemWidth(inputWidth);
         var dailyLimit = config.MarketDailyActionLimit;
-        if (ImGui.InputInt("Daily Market Board limit (0 = Unlimited)", ref dailyLimit, 5, 10))
+        if (ImGui.InputInt("Daily auto-list / buy limit (0 = Unlimited)", ref dailyLimit, 5, 10))
         {
             config.MarketDailyActionLimit = Math.Clamp(dailyLimit, 0, 200);
-            changed = true;
+            uiOnlyChanged = true;
         }
 
-        var usedToday = config.GetUsedMarketActionsToday();
+        var usedToday = config.GetUsedMarketActionsToday(cid);
         var dailyLimitNote = config.MarketDailyActionLimit <= 0
-            ? $"    Used today: {usedToday} (Unlimited). Review Mode always waits for your manual Confirm."
-            : $"    Used today: {usedToday}/{config.MarketDailyActionLimit}. Anything past the limit is up to you to do manually.";
+            ? $"    Used today (this character): {usedToday} (Unlimited). Review Mode never consumes daily quota."
+            : $"    Used today (this character): {usedToday}/{config.MarketDailyActionLimit}. Review Mode never consumes daily quota.";
         ImGui.TextColored(ColorMuted, dailyLimitNote);
 
-        var hasLifestream = pluginInterface.InstalledPlugins.Any(p =>
-            string.Equals(p.InternalName, "Lifestream", StringComparison.OrdinalIgnoreCase) && p.IsLoaded);
         var lifestreamOptIn = config.EnableLifestreamWorldHopPrompt;
-        if (ImGui.Checkbox("Ask to travel via Lifestream if an item isn't listed on my Home World", ref lifestreamOptIn))
+        if (ImGui.Checkbox("Ask to travel via Lifestream if an item isn't listed on my Current World", ref lifestreamOptIn))
         {
             config.EnableLifestreamWorldHopPrompt = lifestreamOptIn;
-            changed = true;
+            uiOnlyChanged = true;
         }
 
         ImGui.TextColored(
-            hasLifestream ? ColorGood : ColorMuted,
-            hasLifestream
-                ? "    Lifestream installed — only travels after you click Travel."
-                : "    Lifestream not installed — shows the cheapest DC world in chat instead.");
+            cachedHasLifestream ? ColorGood : ColorMuted,
+            cachedHasLifestream
+                ? "    Lifestream installed (only travels after you click Travel)."
+                : "    Lifestream not installed (shows cheapest DC world in chat instead).");
 
         ImGui.BeginDisabled(!config.EnableLifestreamWorldHopPrompt);
-        ImGui.Indent(18f);
-        ImGui.SetNextItemWidth(160f);
+        ImGui.Indent(indentWidth);
+        ImGui.SetNextItemWidth(inputWidth);
         var minWorldHopSavings = config.WorldHopMinSavingsGil;
         if (ImGui.InputInt("Min Gil savings to suggest world travel", ref minWorldHopSavings, 1_000, 5_000))
         {
             config.WorldHopMinSavingsGil = Math.Clamp(minWorldHopSavings, 0, 1_000_000);
-            changed = true;
+            uiOnlyChanged = true;
         }
 
-        ImGui.Unindent(18f);
+        ImGui.Unindent(indentWidth);
         ImGui.EndDisabled();
 
         ImGui.Spacing();
@@ -1051,7 +1253,7 @@ public sealed class SettingsWindow : Window
         if (ImGui.Checkbox("Highlight matching items when hovering buttons or right-click options", ref hoverHighlights))
         {
             config.EnableHoverHighlights = hoverHighlights;
-            changed = true;
+            uiOnlyChanged = true;
         }
 
         if (ImGui.Button("Reset Tracker Position"))
@@ -1059,7 +1261,7 @@ public sealed class SettingsWindow : Window
             config.TrackerX = 24f;
             config.TrackerY = 120f;
             onResetTrackerPosition?.Invoke();
-            changed = true;
+            uiOnlyChanged = true;
         }
 
         ImGui.SameLine();
@@ -1072,68 +1274,82 @@ public sealed class SettingsWindow : Window
                 ColorMuted,
                 "High-value items scale liquidity automatically: 10k-50k stacks allow slower sales (up to 21d); 50k+ allow 0.10/day (up to 30d).");
             ImGui.Spacing();
-            ImGui.SetNextItemWidth(160f);
+
+            ImGui.SetNextItemWidth(inputWidth);
             var minStack = config.MarketMinStackValue;
             if (ImGui.InputInt("Min stack value for Market (Gil)", ref minStack, 100, 500))
             {
                 config.MarketMinStackValue = Math.Clamp(minStack, 100, 1_000_000);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var minUnit = config.MarketMinUnitPrice;
             if (ImGui.InputInt("Min single-item price for Market (Gil)", ref minUnit, 100, 500))
             {
                 config.MarketMinUnitPrice = Math.Clamp(minUnit, 50, 1_000_000);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
+            var floorUnit = config.MarketMinFloorUnitPrice;
+            if (ImGui.InputInt("Min unit floor for small stacks (Gil)", ref floorUnit, 10, 50))
+            {
+                config.MarketMinFloorUnitPrice = Math.Clamp(floorUnit, 1, 10_000);
+                triageChanged = true;
+            }
+
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip("Blocks cheap single items from wasting MB slots. Bulk stacks meeting 'Min stack value for Market' are still allowed.");
+            }
+
+            ImGui.SetNextItemWidth(inputWidth);
             var minVel = config.MarketMinVelocity;
             if (ImGui.InputFloat("Min daily sales for Market", ref minVel, 0.05f, 0.25f, "%.2f"))
             {
                 config.MarketMinVelocity = Math.Clamp(minVel, 0.01f, 50f);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var maxDays = config.MarketMaxDaysSinceLastSale;
             if (ImGui.InputInt("Max days since last sale for Market", ref maxDays, 1, 7))
             {
                 config.MarketMaxDaysSinceLastSale = Math.Clamp(maxDays, 1, 90);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var maxCompDays = config.MarketMaxCompetitionDays;
-            if (ImGui.InputInt("Max seller backlog (days) before oversupplied", ref maxCompDays, 5, 15))
+            if (ImGui.InputInt("Max competitive backlog (days) before oversupplied", ref maxCompDays, 5, 15))
             {
                 config.MarketMaxCompetitionDays = Math.Clamp(maxCompDays, 5, 180);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var stalePct = config.StaleListingUndercutPct;
             if (ImGui.InputInt("Flag active listing if overpriced by (%)", ref stalePct, 5, 10))
             {
                 config.StaleListingUndercutPct = Math.Clamp(stalePct, 5, 200);
-                changed = true;
+                uiOnlyChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var vendorMaxStack = config.VendorMaxStackValue;
             if (ImGui.InputInt("Max stack value to sell to Vendor (Gil)", ref vendorMaxStack, 50, 200))
             {
                 config.VendorMaxStackValue = Math.Clamp(vendorMaxStack, 0, 50_000);
-                changed = true;
+                triageChanged = true;
             }
 
-            ImGui.SetNextItemWidth(160f);
+            ImGui.SetNextItemWidth(inputWidth);
             var vendorMaxVel = config.VendorMaxVelocity;
             if (ImGui.InputFloat("Max daily sales to sell to Vendor", ref vendorMaxVel, 0.05f, 0.25f, "%.2f"))
             {
                 config.VendorMaxVelocity = Math.Clamp(vendorMaxVel, 0f, 10f);
-                changed = true;
+                triageChanged = true;
             }
         }
 
@@ -1142,6 +1358,7 @@ public sealed class SettingsWindow : Window
         {
             config.ApplySellModePresets(SellMode.Safe);
             config.MarketUndercutGil = 1;
+            config.MarketMinFloorUnitPrice = 50;
             config.BuyMaxGilPerPurchase = 50_000;
             config.BuyOutlierMultiplier = 2.5f;
             config.EnableLifestreamWorldHopPrompt = false;
@@ -1154,18 +1371,23 @@ public sealed class SettingsWindow : Window
             config.StaleListingUndercutPct = 25;
             config.MarketOneListingPerClick = true;
             config.MarketDailyActionLimit = 20;
-            changed = true;
+            triageChanged = true;
         }
 
         ImGui.SameLine();
         ImGui.TextColored(ColorMuted, "Custom item overrides are never reset.");
 
-        if (changed)
+        if (triageChanged)
         {
             config.Save(pluginInterface);
             triageEngine.Invalidate();
             magicSort.InvalidateButtonCache();
             InvalidateLocalCaches();
+        }
+        else if (uiOnlyChanged)
+        {
+            config.Save(pluginInterface);
+            magicSort.InvalidateButtonCache();
         }
     }
 }

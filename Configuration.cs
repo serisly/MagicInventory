@@ -27,26 +27,31 @@ public sealed class CharacterProfile
 
     public Dictionary<uint, int> TrackedItems { get; set; } = new();
 
-    public HashSet<uint> LockedItemIds { get; set; } = new();
+    public Dictionary<uint, string> ManualRouteOverrides { get; set; } = new();
 
-    /// <summary>
-    /// Optional per-retainer specialty UI categories (e.g. "Ingredient", "Lumber", "Materia").
-    /// Empty means auto-learned from existing retainer contents + sensible defaults.
-    /// </summary>
+    public Dictionary<uint, int> MarketListingPriorities { get; set; } = new();
+
+    public Dictionary<ulong, HashSet<uint>> RetainerSpecialtyCategoryIds { get; set; } = new();
+
+    public string MarketActionsDay { get; set; } = string.Empty;
+
+    public int MarketActionsToday { get; set; }
+
+    public bool MigratedToV3 { get; set; }
+
+    public HashSet<uint> LockedItemIds { get; set; } = new();
     public Dictionary<ulong, HashSet<string>> RetainerSpecialties { get; set; } = new();
 }
 
 [Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 2;
+    public int Version { get; set; } = 3;
 
-    // UI placement (shared across characters)
     public float TrackerX { get; set; } = 24f;
     public float TrackerY { get; set; } = 120f;
     public bool EnableHoverHighlights { get; set; } = true;
 
-    // Sell rules (account-wide, editable in Settings)
     public SellMode SellMode { get; set; } = SellMode.Safe;
     public int MarketMinStackValue { get; set; } = 2500;
     public int MarketMinUnitPrice { get; set; } = 1000;
@@ -97,13 +102,11 @@ public sealed class Configuration : IPluginConfiguration
         }
     }
 
-    // Magic Buy safety bounds
     public int BuyMaxGilPerPurchase { get; set; } = 50_000;
     public float BuyOutlierMultiplier { get; set; } = 2.5f;
     public bool EnableLifestreamWorldHopPrompt { get; set; } = false;
     public int WorldHopMinSavingsGil { get; set; } = 5_000;
 
-    // Market Board selling workflow & safety limits
     public bool MarketReviewBeforeConfirm { get; set; } = true;
     public bool MarketAutoComparePricesInReview { get; set; } = true;
     public bool MarketAutoFillRetainerSell { get; set; } = true;
@@ -111,83 +114,113 @@ public sealed class Configuration : IPluginConfiguration
     public int StaleListingUndercutPct { get; set; } = 25;
     public bool MarketOneListingPerClick { get; set; } = true;
     public int MarketDailyActionLimit { get; set; } = 20;
+
     public string MarketActionsDay { get; set; } = string.Empty;
     public int MarketActionsToday { get; set; }
 
     [NonSerialized]
     private CharacterProfile? fallbackProfile;
 
-    public int GetUsedMarketActionsToday()
+    public Dictionary<uint, string> GetManualRouteOverrides(ulong contentId)
+        => GetOrCreateCharacter(contentId).ManualRouteOverrides;
+
+    public Dictionary<uint, int> GetMarketListingPriorities(ulong contentId)
+        => GetOrCreateCharacter(contentId).MarketListingPriorities;
+
+    public bool TryGetManualRouteOverride(ulong contentId, uint baseItemId, out string routeSpec)
     {
+        if (baseItemId == 0)
+        {
+            routeSpec = string.Empty;
+            return false;
+        }
+
+        return GetOrCreateCharacter(contentId).ManualRouteOverrides.TryGetValue(baseItemId, out routeSpec!)
+            && !string.IsNullOrWhiteSpace(routeSpec);
+    }
+
+    public int GetMarketListingPriority(ulong contentId, uint baseItemId)
+        => baseItemId == 0 ? 0 : GetOrCreateCharacter(contentId).MarketListingPriorities.GetValueOrDefault(baseItemId, 0);
+
+    public int GetUsedMarketActionsToday(ulong contentId)
+    {
+        var profile = GetOrCreateCharacter(contentId);
         var today = DateTime.Now.ToString("yyyy-MM-dd");
-        return string.Equals(MarketActionsDay, today, StringComparison.Ordinal)
-            ? MarketActionsToday
+        return string.Equals(profile.MarketActionsDay, today, StringComparison.Ordinal)
+            ? profile.MarketActionsToday
             : 0;
     }
 
-    public int GetRemainingMarketActionsToday()
+    public int GetRemainingMarketActionsToday(ulong contentId)
     {
-        // 0 = unlimited
         if (MarketDailyActionLimit <= 0)
         {
             return int.MaxValue;
         }
 
-        return Math.Max(0, MarketDailyActionLimit - GetUsedMarketActionsToday());
+        return Math.Max(0, MarketDailyActionLimit - GetUsedMarketActionsToday(contentId));
     }
 
-    public void RecordMarketAction()
+    public void RecordMarketAction(ulong contentId)
     {
-        RollMarketDayIfNeeded();
-        MarketActionsToday++;
-    }
-
-    private void RollMarketDayIfNeeded()
-    {
+        var profile = GetOrCreateCharacter(contentId);
         var today = DateTime.Now.ToString("yyyy-MM-dd");
-        if (!string.Equals(MarketActionsDay, today, StringComparison.Ordinal))
+        if (!string.Equals(profile.MarketActionsDay, today, StringComparison.Ordinal))
         {
-            MarketActionsDay = today;
-            MarketActionsToday = 0;
+            profile.MarketActionsDay = today;
+            profile.MarketActionsToday = 0;
         }
+
+        profile.MarketActionsToday++;
     }
 
-    public static HashSet<string> GetOrCreateRetainerSpecialtySet(CharacterProfile profile, ulong retainerId)
+    public static HashSet<uint> GetOrCreateRetainerSpecialtyCategoryIds(CharacterProfile profile, ulong retainerId)
     {
-        if (!profile.RetainerSpecialties.TryGetValue(retainerId, out var set) || set == null)
+        if (!profile.RetainerSpecialtyCategoryIds.TryGetValue(retainerId, out var set) || set == null)
         {
-            set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            profile.RetainerSpecialties[retainerId] = set;
-            return set;
-        }
-
-        if (!ReferenceEquals(set.Comparer, StringComparer.OrdinalIgnoreCase))
-        {
-            set = new HashSet<string>(set, StringComparer.OrdinalIgnoreCase);
-            profile.RetainerSpecialties[retainerId] = set;
+            set = new HashSet<uint>();
+            profile.RetainerSpecialtyCategoryIds[retainerId] = set;
         }
 
         return set;
     }
 
-    /// <summary>
-    /// Manual per-item route overrides ("Keep", "Use", "Market", "Vendor", "GrandCompany", or "Retainer:&lt;id&gt;").
-    /// Absence means automatic rules. Never cleared by automatic settings reset.
-    /// </summary>
-    public Dictionary<uint, string> ManualRouteOverrides { get; set; } = new();
+    public static bool MigrateLegacyRetainerSpecialties(
+        CharacterProfile profile,
+        Func<string, uint?> resolveCategoryIdByName)
+    {
+        if (profile.RetainerSpecialties.Count == 0)
+        {
+            return false;
+        }
 
-    /// <summary>
-    /// Optional per-item Market Board listing priority (1 = High, 0 = Normal, -1 = Low).
-    /// High-priority items are listed first when retainer sale slots are limited.
-    /// </summary>
+        foreach (var (retainerId, legacyNames) in profile.RetainerSpecialties)
+        {
+            if (legacyNames == null || legacyNames.Count == 0)
+            {
+                continue;
+            }
+
+            var targetSet = GetOrCreateRetainerSpecialtyCategoryIds(profile, retainerId);
+            foreach (var name in legacyNames)
+            {
+                var catId = resolveCategoryIdByName(name);
+                if (catId.HasValue && catId.Value != 0)
+                {
+                    targetSet.Add(catId.Value);
+                }
+            }
+        }
+
+        profile.RetainerSpecialties.Clear();
+        return true;
+    }
+
+    public Dictionary<uint, string> ManualRouteOverrides { get; set; } = new();
     public Dictionary<uint, int> MarketListingPriorities { get; set; } = new();
 
-    /// <summary>
-    /// Per-character state keyed by PlayerState.ContentId (isolates alts cleanly).
-    /// </summary>
     public Dictionary<ulong, CharacterProfile> Characters { get; set; } = new();
 
-    // Legacy single-character fallback fields (migrated lazily into Characters[contentId])
     public uint TrackedRecipeId { get; set; }
     public string TrackedTitle { get; set; } = string.Empty;
     public int TrackedCraftCount { get; set; } = 1;
@@ -207,7 +240,13 @@ public sealed class Configuration : IPluginConfiguration
                 TrackWithdrawAllStacks = TrackWithdrawAllStacks,
                 TrackedItems = TrackedItems,
                 LockedItemIds = LockedItemIds,
+                ManualRouteOverrides = ManualRouteOverrides,
+                MarketListingPriorities = MarketListingPriorities,
+                MarketActionsDay = MarketActionsDay,
+                MarketActionsToday = MarketActionsToday,
+                MigratedToV3 = true,
             };
+            MigrateProfileLocks(fallbackProfile);
             return fallbackProfile;
         }
 
@@ -215,7 +254,6 @@ public sealed class Configuration : IPluginConfiguration
         {
             profile = new CharacterProfile();
 
-            // Migrate legacy top-level fields once on first character created
             if (Characters.Count == 0 && (TrackedItems.Count > 0 || LockedItemIds.Count > 0))
             {
                 profile.TrackedRecipeId = TrackedRecipeId;
@@ -223,13 +261,23 @@ public sealed class Configuration : IPluginConfiguration
                 profile.TrackedCraftCount = Math.Max(1, TrackedCraftCount);
                 profile.TrackWithdrawAllStacks = TrackWithdrawAllStacks;
                 profile.TrackedItems = new Dictionary<uint, int>(TrackedItems);
-                profile.LockedItemIds = new HashSet<uint>(LockedItemIds);
+                foreach (var id in LockedItemIds)
+                {
+                    if (id != 0)
+                    {
+                        profile.ManualRouteOverrides.TryAdd(id, "Keep");
+                    }
+                }
+
                 TrackedItems.Clear();
                 LockedItemIds.Clear();
             }
 
             Characters[contentId] = profile;
         }
+
+        MigrateProfileLocks(profile);
+        MigrateLegacyV2AccountState(profile);
 
         if (!string.IsNullOrWhiteSpace(name))
         {
@@ -247,6 +295,57 @@ public sealed class Configuration : IPluginConfiguration
         }
 
         return profile;
+    }
+
+    private static void MigrateProfileLocks(CharacterProfile profile)
+    {
+        if (profile.LockedItemIds.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var id in profile.LockedItemIds)
+        {
+            if (id != 0)
+            {
+                profile.ManualRouteOverrides.TryAdd(id, "Keep");
+            }
+        }
+
+        profile.LockedItemIds.Clear();
+    }
+
+    private void MigrateLegacyV2AccountState(CharacterProfile profile)
+    {
+        if (profile.MigratedToV3)
+        {
+            return;
+        }
+
+        foreach (var (itemId, routeSpec) in ManualRouteOverrides)
+        {
+            if (itemId != 0 && !string.IsNullOrWhiteSpace(routeSpec))
+            {
+                profile.ManualRouteOverrides.TryAdd(itemId, routeSpec);
+            }
+        }
+
+        foreach (var (itemId, prio) in MarketListingPriorities)
+        {
+            if (itemId != 0 && prio != 0)
+            {
+                profile.MarketListingPriorities.TryAdd(itemId, prio);
+            }
+        }
+
+        if (string.IsNullOrEmpty(profile.MarketActionsDay) && !string.IsNullOrEmpty(MarketActionsDay))
+        {
+            profile.MarketActionsDay = MarketActionsDay;
+            profile.MarketActionsToday = MarketActionsToday;
+        }
+
+        profile.MigratedToV3 = true;
+        Version = 3;
     }
 
     public void Save(IDalamudPluginInterface pluginInterface)

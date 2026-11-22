@@ -1,8 +1,8 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using MagicInventory.Core;
@@ -11,11 +11,6 @@ using MagicInventory.Services.Triage;
 
 namespace MagicInventory.UI;
 
-/// <summary>
-/// Context-only docked prompt panel beside RetainerSellList when stale, illiquid,
-/// below-vendor, or heavily overpriced active listings are detected.
-/// Completely hidden during normal gameplay and whenever all listings look healthy.
-/// </summary>
 public sealed unsafe class StaleListingsOverlay
 {
     private static readonly Vector4 ColorBad = new(0.96f, 0.44f, 0.44f, 1.0f);
@@ -25,6 +20,7 @@ public sealed unsafe class StaleListingsOverlay
     private readonly IGameGui gameGui;
     private readonly Configuration configuration;
     private readonly ActiveListingAuditor auditor;
+    private readonly List<ActiveListingAuditItem> unsellableBuffer = new(20);
 
     private ulong panelDismissedForRetainerId;
 
@@ -52,6 +48,11 @@ public sealed unsafe class StaleListingsOverlay
             return;
         }
 
+        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell"))
+        {
+            return;
+        }
+
         var findings = auditor.GetCurrentRetainerFindings();
         if (findings.Count == 0)
         {
@@ -64,22 +65,24 @@ public sealed unsafe class StaleListingsOverlay
             return;
         }
 
+        var uiScale = ImGuiHelpers.GlobalScale;
         var vp = ImGui.GetMainViewport();
         var scale = sellListAddon->Scale > 0.01f ? sellListAddon->Scale : 1f;
-        var rootW = sellListAddon->RootNode != null ? sellListAddon->RootNode->Width * scale : 420f;
-        const float panelW = 360f;
+        var rootW = sellListAddon->RootNode != null ? sellListAddon->RootNode->Width * scale : 420f * uiScale;
+        var panelW = 370f * uiScale;
+        var maxPanelH = 440f * uiScale;
 
         var rightX = vp.Pos.X + sellListAddon->X + rootW + 6f;
         var leftX = vp.Pos.X + sellListAddon->X - panelW - 6f;
         var x = (rightX + panelW <= vp.Pos.X + vp.Size.X - 8f)
             ? rightX
             : Math.Max(vp.Pos.X + 8f, leftX);
-        var maxPanelY = Math.Max(vp.Pos.Y + 8f, vp.Pos.Y + vp.Size.Y - 428f);
+        var maxPanelY = Math.Max(vp.Pos.Y + 8f, vp.Pos.Y + vp.Size.Y - maxPanelH - 8f);
         var y = Math.Clamp(vp.Pos.Y + sellListAddon->Y, vp.Pos.Y + 8f, maxPanelY);
 
         ImGui.SetNextWindowPos(new Vector2(x, y), ImGuiCond.Always);
         ImGui.SetNextWindowSize(new Vector2(panelW, 0f), ImGuiCond.Always);
-        ImGui.SetNextWindowSizeConstraints(new Vector2(panelW, 0f), new Vector2(panelW, 420f));
+        ImGui.SetNextWindowSizeConstraints(new Vector2(panelW, 0f), new Vector2(panelW, maxPanelH));
         ImGui.SetNextWindowBgAlpha(0.94f);
 
         const ImGuiWindowFlags flags = ImGuiWindowFlags.NoTitleBar
@@ -96,45 +99,52 @@ public sealed unsafe class StaleListingsOverlay
             return;
         }
 
-        var unsellable = findings.Where(f => f.Severity == StaleListingSeverity.UnrealisticRemove).ToList();
-        var sellModalOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSell");
-        var actionsBlocked = auditor.IsBusy || sellModalOpen;
+        unsellableBuffer.Clear();
+        for (var i = 0; i < findings.Count; i++)
+        {
+            if (findings[i].Severity == StaleListingSeverity.UnrealisticRemove)
+            {
+                unsellableBuffer.Add(findings[i]);
+            }
+        }
 
-        ImGui.TextColored(unsellable.Count > 0 ? ColorBad : ColorWarn, $"Stale / Unrealistic Listings ({findings.Count})");
-        ImGui.SameLine(panelW - 32f);
+        var actionsBlocked = auditor.IsBusy;
+        var closeBtnWidth = ImGui.CalcTextSize("X").X + ImGui.GetStyle().FramePadding.X * 2f;
+
+        ImGui.TextColored(unsellableBuffer.Count > 0 ? ColorBad : ColorWarn, $"Stale / Unrealistic Listings ({findings.Count})");
+        ImGui.SameLine(Math.Max(ImGui.GetCursorPosX() + 4f, ImGui.GetWindowContentRegionMax().X - closeBtnWidth));
         if (ImGui.SmallButton("X##CloseStale"))
         {
             panelDismissedForRetainerId = activeRetainerId;
         }
 
-        if (sellModalOpen)
+        if (unsellableBuffer.Count > 1)
         {
-            ImGui.TextColored(ColorMuted, "Close the active price window to remove or reprice listings.");
-        }
-
-        if (unsellable.Count > 1)
-        {
-            ImGui.BeginDisabled(actionsBlocked);
-            if (ImGui.SmallButton($"Remove All Unsellable ({unsellable.Count})"))
+            var shiftHeld = ImGui.GetIO().KeyShift;
+            ImGui.BeginDisabled(actionsBlocked || !shiftHeld);
+            var btnLabel = shiftHeld
+                ? $"Remove All Unsellable ({unsellableBuffer.Count})"
+                : $"Hold Shift to Remove All ({unsellableBuffer.Count})";
+            if (ImGui.SmallButton(btnLabel))
             {
-                auditor.QueueRemoveListings(unsellable);
+                auditor.QueueRemoveListings(unsellableBuffer.ToArray());
             }
 
             if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
             {
                 ImGui.BeginTooltip();
-                ImGui.TextUnformatted(sellModalOpen
-                    ? "Close RetainerSell before removing listings."
-                    : $"Remove {unsellable.Count} unrealistic listing(s):");
-                foreach (var u in unsellable.Take(12))
+                ImGui.TextUnformatted($"Hold Shift + Click to remove {unsellableBuffer.Count} unrealistic listing(s):");
+                var previewCount = Math.Min(unsellableBuffer.Count, 12);
+                for (var uIdx = 0; uIdx < previewCount; uIdx++)
                 {
+                    var u = unsellableBuffer[uIdx];
                     var uHq = u.IsHq ? " HQ" : string.Empty;
                     ImGui.TextUnformatted($"  - {u.Name}{uHq} ({u.Reason})");
                 }
 
-                if (unsellable.Count > 12)
+                if (unsellableBuffer.Count > previewCount)
                 {
-                    ImGui.TextUnformatted($"  ... and {unsellable.Count - 12} more");
+                    ImGui.TextUnformatted($"  ... and {unsellableBuffer.Count - previewCount} more");
                 }
 
                 ImGui.EndTooltip();
@@ -145,9 +155,12 @@ public sealed unsafe class StaleListingsOverlay
 
         ImGui.Separator();
 
-        var listHeight = Math.Min(310f, Math.Max(74f, findings.Count * 76f));
+        var lineH = ImGui.GetTextLineHeightWithSpacing();
+        var estRowH = lineH * 5.2f + 12f * uiScale;
+        var listHeight = Math.Min(330f * uiScale, Math.Max(estRowH, findings.Count * estRowH));
         if (ImGui.BeginChild("##MagicInventoryStaleList", new Vector2(0f, listHeight), false))
         {
+            ImGui.PushTextWrapPos(0f);
             for (var i = 0; i < findings.Count; i++)
             {
                 var item = findings[i];
@@ -158,14 +171,16 @@ public sealed unsafe class StaleListingsOverlay
                 ImGui.TextUnformatted($"{item.Name}{hqTag}{qtyTag}");
 
                 var sevColor = item.Severity == StaleListingSeverity.UnrealisticRemove ? ColorBad : ColorWarn;
-                ImGui.TextColored(sevColor, $"  {item.Reason}");
+                var ageMins = (int)Math.Round(item.SnapshotAge.TotalMinutes);
+                var snapTag = ageMins < 60 ? $"{ageMins}m" : $"{ageMins / 60}h";
+                ImGui.TextColored(sevColor, $"  {item.Reason} (Universalis {snapTag} ago)");
 
                 var mbStr = item.Viability.ServerCheapest > 0 ? $"{item.Viability.ServerCheapest:N0}g" : "none";
                 var medStr = item.Viability.SoldMedian > 0 ? $"{item.Viability.SoldMedian:N0}g" : "n/a";
                 var lastStr = MarketViabilityEvaluator.FormatAgeShort(item.Viability.DaysSinceLastSale);
                 ImGui.TextColored(
                     ColorMuted,
-                    $"  Listed: {item.ListedUnitPrice:N0}g | MB: {mbStr} | Med: {medStr}");
+                    $"  Listed: {item.ListedUnitPrice:N0}g | Est. MB: {mbStr} | Med: {medStr}");
                 ImGui.TextColored(
                     ColorMuted,
                     $"  Freq: {item.Viability.EffectiveVelocity:0.00}/day | Last sold: {lastStr}");
@@ -188,9 +203,14 @@ public sealed unsafe class StaleListingsOverlay
                 ImGui.EndDisabled();
 
                 ImGui.SameLine();
-                if (ImGui.SmallButton("Keep"))
+                if (ImGui.SmallButton("Dismiss"))
                 {
                     auditor.DismissForSession(item);
+                }
+
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip("Hide this listing for the current session (does not change permanent item rules).");
                 }
 
                 if (i + 1 < findings.Count)
@@ -200,6 +220,8 @@ public sealed unsafe class StaleListingsOverlay
 
                 ImGui.PopID();
             }
+
+            ImGui.PopTextWrapPos();
         }
 
         ImGui.EndChild();

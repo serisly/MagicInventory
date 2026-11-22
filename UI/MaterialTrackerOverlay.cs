@@ -1,7 +1,11 @@
-﻿using System.Numerics;
+using System;
+using System.Numerics;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.Graphics.Kernel;
+using FFXIVClientStructs.FFXIV.Client.System.Input;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using KamiToolKit.Classes;
 using KamiToolKit.Enums;
@@ -41,11 +45,17 @@ public sealed class MaterialTrackerOverlay : IDisposable
     private sealed unsafe class MaterialTrackerNode : OverlayNode
     {
         private const int MaxDisplayedRows = 8;
-        private const float PanelWidth = 284f;
-        private const float DragHandleWidth = PanelWidth - 104f;
+        private const float PanelWidth = 296f;
+        private const float PanelPadX = 8f;
+        private const float PanelPadY = 6f;
+        private const float ContentWidth = PanelWidth - (PanelPadX * 2f);
+        private const float CountButtonWidth = 50f;
+        private const float ClearButtonWidth = 54f;
+        private const float DragHandleWidth = ContentWidth - CountButtonWidth - ClearButtonWidth - 8f;
         private const float HeaderHeight = 24f;
         private const float RowHeight = 20f;
 
+        private static readonly Vector4 BackdropColor = new(0.05f, 0.06f, 0.09f, 0.78f);
         private static readonly Vector4 PendingTextColor = new(0.95f, 0.95f, 0.92f, 1.0f);
         private static readonly Vector4 CompleteTextColor = new(0.62f, 0.89f, 0.62f, 0.92f);
         private static readonly Vector4 RetainerSubtleColor = new(0.86f, 0.79f, 0.56f, 0.95f);
@@ -59,6 +69,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
         private readonly ICondition condition;
         private readonly IChatGui chatGui;
 
+        private readonly ColorImageNode backdropNode;
         private readonly UnderlinedTextNode headerNode;
         private readonly TextNode jobMetaNode;
         private readonly SimpleComponentNode dragHandleNode;
@@ -74,10 +85,14 @@ public sealed class MaterialTrackerOverlay : IDisposable
         private string lastCountMode = string.Empty;
         private string lastCountModeTooltip = string.Empty;
         private string lastJobMeta = string.Empty;
+        private float lastJobMetaY = -1f;
         private string lastActionLabel = string.Empty;
         private string lastActionTooltip = string.Empty;
+        private float lastActionY = -1f;
         private bool actionSwitchesJob;
         private string lastOverflowText = string.Empty;
+        private float lastOverflowY = -1f;
+        private float lastPanelHeight = -1f;
 
         public override OverlayLayer OverlayLayer => OverlayLayer.BehindUserInterface;
         public override bool HideWithNativeUi => true;
@@ -89,6 +104,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
             public string LastRetainer { get; set; } = string.Empty;
             public string LastCount { get; set; } = string.Empty;
             public bool? LastComplete { get; set; }
+            public float LastY { get; set; } = -1f;
+            public float LastRetainerY { get; set; } = -1f;
         }
 
         public MaterialTrackerNode(
@@ -106,20 +123,29 @@ public sealed class MaterialTrackerOverlay : IDisposable
             this.condition = condition;
             this.chatGui = chatGui;
 
-            var vpSize = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
-            var maxStartX = vpSize.X > 400f ? Math.Max(320f, vpSize.X - PanelWidth - 8f) : 3600f;
-            var maxStartY = vpSize.Y > 300f ? Math.Max(200f, vpSize.Y - 60f) : 2000f;
+            var bounds = GetNativeOverlayViewportSize();
+            var maxStartX = Math.Max(4f, bounds.X - PanelWidth - 8f);
+            var maxStartY = Math.Max(4f, bounds.Y - 60f);
             var startX = float.IsFinite(config.TrackerX) ? Math.Clamp(config.TrackerX, 4f, maxStartX) : 24f;
             var startY = float.IsFinite(config.TrackerY) ? Math.Clamp(config.TrackerY, 4f, maxStartY) : 120f;
 
             Position = new Vector2(startX, startY);
-            Size = new Vector2(PanelWidth, HeaderHeight);
+            Size = new Vector2(PanelWidth, HeaderHeight + PanelPadY * 2f);
             IsVisible = false;
+
+            backdropNode = new ColorImageNode
+            {
+                Position = Vector2.Zero,
+                Size = new Vector2(PanelWidth, HeaderHeight + PanelPadY * 2f),
+                Color = BackdropColor,
+                IsVisible = true,
+            };
+            backdropNode.AttachNode(this, NodePosition.AsLastChild);
 
             headerNode = new UnderlinedTextNode
             {
-                Position = new Vector2(0f, 0f),
-                Size = new Vector2(PanelWidth, HeaderHeight),
+                Position = new Vector2(PanelPadX, PanelPadY),
+                Size = new Vector2(ContentWidth, HeaderHeight),
                 String = "Tracked Materials",
                 IsVisible = true,
             };
@@ -130,7 +156,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             dragHandleNode = new SimpleComponentNode
             {
-                Position = new Vector2(0f, 0f),
+                Position = new Vector2(PanelPadX, PanelPadY),
                 Size = new Vector2(DragHandleWidth, HeaderHeight),
                 ShowClickableCursor = true,
                 IsVisible = true,
@@ -140,8 +166,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             countModeButton = new TextButtonNode
             {
-                Position = new Vector2(PanelWidth - 100f, -2f),
-                Size = new Vector2(42f, 20f),
+                Position = new Vector2(PanelWidth - PanelPadX - ClearButtonWidth - 4f - CountButtonWidth, PanelPadY - 2f),
+                Size = new Vector2(CountButtonWidth, 20f),
                 String = "x1",
                 TextTooltip = "Click to cycle craft count (x1 / x5 / x10 / x20 / All).",
                 IsVisible = true,
@@ -151,8 +177,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             clearButton = new TextButtonNode
             {
-                Position = new Vector2(PanelWidth - 54f, -2f),
-                Size = new Vector2(54f, 20f),
+                Position = new Vector2(PanelWidth - PanelPadX - ClearButtonWidth, PanelPadY - 2f),
+                Size = new Vector2(ClearButtonWidth, 20f),
                 String = "Clear",
                 TextTooltip = "Clear tracked item.",
                 IsVisible = true,
@@ -178,8 +204,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             craftActionButton = new TextButtonNode
             {
-                Position = new Vector2(0f, 0f),
-                Size = new Vector2(130f, 22f),
+                Position = new Vector2(PanelPadX, PanelPadY),
+                Size = new Vector2(138f, 22f),
                 String = "Craft",
                 IsVisible = false,
                 OnClick = OnCraftActionClick,
@@ -220,18 +246,20 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
         protected override void OnUpdate()
         {
-            // Release stuck drag if left mouse button was released outside game window (e.g., alt-tab)
-            if (activeDragListener != null
-                && !Dalamud.Bindings.ImGui.ImGui.IsMouseDown(Dalamud.Bindings.ImGui.ImGuiMouseButton.Left))
+            if (activeDragListener != null && !IsLeftMouseButtonHeldNative())
             {
                 StopDragging(savePosition: true);
             }
+
+            var hideForDuty = condition[ConditionFlag.BoundByDuty]
+                && !condition[ConditionFlag.Gathering]
+                && !condition[ConditionFlag.Crafting];
 
             if (!clientState.IsLoggedIn
                 || condition[ConditionFlag.BetweenAreas]
                 || condition[ConditionFlag.BetweenAreas51]
                 || condition[ConditionFlag.OccupiedInCutSceneEvent]
-                || condition[ConditionFlag.BoundByDuty]
+                || hideForDuty
                 || condition[ConditionFlag.InCombat]
                 || !tracker.HasTrackedItems)
             {
@@ -248,12 +276,11 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             SetOverlayVisible(true);
 
-            // Keep tracker clamped inside current display viewport (e.g., after monitor/resolution switch)
-            var liveVp = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
-            if (liveVp.X > 400f && liveVp.Y > 300f)
+            var bounds = GetNativeOverlayViewportSize();
+            if (bounds.X > 400f && bounds.Y > 300f)
             {
-                var clampedX = Math.Clamp(Position.X, 4f, Math.Max(4f, liveVp.X - PanelWidth - 8f));
-                var clampedY = Math.Clamp(Position.Y, 4f, Math.Max(4f, liveVp.Y - 60f));
+                var clampedX = Math.Clamp(Position.X, 4f, Math.Max(4f, bounds.X - PanelWidth - 8f));
+                var clampedY = Math.Clamp(Position.Y, 4f, Math.Max(4f, bounds.Y - 60f));
                 if (MathF.Abs(clampedX - Position.X) > 1f || MathF.Abs(clampedY - Position.Y) > 1f)
                 {
                     Position = new Vector2(clampedX, clampedY);
@@ -284,9 +311,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 countModeButton.TextTooltip = countTip;
             }
 
-            tracker.TickPendingCraft();
-
-            var y = HeaderHeight + 3f;
+            var y = PanelPadY + HeaderHeight + 3f;
 
             if (snapshot.RecipeId > 0 && !string.IsNullOrEmpty(snapshot.RequiredJobAbbr))
             {
@@ -308,13 +333,22 @@ public sealed class MaterialTrackerOverlay : IDisposable
                     metaColor = CompleteTextColor;
                 }
 
-                jobMetaNode.IsVisible = true;
-                jobMetaNode.Position = new Vector2(2f, y);
-                jobMetaNode.Size = new Vector2(PanelWidth - 4f, 16f);
-                jobMetaNode.TextColor = metaColor;
+                if (!jobMetaNode.IsVisible)
+                {
+                    jobMetaNode.IsVisible = true;
+                }
+
+                if (MathF.Abs(lastJobMetaY - y) > 0.5f)
+                {
+                    lastJobMetaY = y;
+                    jobMetaNode.Position = new Vector2(PanelPadX + 2f, y);
+                    jobMetaNode.Size = new Vector2(ContentWidth - 4f, 16f);
+                }
+
                 if (lastJobMeta != metaText)
                 {
                     lastJobMeta = metaText;
+                    jobMetaNode.TextColor = metaColor;
                     jobMetaNode.String = metaText;
                 }
 
@@ -324,6 +358,7 @@ public sealed class MaterialTrackerOverlay : IDisposable
             {
                 jobMetaNode.IsVisible = false;
                 lastJobMeta = string.Empty;
+                lastJobMetaY = -1f;
             }
 
             var visibleCount = Math.Min(MaxDisplayedRows, snapshot.Lines.Count);
@@ -338,6 +373,8 @@ public sealed class MaterialTrackerOverlay : IDisposable
                         widget.NameNode.IsVisible = false;
                         widget.RetainerNode.IsVisible = false;
                         widget.CountNode.IsVisible = false;
+                        widget.LastY = -1f;
+                        widget.LastRetainerY = -1f;
                     }
 
                     continue;
@@ -350,11 +387,14 @@ public sealed class MaterialTrackerOverlay : IDisposable
                     widget.CountNode.IsVisible = true;
                 }
 
-                widget.NameNode.Position = new Vector2(2f, y);
-                widget.NameNode.Size = new Vector2(PanelWidth - 76f, RowHeight);
-
-                widget.CountNode.Position = new Vector2(PanelWidth - 72f, y);
-                widget.CountNode.Size = new Vector2(72f, RowHeight);
+                if (MathF.Abs(widget.LastY - y) > 0.5f)
+                {
+                    widget.LastY = y;
+                    widget.NameNode.Position = new Vector2(PanelPadX + 2f, y);
+                    widget.NameNode.Size = new Vector2(ContentWidth - 76f, RowHeight);
+                    widget.CountNode.Position = new Vector2(PanelWidth - PanelPadX - 72f, y);
+                    widget.CountNode.Size = new Vector2(72f, RowHeight);
+                }
 
                 var displayName = line.Name.Length > 26
                     ? $"{line.Name[..24].TrimEnd()}..."
@@ -384,10 +424,23 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
                 if (!string.IsNullOrEmpty(line.RetainerNote))
                 {
-                    var retText = $"  {line.RetainerNote}";
-                    widget.RetainerNode.IsVisible = true;
-                    widget.RetainerNode.Position = new Vector2(8f, y - 3f);
-                    widget.RetainerNode.Size = new Vector2(PanelWidth - 12f, 16f);
+                    var rawNote = line.RetainerNote.Length > 36
+                        ? $"{line.RetainerNote[..33].TrimEnd()}..."
+                        : line.RetainerNote;
+                    var retText = $"  {rawNote}";
+                    if (!widget.RetainerNode.IsVisible)
+                    {
+                        widget.RetainerNode.IsVisible = true;
+                    }
+
+                    var retY = y - 3f;
+                    if (MathF.Abs(widget.LastRetainerY - retY) > 0.5f)
+                    {
+                        widget.LastRetainerY = retY;
+                        widget.RetainerNode.Position = new Vector2(PanelPadX + 8f, retY);
+                        widget.RetainerNode.Size = new Vector2(ContentWidth - 10f, 16f);
+                    }
+
                     if (widget.LastRetainer != retText)
                     {
                         widget.LastRetainer = retText;
@@ -400,14 +453,24 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 {
                     widget.RetainerNode.IsVisible = false;
                     widget.LastRetainer = string.Empty;
+                    widget.LastRetainerY = -1f;
                 }
             }
 
             if (snapshot.Lines.Count > MaxDisplayedRows)
             {
-                overflowNode.IsVisible = true;
-                overflowNode.Position = new Vector2(0f, y);
-                overflowNode.Size = new Vector2(PanelWidth, 16f);
+                if (!overflowNode.IsVisible)
+                {
+                    overflowNode.IsVisible = true;
+                }
+
+                if (MathF.Abs(lastOverflowY - y) > 0.5f)
+                {
+                    lastOverflowY = y;
+                    overflowNode.Position = new Vector2(PanelPadX, y);
+                    overflowNode.Size = new Vector2(ContentWidth, 16f);
+                }
+
                 var overflowText = $"+{snapshot.Lines.Count - MaxDisplayedRows} more";
                 if (lastOverflowText != overflowText)
                 {
@@ -421,9 +484,9 @@ public sealed class MaterialTrackerOverlay : IDisposable
             {
                 overflowNode.IsVisible = false;
                 lastOverflowText = string.Empty;
+                lastOverflowY = -1f;
             }
 
-            // Bottom action button: Switch Job (if wrong job & gearset exists) or Craft (when ready)
             var showAction = false;
             var actionLabel = string.Empty;
             var actionTip = string.Empty;
@@ -449,8 +512,18 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
             if (showAction)
             {
-                craftActionButton.IsVisible = true;
-                craftActionButton.Position = new Vector2(0f, y + 3f);
+                if (!craftActionButton.IsVisible)
+                {
+                    craftActionButton.IsVisible = true;
+                }
+
+                var actY = y + 3f;
+                if (MathF.Abs(lastActionY - actY) > 0.5f)
+                {
+                    lastActionY = actY;
+                    craftActionButton.Position = new Vector2(PanelPadX, actY);
+                }
+
                 if (lastActionLabel != actionLabel)
                 {
                     lastActionLabel = actionLabel;
@@ -470,9 +543,33 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 craftActionButton.IsVisible = false;
                 lastActionLabel = string.Empty;
                 lastActionTooltip = string.Empty;
+                lastActionY = -1f;
             }
 
-            Size = new Vector2(PanelWidth, y);
+            var totalHeight = y + PanelPadY;
+            if (MathF.Abs(lastPanelHeight - totalHeight) > 0.5f)
+            {
+                lastPanelHeight = totalHeight;
+                Size = new Vector2(PanelWidth, totalHeight);
+                backdropNode.Size = new Vector2(PanelWidth, totalHeight);
+            }
+        }
+
+        private static Vector2 GetNativeOverlayViewportSize()
+        {
+            var dev = Device.Instance();
+            if (dev != null && dev->Width > 320 && dev->Height > 240)
+            {
+                return new Vector2(dev->Width, dev->Height);
+            }
+
+            return new Vector2(1920f, 1080f);
+        }
+
+        private static bool IsLeftMouseButtonHeldNative()
+        {
+            var input = UIInputData.Instance();
+            return input != null && (input->CursorInputs.MouseButtonHeldFlags & MouseButtonFlags.LBUTTON) != 0;
         }
 
         private void OnDragHandleMouseDown(
@@ -514,9 +611,9 @@ public sealed class MaterialTrackerOverlay : IDisposable
                 var delta = currentMouse - lastMousePos;
                 lastMousePos = currentMouse;
 
-                var vpSize = Dalamud.Bindings.ImGui.ImGui.GetMainViewport().Size;
-                var maxX = Math.Max(320f, vpSize.X - PanelWidth - 8f);
-                var maxY = Math.Max(200f, vpSize.Y - 60f);
+                var bounds = GetNativeOverlayViewportSize();
+                var maxX = Math.Max(4f, bounds.X - PanelWidth - 8f);
+                var maxY = Math.Max(4f, bounds.Y - 60f);
                 Position = new Vector2(
                     Math.Clamp(Position.X + delta.X, 4f, maxX),
                     Math.Clamp(Position.Y + delta.Y, 4f, maxY));
@@ -580,10 +677,10 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
         protected override void Dispose(bool isNativeDestructor)
         {
+            StopDragging(savePosition: false);
+
             if (!isNativeDestructor)
             {
-                StopDragging(savePosition: false);
-
                 overflowNode.DetachNode();
                 overflowNode.Dispose();
 
@@ -614,6 +711,9 @@ public sealed class MaterialTrackerOverlay : IDisposable
 
                 headerNode.DetachNode();
                 headerNode.Dispose();
+
+                backdropNode.DetachNode();
+                backdropNode.Dispose();
             }
 
             base.Dispose(isNativeDestructor);
