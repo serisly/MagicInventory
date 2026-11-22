@@ -640,7 +640,7 @@ public sealed unsafe class BellSweepService : IDisposable
             var hasMoreWork = magicSort.HasMoreRetainerSortWork();
             if (hasMoreWork && currentRetainerSortPasses < MaxSortBatchesPerRetainer)
             {
-                if (magicSort.ExecuteRetainerSortFromOrchestrator())
+                if (magicSort.ExecuteAction(StationActionId.RetainerSort, fromOrchestrator: true))
                 {
                     currentRetainerSortPasses++;
                     triggeredBatch = true;
@@ -756,7 +756,7 @@ public sealed unsafe class BellSweepService : IDisposable
             var hasMoreWork = magicSort.HasMoreMarketSellWork();
             if (hasMoreWork && currentMarketSellPasses < MaxMarketBatchesPerRetainer)
             {
-                if (magicSort.ExecuteMarketSortFromOrchestrator())
+                if (magicSort.ExecuteAction(StationActionId.MarketSell, fromOrchestrator: true))
                 {
                     currentMarketSellPasses++;
                     triggeredBatch = true;

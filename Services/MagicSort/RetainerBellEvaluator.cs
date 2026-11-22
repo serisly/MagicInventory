@@ -42,21 +42,27 @@ public sealed unsafe class RetainerBellEvaluator
         this.getMissingTrackedQuantities = getMissingTrackedQuantities;
     }
 
-    public static bool IsWithdrawableRoute(string? route)
+    public static bool IsWithdrawableRoute(ItemRoute? route)
     {
-        if (string.Equals(route, "Armoire", StringComparison.OrdinalIgnoreCase))
+        if (!route.HasValue)
+        {
+            return false;
+        }
+
+        var kind = route.Value.Kind;
+        if (kind == RouteKind.Armoire)
         {
             var uiState = FFXIVClientStructs.FFXIV.Client.Game.UI.UIState.Instance();
             return uiState != null && uiState->Cabinet.IsCabinetLoaded();
         }
 
-        return route is "Market"
-            or "Vendor"
-            or "GrandCompany"
-            or "GoldSaucer"
-            or "Materia"
-            or "Use"
-            or "Glamour";
+        return kind is RouteKind.Market
+            or RouteKind.Vendor
+            or RouteKind.GrandCompany
+            or RouteKind.GoldSaucer
+            or RouteKind.Materia
+            or RouteKind.Use
+            or RouteKind.Glamour;
     }
 
     public Dictionary<ulong, RetainerBellWorkSummary> EvaluateAllRetainers(
@@ -171,7 +177,7 @@ public sealed unsafe class RetainerBellEvaluator
                         continue;
                     }
 
-                    if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                    if (entry.Route.IsKeep)
                     {
                         if (safety.HasExplicitKeepOverride(baseId))
                         {
@@ -239,9 +245,7 @@ public sealed unsafe class RetainerBellEvaluator
                         unlockedProfile,
                         includeBagToArmouryRoute: false,
                         missingTracked: missingTracked);
-                    if (resolved is null
-                        || !string.Equals(resolved.Value.Route, "Retainer", StringComparison.OrdinalIgnoreCase)
-                        || resolved.Value.TargetRetainerId == 0)
+                    if (resolved is null || !resolved.Value.Route.IsSpecificRetainer)
                     {
                         continue;
                     }
@@ -375,9 +379,9 @@ public sealed unsafe class RetainerBellEvaluator
                         unlockedProfile,
                         hasNq: hasNq,
                         hasHq: hasHq);
-                    if (!string.Equals(effectiveRoute, "Retainer", StringComparison.OrdinalIgnoreCase)
-                        || entry.TargetRetainerId == 0
-                        || entry.TargetRetainerId == ret.RetainerId)
+                    if (!effectiveRoute.HasValue
+                        || !effectiveRoute.Value.IsSpecificRetainer
+                        || effectiveRoute.Value.RetainerId == ret.RetainerId)
                     {
                         continue;
                     }

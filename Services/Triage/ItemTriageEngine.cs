@@ -508,19 +508,17 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         if (!ignoreManualOverride
             && profile.ManualRouteOverrides.TryGetValue(baseId, out var overrideSpec)
-            && !string.IsNullOrWhiteSpace(overrideSpec))
+            && ItemRoute.TryParse(overrideSpec, out var overrideRoute))
         {
-            if (overrideSpec.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
-                && ulong.TryParse(overrideSpec["Retainer:".Length..], out var ovRetId))
+            if (overrideRoute.IsSpecificRetainer)
             {
-                var retMatch = retainers.FirstOrDefault(r => r.RetainerId == ovRetId);
+                var retMatch = retainers.FirstOrDefault(r => r.RetainerId == overrideRoute.RetainerId);
                 if (retMatch != null)
                 {
                     return new MagicSortEntry(
                         baseId,
                         name,
-                        "Retainer",
-                        ovRetId,
+                        overrideRoute,
                         retMatch.Name,
                         0,
                         0,
@@ -529,12 +527,11 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         $"Override: {retMatch.Name}");
                 }
             }
-            else
+            else if (!overrideRoute.IsRetainer)
             {
-                var isMarketOverride = string.Equals(overrideSpec, "Market", StringComparison.OrdinalIgnoreCase);
                 long ovTargetNq = 0;
                 long ovTargetHq = 0;
-                if (isMarketOverride && isMarketable)
+                if (overrideRoute.Kind == RouteKind.Market && isMarketable)
                 {
                     if (mkt == null && !string.IsNullOrWhiteSpace(world))
                     {
@@ -551,12 +548,11 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     }
                 }
 
-                var overrideLabel = RoutePresentation.GetDisplayLabel(overrideSpec);
+                var overrideLabel = RoutePresentation.GetDisplayLabel(overrideRoute);
                 return new MagicSortEntry(
                     baseId,
                     name,
-                    overrideSpec,
-                    0,
+                    overrideRoute,
                     string.Empty,
                     ovTargetNq,
                     ovTargetHq,
@@ -578,7 +574,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         if (isEquip && obs.AnyExtractableMateria)
         {
             return new MagicSortEntry(
-                baseId, name, "Materia", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.Materia, string.Empty, 0, 0, priceLow, untradable,
                 "100% Spiritbond (extract materia)");
         }
 
@@ -605,14 +601,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         if (isCabinet && !alreadyInArmoire && !obs.AllGlamoured && !obs.AllMelded)
         {
             return new MagicSortEntry(
-                baseId, name, "Armoire", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.Armoire, string.Empty, 0, 0, priceLow, untradable,
                 "Can be stored in your Inn Armoire");
         }
 
         if (InventorySafetyEvaluator.IsLv1GlamourOrStarterGear(itemRow))
         {
             return new MagicSortEntry(
-                baseId, name, "Glamour", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.Glamour, string.Empty, 0, 0, priceLow, untradable,
                 "Lv. 1 glamour gear (Glamour Dresser)");
         }
 
@@ -658,7 +654,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         var unlockStatus = QueryItemActionUnlockStatus(baseId, itemRow);
         if (IsSafeAutoUseItem(baseId, itemRow, unlockStatus, out var useReason))
         {
-            return new MagicSortEntry(baseId, name, "Use", 0, string.Empty, 0, 0, priceLow, untradable, useReason);
+            return new MagicSortEntry(baseId, name, ItemRoute.Use, string.Empty, 0, 0, priceLow, untradable, useReason);
         }
 
         if (IsUnlockableOrCoffer(itemRow))
@@ -668,7 +664,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 if (unlockStatus == 1)
                 {
                     return new MagicSortEntry(
-                        baseId, name, "GoldSaucer", 0, string.Empty, 0, 0, priceLow, untradable,
+                        baseId, name, ItemRoute.GoldSaucer, string.Empty, 0, 0, priceLow, untradable,
                         "Duplicate card (trade for MGP at Gold Saucer)");
                 }
 
@@ -719,21 +715,21 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             && (itemRow.Rarity != 3 || equipRelevance.IsConfirmedOutgearedByUnlockedJob))
         {
             return new MagicSortEntry(
-                baseId, name, "GrandCompany", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.GrandCompany, string.Empty, 0, 0, priceLow, untradable,
                 $"Outgeared dungeon gear (iLvl {itemRow.LevelItem.RowId})");
         }
 
         if (baseId is >= 5823 and <= 5827 && priceLow > 0)
         {
             return new MagicSortEntry(
-                baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable,
                 $"Allagan piece ({priceLow:N0}g at vendor)");
         }
 
         if (untradable && priceLow > 0 && isEquip && itemRow.Rarity == 1 && !obs.HasHq && itemRow.LevelItem.RowId > 1)
         {
             return new MagicSortEntry(
-                baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable,
+                baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable,
                 $"Old normal gear (iLvl {itemRow.LevelItem.RowId}, {priceLow:N0}g)");
         }
 
@@ -812,8 +808,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 return new MagicSortEntry(
                     baseId,
                     name,
-                    "Market",
-                    0,
+                    ItemRoute.Market,
                     string.Empty,
                     effTargetNq,
                     effTargetHq,
@@ -843,14 +838,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         && nqStackVal < configuration.VendorMaxStackValue)
                     {
                         return new MagicSortEntry(
-                            baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable,
+                            baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable,
                             $"Sold by city vendor ({itemRow.PriceMid:N0}g, easy to re-buy)");
                     }
 
                     if (listingCount >= 5 && nqUnit > 0 && nqUnit <= 200 && nqStackVal < configuration.VendorMaxStackValue)
                     {
                         return new MagicSortEntry(
-                            baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable,
+                            baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable,
                             $"Cheap & abundant on MB (~{nqUnit:N0}g, {listingCount} listed)");
                     }
                 }
@@ -871,7 +866,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                         var reason = isEasyCityShop
                             ? $"City vendor item ({itemRow.PriceMid:N0}g, MB ~{nqUnit:N0}g)"
                             : $"Low MB value (~{nqUnit:N0}g, {nqVel:F1}/day)";
-                        return new MagicSortEntry(baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable, reason);
+                        return new MagicSortEntry(baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable, reason);
                     }
                 }
             }
@@ -919,7 +914,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             if (canVendorTradableGear)
             {
                 return new MagicSortEntry(
-                    baseId, name, "Vendor", 0, string.Empty, 0, 0, priceLow, untradable,
+                    baseId, name, ItemRoute.Vendor, string.Empty, 0, 0, priceLow, untradable,
                     $"Old normal gear (iLvl {itemRow.LevelItem.RowId}, {priceLow:N0}g)");
             }
         }
@@ -937,7 +932,16 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         string reason,
         bool isPendingRefresh = false,
         bool needsRetainerVisit = false)
-        => new(baseId, name, "Keep", 0, string.Empty, 0, 0, priceLow, untradable, reason, isPendingRefresh, needsRetainerVisit);
+        => new(baseId, name, ItemRoute.Keep, string.Empty, 0, 0, priceLow, untradable, reason, isPendingRefresh, needsRetainerVisit);
+
+    private static MagicSortEntry RetainerEntry(
+        uint baseId,
+        string name,
+        KnownRetainerInfo retainer,
+        long priceLow,
+        bool untradable,
+        string reason)
+        => new(baseId, name, ItemRoute.ForRetainer(retainer.RetainerId), retainer.Name, 0, 0, priceLow, untradable, reason);
 
     private MagicSortEntry RouteToBestRetainer(
         uint baseId,
@@ -961,7 +965,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         {
             var only = retainers[0];
             var reason = overrideReasonPrefix ?? $"Stored with {only.Name}";
-            return new MagicSortEntry(baseId, name, "Retainer", only.RetainerId, only.Name, 0, 0, priceLow, untradable, reason);
+            return RetainerEntry(baseId, name, only, priceLow, untradable, reason);
         }
 
         bool HasRoomOrMerge(KnownRetainerInfo ret)
@@ -979,7 +983,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                     && HasRoomOrMerge(ret))
                 {
                     var label = overrideReasonPrefix ?? $"{uiCat} ({ret.Name})";
-                    return new MagicSortEntry(baseId, name, "Retainer", ret.RetainerId, ret.Name, 0, 0, priceLow, untradable, label);
+                    return RetainerEntry(baseId, name, ret, priceLow, untradable, label);
                 }
             }
         }
@@ -1034,14 +1038,14 @@ public sealed unsafe class ItemTriageEngine : IDisposable
                 && (!hasClearMajorityCat || mergeOwner.RetainerId == bestCatOwner!.RetainerId))
             {
                 var reason = overrideReasonPrefix ?? $"Stacks with {mergeOwner.Name}";
-                return new MagicSortEntry(baseId, name, "Retainer", mergeOwner.RetainerId, mergeOwner.Name, 0, 0, priceLow, untradable, reason);
+                return RetainerEntry(baseId, name, mergeOwner, priceLow, untradable, reason);
             }
         }
 
         if (hasClearMajorityCat && bestCatOwner != null)
         {
             var label = overrideReasonPrefix ?? $"{uiCat} ({bestCatOwner.Name})";
-            return new MagicSortEntry(baseId, name, "Retainer", bestCatOwner.RetainerId, bestCatOwner.Name, 0, 0, priceLow, untradable, label);
+            return RetainerEntry(baseId, name, bestCatOwner, priceLow, untradable, label);
         }
 
         KnownRetainerInfo? stackOwner = null;
@@ -1064,7 +1068,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
         if (stackOwner != null)
         {
             var label = overrideReasonPrefix ?? $"Stored with {stackOwner.Name}";
-            return new MagicSortEntry(baseId, name, "Retainer", stackOwner.RetainerId, stackOwner.Name, 0, 0, priceLow, untradable, label);
+            return RetainerEntry(baseId, name, stackOwner, priceLow, untradable, label);
         }
 
         if (hasUnvisitedRetainers)
@@ -1080,7 +1084,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
             && (bestCatOwner.UsedBagSlots < crowdedThreshold || !hasUncrowded))
         {
             var label = overrideReasonPrefix ?? $"{uiCat} ({bestCatOwner.Name})";
-            return new MagicSortEntry(baseId, name, "Retainer", bestCatOwner.RetainerId, bestCatOwner.Name, 0, 0, priceLow, untradable, label);
+            return RetainerEntry(baseId, name, bestCatOwner, priceLow, untradable, label);
         }
 
         var candidates = hasUncrowded
@@ -1093,7 +1097,7 @@ public sealed unsafe class ItemTriageEngine : IDisposable
 
         var chosen = candidates.OrderBy(r => r.UsedBagSlots).First();
         var defaultReason = overrideReasonPrefix ?? $"Stored with {chosen.Name}";
-        return new MagicSortEntry(baseId, name, "Retainer", chosen.RetainerId, chosen.Name, 0, 0, priceLow, untradable, defaultReason);
+        return RetainerEntry(baseId, name, chosen, priceLow, untradable, defaultReason);
     }
 
     private static long QueryItemActionUnlockStatus(uint baseId, Item itemRow)

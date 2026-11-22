@@ -3,6 +3,7 @@ using System.Numerics;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using MagicInventory.Core;
 using MagicInventory.Services;
+using MagicInventory.Services.MagicSort;
 
 namespace MagicInventory.UI;
 
@@ -29,8 +30,8 @@ public sealed unsafe class RetainerController : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Magic Sort",
-                magicSort.GetRetainerSortButtonState,
-                magicSort.ExecuteRetainerSort,
+                () => magicSort.GetButtonState(StationActionId.RetainerSort),
+                () => magicSort.ExecuteAction(StationActionId.RetainerSort),
                 static addon => addon->RootNode,
                 ResolveButtonPlacement,
                 hovered => routeOverlay.SetHoveredRetainerSortAddon(addonName, hovered)));

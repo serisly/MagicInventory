@@ -178,7 +178,7 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         }
 
         var items = new List<IMenuItem>();
-        var routeFilters = new List<string?>();
+        var routeFilters = new List<RouteFilter?>();
         var isManual = magicSort.IsItemOverwritten(baseItemId);
 
         var currentEntry = triageEngine.ClassifySingleItemOnDemand(baseItemId, queuePriceIfMissing: false);
@@ -186,22 +186,22 @@ public sealed unsafe class ItemContextMenuController : IDisposable
             ? triageEngine.ClassifySingleItemOnDemand(baseItemId, queuePriceIfMissing: false, ignoreManualOverride: true)
             : currentEntry;
 
-        var currentRoute = currentEntry?.Route ?? "Keep";
-        var autoLabel = RoutePresentation.FormatAutoPredictedLabel(autoEntry, out var autoRouteFilter);
+        var currentRoute = currentEntry?.Route ?? ItemRoute.Keep;
+        var autoLabel = RoutePresentation.FormatAutoPredictedLabel(autoEntry, out var autoRoute);
         if (openedFromRetainer && materialTracker.IsItemTracked(baseItemId)
             && materialTracker.GetMissingTrackedForRetainerWithdraw().GetValueOrDefault(baseItemId) > 0)
         {
             autoLabel = "Withdraw (Tracked)";
-            autoRouteFilter = "Tracked";
+            autoRoute = ItemRoute.Tracked;
         }
-        else if (openedFromRetainer && string.Equals(autoRouteFilter, "Keep", StringComparison.OrdinalIgnoreCase))
+        else if (openedFromRetainer && autoRoute.IsKeep)
         {
             var activeRetId = HoldingsService.GetActiveRetainerId();
             var activeRetName = HoldingsService.GetActiveRetainerName();
             if (activeRetId != 0 && !string.IsNullOrWhiteSpace(activeRetName))
             {
                 autoLabel = activeRetName;
-                autoRouteFilter = $"Retainer:{activeRetId}";
+                autoRoute = ItemRoute.ForRetainer(activeRetId);
             }
         }
 
@@ -210,53 +210,49 @@ public sealed unsafe class ItemContextMenuController : IDisposable
             Name = isManual ? $"Auto ({autoLabel})" : $"• Auto ({autoLabel})",
             OnClicked = _ =>
             {
-                magicSort.SetItemOverride(baseItemId, string.Empty);
+                magicSort.SetItemOverride(baseItemId, null);
                 chatGui.Print($"Set {itemName} -> Auto ({autoLabel}).");
             },
         });
-        routeFilters.Add(autoRouteFilter);
+        routeFilters.Add(RouteFilter.Exact(autoRoute));
 
-        var isKeepActive = isManual && string.Equals(currentRoute, "Keep", StringComparison.OrdinalIgnoreCase);
+        var isKeepActive = isManual && currentRoute.IsKeep;
         items.Add(new MenuItem
         {
             Name = isKeepActive ? "• Keep" : "Keep",
-            OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Keep", null, "Keep"),
+            OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Keep, null, "Keep"),
         });
-        routeFilters.Add("Keep");
+        routeFilters.Add(RouteFilter.Exact(ItemRoute.Keep));
 
         var eligibility = ItemRouteEligibility.Compute(itemRow, triageEngine.IsCabinetItem(baseItemId));
 
         if (eligibility.CanUse)
         {
-            var isUseActive = isManual && string.Equals(currentRoute, "Use", StringComparison.OrdinalIgnoreCase);
+            var isUseActive = isManual && currentRoute.Kind == RouteKind.Use;
             items.Add(new MenuItem
             {
                 Name = isUseActive ? "• Use" : "Use",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Use", null, "Use"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Use, null, "Use"),
             });
-            routeFilters.Add("Use");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Use));
         }
 
         var retainers = holdings.GetKnownRetainersForCurrentCharacter();
         if (retainers.Count > 0)
         {
-            var isStoreActive = isManual && string.Equals(currentRoute, "Retainer", StringComparison.OrdinalIgnoreCase);
+            var isStoreActive = isManual && currentRoute.IsRetainer;
             items.Add(new MenuItem
             {
                 Name = isStoreActive ? "• Store" : "Store",
                 IsSubmenu = true,
-                OnClicked = subArgs => OpenStoreSubmenu(subArgs, baseItemId, itemName, isManual, currentEntry?.TargetRetainerId ?? 0UL),
+                OnClicked = subArgs => OpenStoreSubmenu(subArgs, baseItemId, itemName, isManual, currentRoute.RetainerId),
             });
-            routeFilters.Add("Retainer");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.AnyRetainer));
         }
 
         if (eligibility.CanSellAny)
         {
-            var isSellActive = isManual
-                && (string.Equals(currentRoute, "Market", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(currentRoute, "Vendor", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(currentRoute, "GrandCompany", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(currentRoute, "GoldSaucer", StringComparison.OrdinalIgnoreCase));
+            var isSellActive = isManual && currentRoute.IsSell;
             items.Add(new MenuItem
             {
                 Name = isSellActive ? "• Sell" : "Sell",
@@ -269,29 +265,29 @@ public sealed unsafe class ItemContextMenuController : IDisposable
                     currentRoute,
                     eligibility),
             });
-            routeFilters.Add("Sell");
+            routeFilters.Add(RouteFilter.AnySell);
         }
 
         if (eligibility.CanGlamour)
         {
-            var isGlamActive = isManual && string.Equals(currentRoute, "Glamour", StringComparison.OrdinalIgnoreCase);
+            var isGlamActive = isManual && currentRoute.Kind == RouteKind.Glamour;
             items.Add(new MenuItem
             {
                 Name = isGlamActive ? "• Glamour Dresser" : "Glamour Dresser",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Glamour", null, "Glamour Dresser"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Glamour, null, "Glamour Dresser"),
             });
-            routeFilters.Add("Glamour");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Glamour));
         }
 
         if (eligibility.CanArmoire)
         {
-            var isArmoireActive = isManual && string.Equals(currentRoute, "Armoire", StringComparison.OrdinalIgnoreCase);
+            var isArmoireActive = isManual && currentRoute.Kind == RouteKind.Armoire;
             items.Add(new MenuItem
             {
                 Name = isArmoireActive ? "• Armoire" : "Armoire",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Armoire", null, "Armoire"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Armoire, null, "Armoire"),
             });
-            routeFilters.Add("Armoire");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Armoire));
         }
 
         items.Add(new MenuItem
@@ -309,19 +305,20 @@ public sealed unsafe class ItemContextMenuController : IDisposable
     private void OpenStoreSubmenu(IMenuItemClickedArgs clickedArgs, uint baseItemId, string itemName, bool isManual, ulong currentRetainerId)
     {
         var items = new List<IMenuItem>();
-        var routeFilters = new List<string?>();
+        var routeFilters = new List<RouteFilter?>();
 
         foreach (var ret in holdings.GetKnownRetainersForCurrentCharacter())
         {
             var retId = ret.RetainerId;
             var retName = ret.Name;
+            var retRoute = ItemRoute.ForRetainer(retId);
             var isActive = isManual && currentRetainerId == retId;
             items.Add(new MenuItem
             {
                 Name = isActive ? $"• {retName}" : retName,
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, $"Retainer:{retId}", null, retName),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, retRoute, null, retName),
             });
-            routeFilters.Add($"Retainer:{retId}");
+            routeFilters.Add(RouteFilter.Exact(retRoute));
         }
 
         routeOverlay.SetActiveContextSubmenuRoutes("Store", routeFilters);
@@ -333,70 +330,70 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         uint baseItemId,
         string itemName,
         bool isManual,
-        string currentRoute,
+        ItemRoute currentRoute,
         ItemRouteEligibility eligibility)
     {
         var items = new List<IMenuItem>();
-        var routeFilters = new List<string?>();
+        var routeFilters = new List<RouteFilter?>();
 
         if (eligibility.CanMarket)
         {
-            var isMarket = isManual && string.Equals(currentRoute, "Market", StringComparison.OrdinalIgnoreCase);
+            var isMarket = isManual && currentRoute.Kind == RouteKind.Market;
             var prio = safety.GetMarketPriority(baseItemId);
 
             items.Add(new MenuItem
             {
                 Name = isMarket && prio > 0 ? "• Market (High Priority)" : "Market (High Priority)",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 1, "Market (High Priority)"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Market, 1, "Market (High Priority)"),
             });
-            routeFilters.Add("Market");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Market));
 
             items.Add(new MenuItem
             {
                 Name = isMarket && prio == 0 ? "• Market" : "Market",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", 0, "Market"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Market, 0, "Market"),
             });
-            routeFilters.Add("Market");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Market));
 
             items.Add(new MenuItem
             {
                 Name = isMarket && prio < 0 ? "• Market (Low Priority)" : "Market (Low Priority)",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Market", -1, "Market (Low Priority)"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Market, -1, "Market (Low Priority)"),
             });
-            routeFilters.Add("Market");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Market));
         }
 
         if (eligibility.CanVendor)
         {
-            var isVendor = isManual && string.Equals(currentRoute, "Vendor", StringComparison.OrdinalIgnoreCase);
+            var isVendor = isManual && currentRoute.Kind == RouteKind.Vendor;
             items.Add(new MenuItem
             {
                 Name = isVendor ? "• Vendor" : "Vendor",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "Vendor", null, "Vendor"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.Vendor, null, "Vendor"),
             });
-            routeFilters.Add("Vendor");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.Vendor));
         }
 
         if (eligibility.CanGrandCompany)
         {
-            var isGc = isManual && string.Equals(currentRoute, "GrandCompany", StringComparison.OrdinalIgnoreCase);
+            var isGc = isManual && currentRoute.Kind == RouteKind.GrandCompany;
             items.Add(new MenuItem
             {
                 Name = isGc ? "• GC Seals" : "GC Seals",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GrandCompany", null, "GC Seals"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.GrandCompany, null, "GC Seals"),
             });
-            routeFilters.Add("GrandCompany");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.GrandCompany));
         }
 
         if (eligibility.CanGoldSaucer)
         {
-            var isGs = isManual && string.Equals(currentRoute, "GoldSaucer", StringComparison.OrdinalIgnoreCase);
+            var isGs = isManual && currentRoute.Kind == RouteKind.GoldSaucer;
             items.Add(new MenuItem
             {
                 Name = isGs ? "• Gold Saucer" : "Gold Saucer",
-                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, "GoldSaucer", null, "Gold Saucer"),
+                OnClicked = _ => ApplyContextOverride(baseItemId, itemName, ItemRoute.GoldSaucer, null, "Gold Saucer"),
             });
-            routeFilters.Add("GoldSaucer");
+            routeFilters.Add(RouteFilter.Exact(ItemRoute.GoldSaucer));
         }
 
         routeOverlay.SetActiveContextSubmenuRoutes("Sell", routeFilters);
@@ -498,7 +495,7 @@ public sealed unsafe class ItemContextMenuController : IDisposable
             });
         }
 
-        routeOverlay.SetActiveContextSubmenuRoutes(submenuTitle, Array.Empty<string?>());
+        routeOverlay.SetActiveContextSubmenuRoutes(submenuTitle, Array.Empty<RouteFilter?>());
         clickedArgs.OpenSubmenu(submenuTitle, items);
     }
 
@@ -511,9 +508,9 @@ public sealed unsafe class ItemContextMenuController : IDisposable
         }
     }
 
-    private void ApplyContextOverride(uint baseItemId, string itemName, string routeSpec, int? marketPriority, string displayLabel)
+    private void ApplyContextOverride(uint baseItemId, string itemName, ItemRoute route, int? marketPriority, string displayLabel)
     {
-        magicSort.SetItemOverride(baseItemId, routeSpec, marketPriority);
+        magicSort.SetItemOverride(baseItemId, route, marketPriority);
         chatGui.Print($"Set {itemName} -> {displayLabel}.");
     }
 

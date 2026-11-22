@@ -9,8 +9,7 @@ namespace MagicInventory.Services
     public sealed record MagicSortEntry(
         uint ItemId,
         string Name,
-        string Route,
-        ulong TargetRetainerId,
+        ItemRoute Route,
         string TargetRetainerName,
         long TargetPriceNq,
         long TargetPriceHq,
@@ -18,7 +17,10 @@ namespace MagicInventory.Services
         bool Untradable,
         string Reason,
         bool IsPendingRefresh = false,
-        bool NeedsRetainerVisit = false);
+        bool NeedsRetainerVisit = false)
+    {
+        public ulong TargetRetainerId => Route.RetainerId;
+    }
 
     public sealed record MagicSortButtonState(
         bool IsVisible,
@@ -27,6 +29,12 @@ namespace MagicInventory.Services
         string? Tooltip = null)
     {
         public static readonly MagicSortButtonState Hidden = new(false, false, string.Empty, string.Empty);
+
+        public static MagicSortButtonState Enabled(string label, string? tooltip = null)
+            => new(true, true, label, tooltip);
+
+        public static MagicSortButtonState Disabled(string label, string? tooltip = null)
+            => new(true, false, label, tooltip);
     }
 }
 

@@ -106,14 +106,14 @@ public sealed unsafe class MarketListingPlanner
                 var rawId = slot->ItemId;
                 var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
+                    || entry.Route.Kind != RouteKind.Market)
                 {
                     continue;
                 }
 
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
                 if (itemRow is null
-                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", manifestEntries, gearsetIds, jobProfile))
+                    || !safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.Market, manifestEntries, gearsetIds, jobProfile))
                 {
                     continue;
                 }
@@ -127,8 +127,8 @@ public sealed unsafe class MarketListingPlanner
                     continue;
                 }
 
-                var isManualMarket = configuration.TryGetManualRouteOverride(cid, baseId, out var manualSpec)
-                    && string.Equals(manualSpec, "Market", StringComparison.OrdinalIgnoreCase);
+                var isManualMarket = configuration.TryGetManualRoute(cid, baseId, out var manualRoute)
+                    && manualRoute.Kind == RouteKind.Market;
                 var slotStackValue = unitPrice * Math.Max(1, (int)slot->Quantity);
                 if (!isManualMarket
                     && unitPrice < configuration.MarketMinUnitPrice
@@ -229,7 +229,7 @@ public sealed unsafe class MarketListingPlanner
 
                     var gearsetIds = safety.BuildGearsetItemIds();
                     var jobProfile = safety.BuildUnlockedJobGearProfile();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Market", getManifest(), gearsetIds, jobProfile))
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.Market, getManifest(), gearsetIds, jobProfile))
                     {
                         return false;
                     }

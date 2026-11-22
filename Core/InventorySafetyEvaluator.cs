@@ -151,16 +151,16 @@ public sealed unsafe class InventorySafetyEvaluator
     public int GetMarketPriority(uint baseItemId)
         => configuration.GetMarketListingPriority(GetCurrentContentId(), ItemIdentity.NormalizeBaseItemId(baseItemId));
 
-    public bool HasManualRouteOverride(uint rawItemId, string expectedRoute)
+    public bool HasManualRouteOverride(uint rawItemId, RouteKind expectedKind)
     {
         var baseId = ItemIdentity.NormalizeBaseItemId(rawItemId);
         return baseId != 0
-            && configuration.TryGetManualRouteOverride(GetCurrentContentId(), baseId, out var spec)
-            && string.Equals(spec, expectedRoute, StringComparison.OrdinalIgnoreCase);
+            && configuration.TryGetManualRoute(GetCurrentContentId(), baseId, out var route)
+            && route.Kind == expectedKind;
     }
 
     public bool HasExplicitKeepOverride(uint rawItemId)
-        => HasManualRouteOverride(rawItemId, "Keep");
+        => HasManualRouteOverride(rawItemId, RouteKind.Keep);
 
     public static EquipSlotKey ResolveEquipSlotKey(Item itemRow)
     {
@@ -749,7 +749,7 @@ public sealed unsafe class InventorySafetyEvaluator
         return profile;
     }
 
-    public string? ResolveEffectiveSlotRoute(
+    public ItemRoute? ResolveEffectiveSlotRoute(
         MagicSortEntry entry,
         Item itemRow,
         InventoryItem* liveItem,
@@ -759,14 +759,15 @@ public sealed unsafe class InventorySafetyEvaluator
         bool hasNq = true,
         bool hasHq = false)
     {
-        if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+        if (entry.Route.IsKeep)
         {
             return null;
         }
 
         var cid = GetCurrentContentId();
-        var hasManualRouteOverride = configuration.TryGetManualRouteOverride(cid, entry.ItemId, out var manualSpec)
-            && string.Equals(manualSpec, entry.Route, StringComparison.OrdinalIgnoreCase);
+        var hasManualRouteOverride = configuration.TryGetManualRoute(cid, entry.ItemId, out var manualRoute)
+            && manualRoute == entry.Route;
+        var kind = entry.Route.Kind;
 
         if (liveItem == null)
         {
@@ -775,19 +776,19 @@ public sealed unsafe class InventorySafetyEvaluator
                 return null;
             }
 
-            if (string.Equals(entry.Route, "Materia", StringComparison.OrdinalIgnoreCase))
+            if (kind == RouteKind.Materia)
             {
                 return null;
             }
 
             if (!hasManualRouteOverride
-                && entry.Route is "Market" or "Vendor" or "GrandCompany"
+                && entry.Route.IsDisposal
                 && ItemIdentity.IsHousingItem(itemRow))
             {
                 return null;
             }
 
-            if (string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase))
+            if (kind == RouteKind.Market)
             {
                 if (!ItemIdentity.IsMarketable(itemRow))
                 {
@@ -803,7 +804,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
             }
 
-            if (string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase))
+            if (kind == RouteKind.Vendor)
             {
                 if (itemRow.PriceLow == 0
                     || (!hasManualRouteOverride && hasHq && !hasNq)
@@ -813,7 +814,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
             }
 
-            if (string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+            if (kind == RouteKind.GrandCompany)
             {
                 if ((!hasManualRouteOverride && hasHq && !hasNq)
                     || (!hasManualRouteOverride && !itemRow.IsUntradable)
@@ -824,7 +825,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
             }
 
-            if (entry.Route is "Vendor" or "GrandCompany"
+            if (kind is RouteKind.Vendor or RouteKind.GrandCompany
                 && !hasManualRouteOverride
                 && itemRow.EquipSlotCategory.RowId > 0)
             {
@@ -836,7 +837,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 }
             }
 
-            if (string.Equals(entry.Route, "Use", StringComparison.OrdinalIgnoreCase) && itemRow.ItemAction.RowId == 0)
+            if (kind == RouteKind.Use && itemRow.ItemAction.RowId == 0)
             {
                 return null;
             }
@@ -844,9 +845,9 @@ public sealed unsafe class InventorySafetyEvaluator
             return entry.Route;
         }
 
-        if (entry.Route is "Market")
+        if (kind == RouteKind.Market)
         {
-            if (IsSafeToDisposeOrList(liveItem, itemRow, "Market", manifestEntries, gearsetIds, jobProfile))
+            if (IsSafeToDisposeOrList(liveItem, itemRow, RouteKind.Market, manifestEntries, gearsetIds, jobProfile))
             {
                 var isHq = ItemIdentity.IsHighQuality(liveItem);
                 var unitPrice = isHq ? entry.TargetPriceHq : entry.TargetPriceNq;
@@ -862,7 +863,7 @@ public sealed unsafe class InventorySafetyEvaluator
                         }
                     }
 
-                    return "Market";
+                    return ItemRoute.Market;
                 }
 
                 return null;
@@ -871,22 +872,22 @@ public sealed unsafe class InventorySafetyEvaluator
             if (itemRow.EquipSlotCategory.RowId > 0
                 && liveItem->SpiritbondOrCollectability is > 0 and < 10000
                 && itemRow.Rarity == 1
-                && IsSafeToDisposeOrList(liveItem, itemRow, "Vendor", manifestEntries, gearsetIds, jobProfile))
+                && IsSafeToDisposeOrList(liveItem, itemRow, RouteKind.Vendor, manifestEntries, gearsetIds, jobProfile))
             {
-                return "Vendor";
+                return ItemRoute.Vendor;
             }
 
             return null;
         }
 
-        if (entry.Route is "Vendor" or "GrandCompany")
+        if (kind is RouteKind.Vendor or RouteKind.GrandCompany)
         {
-            return IsSafeToDisposeOrList(liveItem, itemRow, entry.Route, manifestEntries, gearsetIds, jobProfile)
+            return IsSafeToDisposeOrList(liveItem, itemRow, kind, manifestEntries, gearsetIds, jobProfile)
                 ? entry.Route
                 : null;
         }
 
-        if (entry.Route is "Armoire")
+        if (kind == RouteKind.Armoire)
         {
             if (liveItem->GetMateriaCount() > 0
                 || liveItem->Materia[0] != 0
@@ -901,15 +902,15 @@ public sealed unsafe class InventorySafetyEvaluator
                 return null;
             }
 
-            return "Armoire";
+            return ItemRoute.Armoire;
         }
 
-        if (entry.Route is "Use")
+        if (kind == RouteKind.Use)
         {
-            return itemRow.ItemAction.RowId > 0 ? "Use" : null;
+            return itemRow.ItemAction.RowId > 0 ? ItemRoute.Use : null;
         }
 
-        if (entry.Route is "Glamour")
+        if (kind == RouteKind.Glamour)
         {
             if (liveItem->GetMateriaCount() > 0
                 || liveItem->Materia[0] != 0
@@ -918,27 +919,27 @@ public sealed unsafe class InventorySafetyEvaluator
                 return null;
             }
 
-            return "Glamour";
+            return ItemRoute.Glamour;
         }
 
-        if (entry.Route is "GoldSaucer")
+        if (kind == RouteKind.GoldSaucer)
         {
-            return "GoldSaucer";
+            return ItemRoute.GoldSaucer;
         }
 
-        if (entry.Route is "Materia")
+        if (kind == RouteKind.Materia)
         {
-            return IsMateriaExtractable(itemRow, liveItem) ? "Materia" : null;
+            return IsMateriaExtractable(itemRow, liveItem) ? ItemRoute.Materia : null;
         }
 
-        if (entry.Route is "Retainer")
+        if (kind == RouteKind.Retainer)
         {
             if (IsMateriaExtractable(itemRow, liveItem))
             {
                 return null;
             }
 
-            return "Retainer";
+            return entry.Route;
         }
 
         return null;
@@ -947,7 +948,7 @@ public sealed unsafe class InventorySafetyEvaluator
     public bool IsSafeToDisposeOrList(
         InventoryItem* slot,
         Item itemRow,
-        string targetRoute,
+        RouteKind targetRoute,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
         HashSet<uint> gearsetIds,
         UnlockedJobGearProfile jobProfile)
@@ -979,8 +980,8 @@ public sealed unsafe class InventorySafetyEvaluator
         }
 
         var cid = GetCurrentContentId();
-        var hasManualDisposalOverride = configuration.TryGetManualRouteOverride(cid, baseId, out var overrideSpec)
-            && string.Equals(overrideSpec, targetRoute, StringComparison.OrdinalIgnoreCase);
+        var hasManualDisposalOverride = configuration.TryGetManualRoute(cid, baseId, out var manualRoute)
+            && manualRoute.Kind == targetRoute;
 
         if (!hasManualDisposalOverride && ItemIdentity.IsHousingItem(itemRow))
         {
@@ -994,13 +995,13 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        if (targetRoute is "Vendor" or "GrandCompany" && !hasManualDisposalOverride && IsLv1GlamourOrStarterGear(itemRow))
+        if (targetRoute is RouteKind.Vendor or RouteKind.GrandCompany && !hasManualDisposalOverride && IsLv1GlamourOrStarterGear(itemRow))
         {
             return false;
         }
 
         var isHq = ItemIdentity.IsHighQuality(slot);
-        if (!hasManualDisposalOverride && targetRoute == "Vendor" && isHq)
+        if (!hasManualDisposalOverride && targetRoute == RouteKind.Vendor && isHq)
         {
             return false;
         }
@@ -1015,7 +1016,7 @@ public sealed unsafe class InventorySafetyEvaluator
             return false;
         }
 
-        if (targetRoute is "Vendor" or "GrandCompany"
+        if (targetRoute is RouteKind.Vendor or RouteKind.GrandCompany
             && !hasManualDisposalOverride
             && itemRow.EquipSlotCategory.RowId > 0)
         {
@@ -1031,14 +1032,14 @@ public sealed unsafe class InventorySafetyEvaluator
             }
         }
 
-        if (targetRoute == "GrandCompany")
+        if (targetRoute == RouteKind.GrandCompany)
         {
             if (itemRow.PriceLow == 0 || (!hasManualDisposalOverride && (isHq || !itemRow.IsUntradable)))
             {
                 return false;
             }
         }
-        else if (targetRoute == "Vendor")
+        else if (targetRoute == RouteKind.Vendor)
         {
             if (!manifestEntries.TryGetValue(baseId, out var entry)
                 || itemRow.PriceLow == 0)
@@ -1046,9 +1047,9 @@ public sealed unsafe class InventorySafetyEvaluator
                 return false;
             }
 
-            var isVendorRoute = string.Equals(entry.Route, "Vendor", StringComparison.OrdinalIgnoreCase);
+            var isVendorRoute = entry.Route.Kind == RouteKind.Vendor;
             var isBoundMarketWhiteGear = !hasManualDisposalOverride
-                && string.Equals(entry.Route, "Market", StringComparison.OrdinalIgnoreCase)
+                && entry.Route.Kind == RouteKind.Market
                 && itemRow.EquipSlotCategory.RowId > 0
                 && itemRow.Rarity == 1
                 && slot->SpiritbondOrCollectability is > 0 and < 10000;
@@ -1057,7 +1058,7 @@ public sealed unsafe class InventorySafetyEvaluator
                 return false;
             }
         }
-        else if (targetRoute == "Market")
+        else if (targetRoute == RouteKind.Market)
         {
             if (!ItemIdentity.IsMarketable(itemRow))
             {

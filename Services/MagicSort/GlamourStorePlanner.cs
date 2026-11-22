@@ -101,7 +101,7 @@ public sealed unsafe class GlamourStorePlanner
             }
 
             if (!manifestEntries.TryGetValue(baseId, out var entry)
-                || !string.Equals(entry.Route, "Glamour", StringComparison.OrdinalIgnoreCase))
+                || entry.Route.Kind != RouteKind.Glamour)
             {
                 continue;
             }
@@ -114,10 +114,7 @@ public sealed unsafe class GlamourStorePlanner
 
             var itemRow = row.Value;
             if (ItemIdentity.IsSoulCrystal(itemRow)
-                || !string.Equals(
-                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile),
-                    "Glamour",
-                    StringComparison.OrdinalIgnoreCase))
+                || safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile)?.Kind != RouteKind.Glamour)
             {
                 continue;
             }

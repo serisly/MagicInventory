@@ -86,7 +86,7 @@ public sealed unsafe class GrandCompanyPlanner
 
                 var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+                    || entry.Route.Kind != RouteKind.GrandCompany)
                 {
                     continue;
                 }
@@ -97,7 +97,7 @@ public sealed unsafe class GrandCompanyPlanner
                     continue;
                 }
 
-                if (safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", manifestEntries, gearsetIds, unlockedProfile))
+                if (safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.GrandCompany, manifestEntries, gearsetIds, unlockedProfile))
                 {
                     count++;
                     if (count >= maxItems)
@@ -155,7 +155,7 @@ public sealed unsafe class GrandCompanyPlanner
             var baseId = ItemIdentity.NormalizeBaseItemId(gcItem->ItemId);
             if (unsafeDuplicateBaseIds.Contains(baseId)
                 || !manifestEntries.TryGetValue(baseId, out var entry)
-                || !string.Equals(entry.Route, "GrandCompany", StringComparison.OrdinalIgnoreCase))
+                || entry.Route.Kind != RouteKind.GrandCompany)
             {
                 continue;
             }
@@ -167,7 +167,7 @@ public sealed unsafe class GrandCompanyPlanner
                 continue;
             }
 
-            if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", manifestEntries, gearsetIds, unlockedProfile))
+            if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.GrandCompany, manifestEntries, gearsetIds, unlockedProfile))
             {
                 continue;
             }
@@ -298,7 +298,7 @@ public sealed unsafe class GrandCompanyPlanner
 
                     var gearsetIds = safety.BuildGearsetItemIds();
                     var unlockedProfile = safety.BuildUnlockedJobGearProfile();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", getManifest(), gearsetIds, unlockedProfile))
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.GrandCompany, getManifest(), gearsetIds, unlockedProfile))
                     {
                         CloseRewardModal(rewardAddon);
                         transactionQueue.Cancel("Item no longer satisfies safety checks.", QueueBatchOutcome.AbortedOnError);
@@ -443,7 +443,7 @@ public sealed unsafe class GrandCompanyPlanner
                 continue;
             }
 
-            if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "GrandCompany", manifestEntries, gearsetIds, unlockedProfile))
+            if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.GrandCompany, manifestEntries, gearsetIds, unlockedProfile))
             {
                 unsafeIds.Add(baseId);
             }

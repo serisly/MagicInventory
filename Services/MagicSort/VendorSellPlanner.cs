@@ -133,7 +133,7 @@ public sealed unsafe class VendorSellPlanner
                     continue;
                 }
 
-                if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", manifestEntries, gearsetIds, unlockedProfile))
+                if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.Vendor, manifestEntries, gearsetIds, unlockedProfile))
                 {
                     continue;
                 }
@@ -203,7 +203,7 @@ public sealed unsafe class VendorSellPlanner
 
                     var gearsetIds = safety.BuildGearsetItemIds();
                     var unlockedProfile = safety.BuildUnlockedJobGearProfile();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedProfile))
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.Vendor, getManifest(), gearsetIds, unlockedProfile))
                     {
                         return false;
                     }
@@ -270,7 +270,7 @@ public sealed unsafe class VendorSellPlanner
 
                     var gearsetIds = safety.BuildGearsetItemIds();
                     var unlockedProfile = safety.BuildUnlockedJobGearProfile();
-                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, "Vendor", getManifest(), gearsetIds, unlockedProfile))
+                    if (!safety.IsSafeToDisposeOrList(slot, itemRow.Value, RouteKind.Vendor, getManifest(), gearsetIds, unlockedProfile))
                     {
                         CloseOpenContextMenu();
                         return false;

@@ -67,8 +67,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Magic Sell",
-                magicSort.GetMarketSortButtonState,
-                magicSort.ExecuteMarketSort,
+                () => magicSort.GetButtonState(StationActionId.MarketSell),
+                () => magicSort.ExecuteAction(StationActionId.MarketSell),
                 static addon => addon->RootNode,
                 static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 138f, 28f, preferRightSide: true),
                 hovered => routeOverlay.SetHoveredSellAddon("RetainerSellList", hovered)));
@@ -78,8 +78,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => &a->AtkUnitBase,
             new NativeAddonButtonGroup<AddonShop>.ButtonSpec(
                 "Magic Sell",
-                magicSort.GetVendorSortButtonState,
-                magicSort.ExecuteVendorSort,
+                () => magicSort.GetButtonState(StationActionId.VendorSell),
+                () => magicSort.ExecuteAction(StationActionId.VendorSell),
                 static addon => addon->AtkUnitBase.RootNode,
                 static addon => NativeUiHelpers.ResolveBottomMarginPosition(&addon->AtkUnitBase, 134f, 28f, preferRightSide: false),
                 hovered => routeOverlay.SetHoveredSellAddon("Shop", hovered)));
@@ -89,8 +89,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => &a->AtkUnitBase,
             new NativeAddonButtonGroup<AddonGrandCompanySupplyList>.ButtonSpec(
                 "Magic Sell",
-                magicSort.GetGrandCompanySortButtonState,
-                magicSort.ExecuteGrandCompanySort,
+                () => magicSort.GetButtonState(StationActionId.GrandCompany),
+                () => magicSort.ExecuteAction(StationActionId.GrandCompany),
                 static addon => addon->AtkUnitBase.RootNode,
                 ResolveGrandCompanyPosition,
                 hovered => routeOverlay.SetHoveredSellAddon("GrandCompanySupplyList", hovered)));
@@ -100,8 +100,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Extract All",
-                magicSort.GetMateriaExtractButtonState,
-                magicSort.ExecuteMateriaExtractSort,
+                () => magicSort.GetButtonState(StationActionId.MateriaExtract),
+                () => magicSort.ExecuteAction(StationActionId.MateriaExtract),
                 static addon => addon->RootNode,
                 static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: false)));
 
@@ -110,8 +110,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Magic Store",
-                magicSort.GetArmoireStoreButtonState,
-                magicSort.ExecuteArmoireStore,
+                () => magicSort.GetButtonState(StationActionId.ArmoireStore),
+                () => magicSort.ExecuteAction(StationActionId.ArmoireStore),
                 static addon => addon->RootNode,
                 static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 134f, 28f, preferRightSide: true),
                 hovered => routeOverlay.SetHoveredSellAddon("Cabinet", hovered)));
@@ -121,8 +121,8 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Magic Store",
-                magicSort.GetGlamourDresserButtonState,
-                magicSort.ExecuteGlamourDresserStore,
+                () => magicSort.GetButtonState(StationActionId.GlamourStore),
+                () => magicSort.ExecuteAction(StationActionId.GlamourStore),
                 static addon => addon->RootNode,
                 static addon => NativeUiHelpers.ResolveBottomMarginPosition(addon, 126f, 26f, preferRightSide: false),
                 hovered =>
@@ -146,15 +146,15 @@ public sealed unsafe class MagicSortControllers : IDisposable
             static a => a,
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Magic Sort",
-                magicSort.GetInventorySortButtonState,
-                magicSort.ExecuteInventorySort,
+                () => magicSort.GetButtonState(StationActionId.InventorySort),
+                () => magicSort.ExecuteAction(StationActionId.InventorySort),
                 static addon => addon->RootNode,
                 ResolveInventorySortPosition,
                 hovered => routeOverlay.SetHoveredInventorySortAddon(addonName, hovered)),
             new NativeAddonButtonGroup<AtkUnitBase>.ButtonSpec(
                 "Use All",
-                magicSort.GetUseAllButtonState,
-                magicSort.ExecuteUseAll,
+                () => magicSort.GetButtonState(StationActionId.UseAll),
+                () => magicSort.ExecuteAction(StationActionId.UseAll),
                 static addon => addon->RootNode,
                 ResolveInventoryUsePosition,
                 hovered => routeOverlay.SetHoveredSellAddon(addonName, hovered)));

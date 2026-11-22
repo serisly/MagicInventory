@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
+using Lumina.Excel;
 using Lumina.Excel.Sheets;
 using MagicInventory.Core;
 
@@ -20,6 +21,63 @@ public sealed unsafe class RetainerSortPlanner
         int StackSize,
         bool IsUnique,
         string ItemName);
+
+    private static readonly RetainerSortPlan EmptyPlan = new(
+        new List<TransactionStep>(),
+        0,
+        0,
+        0,
+        0,
+        0,
+        false,
+        Array.Empty<string>(),
+        Array.Empty<string>(),
+        Array.Empty<string>(),
+        Array.Empty<(InventoryType, int)>(),
+        Array.Empty<(InventoryType, int)>());
+
+    private sealed class TransferPlanBuilder
+    {
+        public ulong ActiveRetainerId { get; }
+        public int MaxSteps { get; }
+        public SlotSpaceTracker RetainerSpace { get; }
+        public SlotSpaceTracker PlayerSpace { get; }
+        public List<TransactionStep> Steps { get; }
+        public List<string> TrackedWithdrawSummary { get; } = new();
+        public List<string> DepositSummary { get; } = new();
+        public List<string> SortWithdrawSummary { get; } = new();
+        public List<(InventoryType Container, int Slot)> DepositSlots { get; } = new();
+        public List<(InventoryType Container, int Slot)> WithdrawSlots { get; } = new();
+        public int DepositCount { get; set; }
+        public int WithdrawCount { get; set; }
+        public int TrackedWithdrawCount { get; set; }
+        public int BlockedByFullRetainer { get; set; }
+        public int BlockedByFullBag { get; set; }
+        public bool HasMoreRemaining { get; set; }
+
+        public TransferPlanBuilder(ulong activeRetainerId, int maxSteps, SlotSpaceTracker retainerSpace, SlotSpaceTracker playerSpace)
+        {
+            ActiveRetainerId = activeRetainerId;
+            MaxSteps = maxSteps;
+            RetainerSpace = retainerSpace;
+            PlayerSpace = playerSpace;
+            Steps = new List<TransactionStep>(maxSteps);
+        }
+
+        public RetainerSortPlan Build() => new(
+            Steps,
+            DepositCount,
+            WithdrawCount,
+            TrackedWithdrawCount,
+            BlockedByFullRetainer,
+            BlockedByFullBag,
+            HasMoreRemaining,
+            TrackedWithdrawSummary,
+            DepositSummary,
+            SortWithdrawSummary,
+            DepositSlots,
+            WithdrawSlots);
+    }
 
     private readonly IDataManager dataManager;
     private readonly IGameGui gameGui;
@@ -53,19 +111,7 @@ public sealed unsafe class RetainerSortPlanner
         var itemSheet = dataManager.GetExcelSheet<Item>();
         if (activeId == 0 || manager == null || itemSheet == null)
         {
-            return new RetainerSortPlan(
-                new List<TransactionStep>(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                false,
-                Array.Empty<string>(),
-                Array.Empty<string>(),
-                Array.Empty<string>(),
-                Array.Empty<(InventoryType, int)>(),
-                Array.Empty<(InventoryType, int)>());
+            return EmptyPlan;
         }
 
         var gearsetIds = safety.BuildGearsetItemIds();
@@ -73,100 +119,97 @@ public sealed unsafe class RetainerSortPlanner
         var armouryOpen = NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ArmouryBoard");
         var knownRetainers = holdings.GetKnownRetainersForCurrentCharacter();
 
-        var simulatedRetainerEmpty = 0;
-        var retainerExistingBaseIds = new HashSet<uint>();
-        var retainerPartialSlots = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<int>>();
-        var retainerPartialByQuality = new HashSet<(uint BaseId, bool IsHq)>();
+        var retainerSpace = new SlotSpaceTracker();
+        ScanLiveContainers(manager, itemSheet, InventorySafetyEvaluator.RetainerBagContainers, retainerSpace);
 
-        static void AddPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key, int room)
+        var playerSpace = new SlotSpaceTracker();
+        ScanLiveContainers(manager, itemSheet, InventorySafetyEvaluator.PlayerBagContainers, playerSpace);
+        ScanOwnedBaseIds(manager, InventorySafetyEvaluator.ArmouryGearContainers.Append(InventoryType.EquippedItems), playerSpace);
+
+        var missingTracked = getMissingTrackedQuantities();
+        BuildRetainerCapacities(
+            manager,
+            activeId,
+            knownRetainers,
+            retainerSpace,
+            playerSpace,
+            manifestEntries,
+            itemSheet,
+            gearsetIds,
+            unlockedProfile,
+            missingTracked,
+            out var capacityList,
+            out var capacityById);
+
+        var depositCandidates = CollectDepositCandidates(
+            manager,
+            activeId,
+            armouryOpen,
+            retainerSpace,
+            manifestEntries,
+            itemSheet,
+            gearsetIds,
+            unlockedProfile,
+            capacityList,
+            capacityById);
+
+        var withdrawCandidates = CollectWithdrawCandidates(
+            manager,
+            activeId,
+            armouryOpen,
+            playerSpace,
+            manifestEntries,
+            itemSheet,
+            gearsetIds,
+            unlockedProfile,
+            capacityById);
+
+        var trackedWithdrawCandidates = CollectTrackedWithdrawCandidates(
+            manager,
+            playerSpace,
+            itemSheet,
+            missingTracked);
+
+        var state = new TransferPlanBuilder(activeId, maxCount, retainerSpace, playerSpace);
+
+        if (playerSpace.EmptySlots == 0 && depositCandidates.Count > 0 && retainerSpace.EmptySlots > 0)
         {
-            if (room <= 0)
-            {
-                return;
-            }
-
-            if (!map.TryGetValue(key, out var list))
-            {
-                list = new List<int>(2);
-                map[key] = list;
-            }
-
-            list.Add(room);
+            QueueDeposits(state, depositCandidates);
+            QueueTrackedWithdrawals(state, manager, trackedWithdrawCandidates, missingTracked);
+            QueueWithdrawals(state, withdrawCandidates);
         }
-
-        static int PeekFirstPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key)
-            => map.TryGetValue(key, out var list) && list.Count > 0 ? list[0] : 0;
-
-        static void ConsumeFirstPartialRoom(Dictionary<(uint, InventoryItem.ItemFlags), List<int>> map, (uint, InventoryItem.ItemFlags) key, int qty, out bool completelyMerged)
+        else
         {
-            completelyMerged = false;
-            if (!map.TryGetValue(key, out var list) || list.Count == 0)
-            {
-                return;
-            }
+            QueueTrackedWithdrawals(state, manager, trackedWithdrawCandidates, missingTracked);
 
-            var room = list[0];
-            if (qty < room)
+            var runWithdrawalsFirst = retainerSpace.EmptySlots < depositCandidates.Count
+                && playerSpace.EmptySlots > 0
+                && withdrawCandidates.Count > 0;
+
+            if (runWithdrawalsFirst)
             {
-                list[0] = room - qty;
-                completelyMerged = true;
+                QueueWithdrawals(state, withdrawCandidates);
+                QueueDeposits(state, depositCandidates);
             }
             else
             {
-                list.RemoveAt(0);
-                completelyMerged = qty == room;
+                QueueDeposits(state, depositCandidates);
+                QueueWithdrawals(state, withdrawCandidates);
             }
         }
 
-        foreach (var retType in InventorySafetyEvaluator.RetainerBagContainers)
+        return state.Build();
+    }
+
+    private static void ScanLiveContainers(
+        InventoryManager* manager,
+        ExcelSheet<Item> itemSheet,
+        InventoryType[] containers,
+        SlotSpaceTracker tracker)
+    {
+        foreach (var containerType in containers)
         {
-            var retContainer = manager->GetInventoryContainer(retType);
-            if (!InventorySafetyEvaluator.IsContainerReadable(retContainer))
-            {
-                continue;
-            }
-
-            for (var i = 0; i < retContainer->Size; i++)
-            {
-                var rSlot = InventorySafetyEvaluator.GetSlot(retContainer, i);
-                if (rSlot == null)
-                {
-                    continue;
-                }
-
-                if (rSlot->ItemId == 0 || rSlot->Quantity <= 0)
-                {
-                    simulatedRetainerEmpty++;
-                    continue;
-                }
-
-                var rBaseId = ItemIdentity.NormalizeBaseItemId(rSlot->ItemId);
-                retainerExistingBaseIds.Add(rBaseId);
-
-                var rRow = itemSheet.GetRowOrDefault(rBaseId);
-                if (rRow is null)
-                {
-                    continue;
-                }
-
-                var rStackSize = (int)Math.Max(1, rRow.Value.StackSize);
-                if (rStackSize > 1
-                    && (rSlot->Flags & InventoryItem.ItemFlags.Collectable) == 0
-                    && rSlot->Quantity < rStackSize)
-                {
-                    AddPartialRoom(retainerPartialSlots, (rSlot->ItemId, rSlot->Flags), rStackSize - rSlot->Quantity);
-                    retainerPartialByQuality.Add((rBaseId, ItemIdentity.IsHighQuality(rSlot)));
-                }
-            }
-        }
-
-        var simulatedPlayerEmpty = 0;
-        var playerExistingBaseIds = new HashSet<uint>();
-        var playerPartialSlots = new Dictionary<(uint ItemId, InventoryItem.ItemFlags Flags), List<int>>();
-
-        foreach (var bag in InventorySafetyEvaluator.PlayerBagContainers)
-        {
-            var container = manager->GetInventoryContainer(bag);
+            var container = manager->GetInventoryContainer(containerType);
             if (!InventorySafetyEvaluator.IsContainerReadable(container))
             {
                 continue;
@@ -174,99 +217,113 @@ public sealed unsafe class RetainerSortPlanner
 
             for (var i = 0; i < container->Size; i++)
             {
-                var pSlot = InventorySafetyEvaluator.GetSlot(container, i);
-                if (pSlot == null)
+                var slot = InventorySafetyEvaluator.GetSlot(container, i);
+                if (slot == null)
                 {
                     continue;
                 }
 
-                if (pSlot->ItemId == 0 || pSlot->Quantity <= 0)
+                if (slot->ItemId == 0 || slot->Quantity <= 0)
                 {
-                    simulatedPlayerEmpty++;
+                    tracker.RecordEmptySlot();
                     continue;
                 }
 
-                var pBaseId = ItemIdentity.NormalizeBaseItemId(pSlot->ItemId);
-                playerExistingBaseIds.Add(pBaseId);
-
-                var pRow = itemSheet.GetRowOrDefault(pBaseId);
-                if (pRow is null)
+                var baseId = ItemIdentity.NormalizeBaseItemId(slot->ItemId);
+                var row = itemSheet.GetRowOrDefault(baseId);
+                if (row is null)
                 {
+                    tracker.RecordExistingBaseId(baseId);
                     continue;
                 }
 
-                var pStackSize = (int)Math.Max(1, pRow.Value.StackSize);
-                if (pStackSize > 1
-                    && (pSlot->Flags & InventoryItem.ItemFlags.Collectable) == 0
-                    && pSlot->Quantity < pStackSize)
-                {
-                    AddPartialRoom(playerPartialSlots, (pSlot->ItemId, pSlot->Flags), pStackSize - pSlot->Quantity);
-                }
+                var stackSize = (int)Math.Max(1, row.Value.StackSize);
+                tracker.RecordOccupiedSlot(slot->ItemId, baseId, slot->Flags, slot->Quantity, stackSize, ItemIdentity.IsHighQuality(slot));
             }
         }
+    }
 
-        foreach (var equipContainerType in InventorySafetyEvaluator.ArmouryGearContainers.Append(InventoryType.EquippedItems))
+    private static void ScanOwnedBaseIds(
+        InventoryManager* manager,
+        IEnumerable<InventoryType> containers,
+        SlotSpaceTracker tracker)
+    {
+        foreach (var containerType in containers)
         {
-            var equipContainer = manager->GetInventoryContainer(equipContainerType);
-            if (equipContainer == null || equipContainer->Items == null)
+            var container = manager->GetInventoryContainer(containerType);
+            if (container == null || container->Items == null)
             {
                 continue;
             }
 
-            for (var i = 0; i < equipContainer->Size; i++)
+            for (var i = 0; i < container->Size; i++)
             {
-                var eSlot = equipContainer->GetInventorySlot(i);
-                if (eSlot != null && eSlot->ItemId != 0 && eSlot->Quantity > 0)
+                var slot = container->GetInventorySlot(i);
+                if (slot != null && slot->ItemId != 0 && slot->Quantity > 0)
                 {
-                    playerExistingBaseIds.Add(ItemIdentity.NormalizeBaseItemId(eSlot->ItemId));
+                    tracker.RecordExistingBaseId(ItemIdentity.NormalizeBaseItemId(slot->ItemId));
                 }
             }
         }
+    }
 
-        var missingTracked = getMissingTrackedQuantities();
+    private void BuildRetainerCapacities(
+        InventoryManager* manager,
+        ulong activeId,
+        IReadOnlyList<KnownRetainerInfo> knownRetainers,
+        SlotSpaceTracker retainerSpace,
+        SlotSpaceTracker playerSpace,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds,
+        UnlockedJobGearProfile unlockedProfile,
+        IReadOnlyDictionary<uint, int> missingTracked,
+        out List<RetainerCapacityState> capacityList,
+        out Dictionary<ulong, RetainerCapacityState> capacityById)
+    {
+        capacityList = new List<RetainerCapacityState>(knownRetainers.Count + 1);
+        capacityById = new Dictionary<ulong, RetainerCapacityState>(knownRetainers.Count + 1);
+        var liveActiveFree = retainerSpace.EmptySlots;
 
-        var capacityList = new List<RetainerCapacityState>(knownRetainers.Count + 1);
-        var capacityById = new Dictionary<ulong, RetainerCapacityState>(knownRetainers.Count + 1);
-        var liveActiveFree = simulatedRetainerEmpty;
+        RetainerCapacityState CreateLiveActiveCapacity(ulong retId) => new()
+        {
+            RetainerId = retId,
+            BaseFreeSlots = liveActiveFree,
+            ProjectedWithdrawalFreedSlots = ProjectLiveActiveRetainerWithdrawals(
+                manager,
+                liveActiveFree,
+                manifestEntries,
+                itemSheet,
+                gearsetIds,
+                unlockedProfile,
+                playerSpace,
+                missingTracked),
+            HasBaseItem = retainerSpace.HasBaseItem,
+            HasPartialStack = retainerSpace.HasPartialStackForQuality,
+            IsKnownFullFor = (id, hq, stack) => liveActiveFree <= 0 && !(stack > 1 && retainerSpace.HasPartialStackForQuality(id, hq)),
+        };
 
         foreach (var kr in knownRetainers)
         {
-            var captured = kr;
-            var isLiveActive = kr.RetainerId == activeId;
-            var cap = new RetainerCapacityState
-            {
-                RetainerId = kr.RetainerId,
-                BaseFreeSlots = isLiveActive ? liveActiveFree : holdings.GetKnownRetainerFreeSlots(kr.RetainerId),
-                HasBaseItem = isLiveActive
-                    ? id => retainerExistingBaseIds.Contains(id)
-                    : id => captured.Quantities.GetValueOrDefault(id) > 0,
-                HasPartialStack = isLiveActive
-                    ? (id, hq) => retainerPartialByQuality.Contains((id, hq))
-                    : (id, hq) => holdings.HasPartialStackOnRetainer(captured.RetainerId, id, hq),
-                IsKnownFullFor = isLiveActive
-                    ? (id, hq, stack) => liveActiveFree <= 0 && !(stack > 1 && retainerPartialByQuality.Contains((id, hq)))
-                    : (id, hq, stack) => holdings.IsRetainerKnownFullFor(captured.RetainerId, id, hq, stack),
-            };
-
-            cap.ProjectedWithdrawalFreedSlots = isLiveActive
-                ? ProjectLiveActiveRetainerWithdrawals(
-                    manager,
-                    liveActiveFree,
-                    manifestEntries,
-                    itemSheet,
-                    gearsetIds,
-                    unlockedProfile,
-                    playerExistingBaseIds,
-                    missingTracked)
-                : ProjectDirectWithdrawalsForRetainer(
-                    kr,
-                    cap.BaseFreeSlots,
-                    manifestEntries,
-                    itemSheet,
-                    gearsetIds,
-                    unlockedProfile,
-                    playerUniqueBaseIds: playerExistingBaseIds,
-                    missingTracked);
+            var cap = kr.RetainerId == activeId
+                ? CreateLiveActiveCapacity(kr.RetainerId)
+                : new RetainerCapacityState
+                {
+                    RetainerId = kr.RetainerId,
+                    BaseFreeSlots = holdings.GetKnownRetainerFreeSlots(kr.RetainerId),
+                    HasBaseItem = id => kr.Quantities.GetValueOrDefault(id) > 0,
+                    HasPartialStack = (id, hq) => holdings.HasPartialStackOnRetainer(kr.RetainerId, id, hq),
+                    IsKnownFullFor = (id, hq, stack) => holdings.IsRetainerKnownFullFor(kr.RetainerId, id, hq, stack),
+                    ProjectedWithdrawalFreedSlots = ProjectDirectWithdrawalsForRetainer(
+                        kr,
+                        holdings.GetKnownRetainerFreeSlots(kr.RetainerId),
+                        manifestEntries,
+                        itemSheet,
+                        gearsetIds,
+                        unlockedProfile,
+                        playerSpace,
+                        missingTracked),
+                };
 
             capacityList.Add(cap);
             capacityById[kr.RetainerId] = cap;
@@ -274,34 +331,31 @@ public sealed unsafe class RetainerSortPlanner
 
         if (!capacityById.ContainsKey(activeId))
         {
-            var activeCap = new RetainerCapacityState
-            {
-                RetainerId = activeId,
-                BaseFreeSlots = liveActiveFree,
-                ProjectedWithdrawalFreedSlots = ProjectLiveActiveRetainerWithdrawals(
-                    manager,
-                    liveActiveFree,
-                    manifestEntries,
-                    itemSheet,
-                    gearsetIds,
-                    unlockedProfile,
-                    playerExistingBaseIds,
-                    missingTracked),
-                HasBaseItem = id => retainerExistingBaseIds.Contains(id),
-                HasPartialStack = (id, hq) => retainerPartialByQuality.Contains((id, hq)),
-                IsKnownFullFor = (id, hq, stack) => liveActiveFree <= 0 && !(stack > 1 && retainerPartialByQuality.Contains((id, hq))),
-            };
+            var activeCap = CreateLiveActiveCapacity(activeId);
             capacityList.Add(activeCap);
             capacityById[activeId] = activeCap;
         }
 
-        RetainerTransferPolicy.InitializeProjectedBudgets(capacityList, simulatedPlayerEmpty);
+        RetainerTransferPolicy.InitializeProjectedBudgets(capacityList, playerSpace.EmptySlots);
+    }
 
+    private List<RetainerTransferCandidate> CollectDepositCandidates(
+        InventoryManager* manager,
+        ulong activeId,
+        bool armouryOpen,
+        SlotSpaceTracker retainerSpace,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds,
+        UnlockedJobGearProfile unlockedProfile,
+        List<RetainerCapacityState> capacityList,
+        Dictionary<ulong, RetainerCapacityState> capacityById)
+    {
         var depositSources = armouryOpen
             ? InventorySafetyEvaluator.PlayerBagContainers.Concat(InventorySafetyEvaluator.ArmouryGearContainers)
             : InventorySafetyEvaluator.PlayerBagContainers;
 
-        var depositCandidates = new List<RetainerTransferCandidate>();
+        var candidates = new List<RetainerTransferCandidate>();
         foreach (var srcBag in depositSources)
         {
             var container = manager->GetInventoryContainer(srcBag);
@@ -340,13 +394,13 @@ public sealed unsafe class RetainerSortPlanner
                 if (manifestEntries.TryGetValue(baseId, out var entry))
                 {
                     var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
-                    if (effRoute != "Retainer" || entry.TargetRetainerId == 0)
+                    if (!effRoute.HasValue || !effRoute.Value.IsSpecificRetainer)
                     {
                         continue;
                     }
 
                     var decision = RetainerTransferPolicy.ResolveDepositTarget(
-                        entry.TargetRetainerId,
+                        effRoute.Value.RetainerId,
                         baseId,
                         isHq,
                         itemRow.Value.IsUnique,
@@ -359,22 +413,19 @@ public sealed unsafe class RetainerSortPlanner
                         continue;
                     }
                 }
-                else
-                {
-                    if (fromArmoury
-                        || !retainerExistingBaseIds.Contains(baseId)
-                        || !InventorySafetyEvaluator.IsEligibleForLiveRetainerDuplicateDeposit(itemRow.Value))
-                    {
-                        continue;
-                    }
-                }
-
-                if (itemRow.Value.IsUnique && retainerExistingBaseIds.Contains(baseId))
+                else if (fromArmoury
+                    || !retainerSpace.HasBaseItem(baseId)
+                    || !InventorySafetyEvaluator.IsEligibleForLiveRetainerDuplicateDeposit(itemRow.Value))
                 {
                     continue;
                 }
 
-                depositCandidates.Add(new RetainerTransferCandidate(
+                if (itemRow.Value.IsUnique && retainerSpace.HasBaseItem(baseId))
+                {
+                    continue;
+                }
+
+                candidates.Add(new RetainerTransferCandidate(
                     srcBag,
                     slotIdx,
                     rawId,
@@ -387,14 +438,28 @@ public sealed unsafe class RetainerSortPlanner
             }
         }
 
-        depositCandidates.Sort((a, b) =>
+        candidates.Sort((a, b) =>
         {
-            var aMerges = PeekFirstPartialRoom(retainerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-            var bMerges = PeekFirstPartialRoom(retainerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
+            var aMerges = retainerSpace.HasPartialRoom(a.RawItemId, a.Flags) ? 1 : 0;
+            var bMerges = retainerSpace.HasPartialRoom(b.RawItemId, b.Flags) ? 1 : 0;
             return bMerges.CompareTo(aMerges);
         });
 
-        var withdrawCandidates = new List<RetainerTransferCandidate>();
+        return candidates;
+    }
+
+    private List<RetainerTransferCandidate> CollectWithdrawCandidates(
+        InventoryManager* manager,
+        ulong activeId,
+        bool armouryOpen,
+        SlotSpaceTracker playerSpace,
+        IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
+        ExcelSheet<Item> itemSheet,
+        HashSet<uint> gearsetIds,
+        UnlockedJobGearProfile unlockedProfile,
+        Dictionary<ulong, RetainerCapacityState> capacityById)
+    {
+        var candidates = new List<RetainerTransferCandidate>();
         foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainers)
         {
             var container = manager->GetInventoryContainer(retBag);
@@ -415,12 +480,8 @@ public sealed unsafe class RetainerSortPlanner
                 var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                 if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                     || gearsetIds.Contains(baseId)
-                    || safety.IsItemTracked(baseId))
-                {
-                    continue;
-                }
-
-                if (!manifestEntries.TryGetValue(baseId, out var entry))
+                    || safety.IsItemTracked(baseId)
+                    || !manifestEntries.TryGetValue(baseId, out var entry))
                 {
                     continue;
                 }
@@ -428,12 +489,8 @@ public sealed unsafe class RetainerSortPlanner
                 var itemRow = itemSheet.GetRowOrDefault(baseId);
                 if (itemRow is null
                     || ItemIdentity.IsSoulCrystal(itemRow.Value)
-                    || ItemIdentity.IsRelicRarity(itemRow.Value))
-                {
-                    continue;
-                }
-
-                if (itemRow.Value.IsUnique && playerExistingBaseIds.Contains(baseId))
+                    || ItemIdentity.IsRelicRarity(itemRow.Value)
+                    || (itemRow.Value.IsUnique && playerSpace.HasBaseItem(baseId)))
                 {
                     continue;
                 }
@@ -442,26 +499,24 @@ public sealed unsafe class RetainerSortPlanner
                 var isHq = ItemIdentity.IsHighQuality(slot);
                 var shouldWithdraw = false;
 
-                if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                if (entry.Route.IsKeep)
                 {
                     shouldWithdraw = safety.HasExplicitKeepOverride(baseId);
                 }
                 else
                 {
                     var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
-                    if (effRoute != null)
+                    if (effRoute.HasValue)
                     {
                         if (RetainerBellEvaluator.IsWithdrawableRoute(effRoute))
                         {
                             shouldWithdraw = true;
                         }
-                        else if (string.Equals(effRoute, "Retainer", StringComparison.OrdinalIgnoreCase)
-                            && entry.TargetRetainerId != 0
-                            && entry.TargetRetainerId != activeId)
+                        else if (effRoute.Value.IsSpecificRetainer && effRoute.Value.RetainerId != activeId)
                         {
                             var funnel = RetainerTransferPolicy.EvaluateCrossRetainerFunnel(
                                 activeId,
-                                entry.TargetRetainerId,
+                                effRoute.Value.RetainerId,
                                 baseId,
                                 hasNq: !isHq,
                                 hasHq: isHq,
@@ -479,7 +534,7 @@ public sealed unsafe class RetainerSortPlanner
                     continue;
                 }
 
-                withdrawCandidates.Add(new RetainerTransferCandidate(
+                candidates.Add(new RetainerTransferCandidate(
                     retBag,
                     slotIdx,
                     rawId,
@@ -504,7 +559,7 @@ public sealed unsafe class RetainerSortPlanner
 
                 for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
                 {
-                    var slot = container->GetInventorySlot(slotIdx);
+                    var slot = InventorySafetyEvaluator.GetSlot(container, slotIdx);
                     if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
                     {
                         continue;
@@ -514,12 +569,8 @@ public sealed unsafe class RetainerSortPlanner
                     var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
                     if (!ItemIdentity.CanLockOrTagBaseId(baseId)
                         || gearsetIds.Contains(baseId)
-                        || safety.IsItemTracked(baseId))
-                    {
-                        continue;
-                    }
-
-                    if (!manifestEntries.TryGetValue(baseId, out var entry))
+                        || safety.IsItemTracked(baseId)
+                        || !manifestEntries.TryGetValue(baseId, out var entry))
                     {
                         continue;
                     }
@@ -533,12 +584,12 @@ public sealed unsafe class RetainerSortPlanner
                     }
 
                     var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
-                    if (effRoute != "Market")
+                    if (effRoute?.Kind != RouteKind.Market)
                     {
                         continue;
                     }
 
-                    withdrawCandidates.Add(new RetainerTransferCandidate(
+                    candidates.Add(new RetainerTransferCandidate(
                         armType,
                         slotIdx,
                         rawId,
@@ -552,10 +603,10 @@ public sealed unsafe class RetainerSortPlanner
             }
         }
 
-        withdrawCandidates.Sort((a, b) =>
+        candidates.Sort((a, b) =>
         {
-            var aMerges = PeekFirstPartialRoom(playerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-            var bMerges = PeekFirstPartialRoom(playerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
+            var aMerges = playerSpace.HasPartialRoom(a.RawItemId, a.Flags) ? 1 : 0;
+            var bMerges = playerSpace.HasPartialRoom(b.RawItemId, b.Flags) ? 1 : 0;
             if (aMerges != bMerges)
             {
                 return bMerges.CompareTo(aMerges);
@@ -566,351 +617,199 @@ public sealed unsafe class RetainerSortPlanner
             return bFromRet.CompareTo(aFromRet);
         });
 
-        var trackedWithdrawCandidates = new List<RetainerTransferCandidate>();
-        if (missingTracked.Count > 0)
+        return candidates;
+    }
+
+    private static List<RetainerTransferCandidate> CollectTrackedWithdrawCandidates(
+        InventoryManager* manager,
+        SlotSpaceTracker playerSpace,
+        ExcelSheet<Item> itemSheet,
+        IReadOnlyDictionary<uint, int> missingTracked)
+    {
+        var candidates = new List<RetainerTransferCandidate>();
+        if (missingTracked.Count == 0)
         {
-            foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainersWithCrystals)
-            {
-                var container = manager->GetInventoryContainer(retBag);
-                if (!InventorySafetyEvaluator.IsContainerReadable(container))
-                {
-                    continue;
-                }
-
-                for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
-                {
-                    var slot = InventorySafetyEvaluator.GetSlot(container, slotIdx);
-                    if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
-                    {
-                        continue;
-                    }
-
-                    var rawId = slot->ItemId;
-                    var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
-                    if (!missingTracked.TryGetValue(baseId, out var neededQty) || neededQty <= 0)
-                    {
-                        continue;
-                    }
-
-                    var itemRow = itemSheet.GetRowOrDefault(baseId);
-                    if (itemRow is null)
-                    {
-                        continue;
-                    }
-
-                    if (itemRow.Value.IsUnique && playerExistingBaseIds.Contains(baseId))
-                    {
-                        continue;
-                    }
-
-                    trackedWithdrawCandidates.Add(new RetainerTransferCandidate(
-                        retBag,
-                        slotIdx,
-                        rawId,
-                        baseId,
-                        slot->Flags,
-                        slot->Quantity,
-                        (int)Math.Max(1, itemRow.Value.StackSize),
-                        itemRow.Value.IsUnique,
-                        itemRow.Value.Name.ExtractText()));
-                }
-            }
-
-            trackedWithdrawCandidates.Sort((a, b) =>
-            {
-                var aMerges = PeekFirstPartialRoom(playerPartialSlots, (a.RawItemId, a.Flags)) > 0 ? 1 : 0;
-                var bMerges = PeekFirstPartialRoom(playerPartialSlots, (b.RawItemId, b.Flags)) > 0 ? 1 : 0;
-                if (aMerges != bMerges)
-                {
-                    return bMerges.CompareTo(aMerges);
-                }
-
-                var aNeed = missingTracked.GetValueOrDefault(a.BaseItemId);
-                var bNeed = missingTracked.GetValueOrDefault(b.BaseItemId);
-                var aExactOrSmaller = aNeed != int.MaxValue && a.Quantity <= aNeed ? 1 : 0;
-                var bExactOrSmaller = bNeed != int.MaxValue && b.Quantity <= bNeed ? 1 : 0;
-                if (aExactOrSmaller != bExactOrSmaller)
-                {
-                    return bExactOrSmaller.CompareTo(aExactOrSmaller);
-                }
-
-                return a.Quantity.CompareTo(b.Quantity);
-            });
+            return candidates;
         }
 
-        var steps = new List<TransactionStep>(maxCount);
-        var depositCount = 0;
-        var withdrawCount = 0;
-        var trackedWithdrawCount = 0;
-        var blockedByFullRetainer = 0;
-        var blockedByFullBag = 0;
-        var hasMoreRemaining = false;
-        var trackedWithdrawSummary = new List<string>();
-        var depositSummary = new List<string>();
-        var sortWithdrawSummary = new List<string>();
-        var depositSlots = new List<(InventoryType Container, int Slot)>();
-        var withdrawSlots = new List<(InventoryType Container, int Slot)>();
-
-        void QueueTrackedWithdrawals()
+        foreach (var retBag in InventorySafetyEvaluator.RetainerBagContainersWithCrystals)
         {
-            var remainingNeeded = new Dictionary<uint, int>(missingTracked);
-            foreach (var cand in trackedWithdrawCandidates)
+            var container = manager->GetInventoryContainer(retBag);
+            if (!InventorySafetyEvaluator.IsContainerReadable(container))
             {
-                if (!remainingNeeded.TryGetValue(cand.BaseItemId, out var needed) || needed <= 0)
+                continue;
+            }
+
+            for (var slotIdx = 0; slotIdx < container->Size; slotIdx++)
+            {
+                var slot = InventorySafetyEvaluator.GetSlot(container, slotIdx);
+                if (slot == null || slot->ItemId == 0 || slot->Quantity <= 0)
                 {
                     continue;
                 }
 
-                if (cand.IsUnique && playerExistingBaseIds.Contains(cand.BaseItemId))
+                var rawId = slot->ItemId;
+                var baseId = ItemIdentity.NormalizeBaseItemId(rawId);
+                if (!missingTracked.TryGetValue(baseId, out var neededQty) || neededQty <= 0)
                 {
                     continue;
                 }
 
-                var isCrystal = ItemIdentity.IsCrystalItemId(cand.BaseItemId) || cand.SourceContainer == InventoryType.RetainerCrystals;
-                if (isCrystal)
+                var itemRow = itemSheet.GetRowOrDefault(baseId);
+                if (itemRow is null || (itemRow.Value.IsUnique && playerSpace.HasBaseItem(baseId)))
                 {
-                    var crystalBag = manager->GetInventoryContainer(InventoryType.Crystals);
-                    var crystalSlot = crystalBag != null ? InventorySafetyEvaluator.GetSlot(crystalBag, (int)(cand.BaseItemId - 2)) : null;
-                    if (crystalSlot != null && crystalSlot->Quantity >= 9999)
-                    {
-                        continue;
-                    }
-
-                    if (steps.Count >= maxCount)
-                    {
-                        hasMoreRemaining = true;
-                        break;
-                    }
-
-                    trackedWithdrawCount++;
-                    trackedWithdrawSummary.Add($"{cand.ItemName} x{cand.Quantity}");
-                    withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
-                    remainingNeeded[cand.BaseItemId] = 0;
-
-                    steps.Add(BuildMoveStep(
-                        $"Withdraw tracked {cand.ItemName}",
-                        activeId,
-                        cand.SourceContainer,
-                        cand.SourceSlot,
-                        cand.RawItemId,
-                        cand.Flags,
-                        cand.StackSize,
-                        InventorySafetyEvaluator.PlayerBagContainers,
-                        checkSourceFlags: false,
-                        routeCrystalsToCrystalBag: true));
                     continue;
                 }
 
-                var withdrawAll = needed == int.MaxValue;
-                var takeQty = withdrawAll ? cand.Quantity : Math.Min(cand.Quantity, needed);
-                var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
-                var wantsSplit = !withdrawAll && takeQty < cand.Quantity && canStack;
-                var canSplit = wantsSplit && simulatedRetainerEmpty >= 1;
-                var effectiveQty = canSplit ? takeQty : cand.Quantity;
-
-                var roomKey = (cand.RawItemId, cand.Flags);
-                var firstPartialRoom = canStack ? PeekFirstPartialRoom(playerPartialSlots, roomKey) : 0;
-                var fitsCompletelyInPartial = firstPartialRoom >= effectiveQty;
-                var fitsAnyPartial = firstPartialRoom > 0;
-                if (!fitsCompletelyInPartial && simulatedPlayerEmpty <= 0 && (!fitsAnyPartial || canSplit))
-                {
-                    blockedByFullBag++;
-                    continue;
-                }
-
-                var requiredSteps = canSplit ? 2 : 1;
-                if (steps.Count + requiredSteps > maxCount)
-                {
-                    hasMoreRemaining = true;
-                    break;
-                }
-
-                var splitTargetsEmptySlot = canSplit && !fitsCompletelyInPartial;
-                if (fitsCompletelyInPartial || (fitsAnyPartial && !canSplit))
-                {
-                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, effectiveQty, out _);
-                }
-                else
-                {
-                    simulatedPlayerEmpty--;
-                    if (canStack && effectiveQty < cand.StackSize)
-                    {
-                        AddPartialRoom(playerPartialSlots, roomKey, cand.StackSize - effectiveQty);
-                    }
-                }
-
-                if (!canSplit && (fitsCompletelyInPartial || !fitsAnyPartial))
-                {
-                    simulatedRetainerEmpty++;
-                }
-
-                if (cand.IsUnique)
-                {
-                    playerExistingBaseIds.Add(cand.BaseItemId);
-                }
-
-                var movedQty = (!canSplit && fitsAnyPartial && !fitsCompletelyInPartial)
-                    ? Math.Min(effectiveQty, firstPartialRoom)
-                    : effectiveQty;
-
-                if (!withdrawAll)
-                {
-                    remainingNeeded[cand.BaseItemId] = Math.Max(0, needed - movedQty);
-                }
-
-                trackedWithdrawCount++;
-                var summaryNote = wantsSplit && !canSplit ? " (full stack - retainer full)" : string.Empty;
-                trackedWithdrawSummary.Add($"{cand.ItemName} x{effectiveQty}{summaryNote}");
-                withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
-
-                if (canSplit)
-                {
-                    AddSplitAndWithdrawSteps(steps, activeId, cand, takeQty, allowPartialMergeForSplit: !splitTargetsEmptySlot);
-                }
-                else
-                {
-                    steps.Add(BuildMoveStep(
-                        $"Withdraw tracked {cand.ItemName}",
-                        activeId,
-                        cand.SourceContainer,
-                        cand.SourceSlot,
-                        cand.RawItemId,
-                        cand.Flags,
-                        cand.StackSize,
-                        InventorySafetyEvaluator.PlayerBagContainers));
-                }
+                candidates.Add(new RetainerTransferCandidate(
+                    retBag,
+                    slotIdx,
+                    rawId,
+                    baseId,
+                    slot->Flags,
+                    slot->Quantity,
+                    (int)Math.Max(1, itemRow.Value.StackSize),
+                    itemRow.Value.IsUnique,
+                    itemRow.Value.Name.ExtractText()));
             }
         }
 
-        void QueueDeposits()
+        candidates.Sort((a, b) =>
         {
-            foreach (var cand in depositCandidates)
+            var aMerges = playerSpace.HasPartialRoom(a.RawItemId, a.Flags) ? 1 : 0;
+            var bMerges = playerSpace.HasPartialRoom(b.RawItemId, b.Flags) ? 1 : 0;
+            if (aMerges != bMerges)
             {
-                if (cand.IsUnique && retainerExistingBaseIds.Contains(cand.BaseItemId))
+                return bMerges.CompareTo(aMerges);
+            }
+
+            var aNeed = missingTracked.GetValueOrDefault(a.BaseItemId);
+            var bNeed = missingTracked.GetValueOrDefault(b.BaseItemId);
+            var aExactOrSmaller = aNeed != int.MaxValue && a.Quantity <= aNeed ? 1 : 0;
+            var bExactOrSmaller = bNeed != int.MaxValue && b.Quantity <= bNeed ? 1 : 0;
+            if (aExactOrSmaller != bExactOrSmaller)
+            {
+                return bExactOrSmaller.CompareTo(aExactOrSmaller);
+            }
+
+            return a.Quantity.CompareTo(b.Quantity);
+        });
+
+        return candidates;
+    }
+
+    private void QueueTrackedWithdrawals(
+        TransferPlanBuilder state,
+        InventoryManager* manager,
+        List<RetainerTransferCandidate> candidates,
+        IReadOnlyDictionary<uint, int> missingTracked)
+    {
+        var remainingNeeded = new Dictionary<uint, int>(missingTracked);
+        foreach (var cand in candidates)
+        {
+            if (!remainingNeeded.TryGetValue(cand.BaseItemId, out var needed) || needed <= 0)
+            {
+                continue;
+            }
+
+            if (cand.IsUnique && state.PlayerSpace.HasBaseItem(cand.BaseItemId))
+            {
+                continue;
+            }
+
+            var isCrystal = ItemIdentity.IsCrystalItemId(cand.BaseItemId) || cand.SourceContainer == InventoryType.RetainerCrystals;
+            if (isCrystal)
+            {
+                var crystalBag = manager->GetInventoryContainer(InventoryType.Crystals);
+                var crystalSlot = crystalBag != null ? InventorySafetyEvaluator.GetSlot(crystalBag, (int)(cand.BaseItemId - 2)) : null;
+                if (crystalSlot != null && crystalSlot->Quantity >= 9999)
                 {
                     continue;
                 }
 
-                var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
-                var roomKey = (cand.RawItemId, cand.Flags);
-                var firstPartialRoom = canStack ? PeekFirstPartialRoom(retainerPartialSlots, roomKey) : 0;
-                var fitsPartial = firstPartialRoom > 0;
-                if (!fitsPartial && simulatedRetainerEmpty <= 0)
+                if (state.Steps.Count >= state.MaxSteps)
                 {
-                    blockedByFullRetainer++;
-                    continue;
-                }
-
-                if (steps.Count >= maxCount)
-                {
-                    hasMoreRemaining = true;
+                    state.HasMoreRemaining = true;
                     break;
                 }
 
-                var freedPlayerSlot = false;
-                if (fitsPartial)
-                {
-                    ConsumeFirstPartialRoom(retainerPartialSlots, roomKey, cand.Quantity, out freedPlayerSlot);
-                }
-                else
-                {
-                    simulatedRetainerEmpty--;
-                    freedPlayerSlot = true;
-                    if (canStack && cand.Quantity < cand.StackSize)
-                    {
-                        AddPartialRoom(retainerPartialSlots, roomKey, cand.StackSize - cand.Quantity);
-                    }
-                }
+                state.TrackedWithdrawCount++;
+                state.TrackedWithdrawSummary.Add($"{cand.ItemName} x{cand.Quantity}");
+                state.WithdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
+                remainingNeeded[cand.BaseItemId] = 0;
 
-                if (freedPlayerSlot && !InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer))
-                {
-                    simulatedPlayerEmpty++;
-                }
-
-                if (cand.IsUnique)
-                {
-                    retainerExistingBaseIds.Add(cand.BaseItemId);
-                }
-
-                depositCount++;
-                depositSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
-                depositSlots.Add((cand.SourceContainer, cand.SourceSlot));
-
-                steps.Add(BuildMoveStep(
-                    $"Deposit {cand.ItemName}",
-                    activeId,
+                state.Steps.Add(BuildMoveStep(
+                    $"Withdraw tracked {cand.ItemName}",
+                    state.ActiveRetainerId,
                     cand.SourceContainer,
                     cand.SourceSlot,
                     cand.RawItemId,
                     cand.Flags,
                     cand.StackSize,
-                    InventorySafetyEvaluator.RetainerBagContainers));
+                    InventorySafetyEvaluator.PlayerBagContainers,
+                    checkSourceFlags: false,
+                    routeCrystalsToCrystalBag: true));
+                continue;
             }
-        }
 
-        void QueueWithdrawals()
-        {
-            foreach (var cand in withdrawCandidates)
+            var withdrawAll = needed == int.MaxValue;
+            var takeQty = withdrawAll ? cand.Quantity : Math.Min(cand.Quantity, needed);
+            var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
+            var wantsSplit = !withdrawAll && takeQty < cand.Quantity && canStack;
+            var canSplit = wantsSplit && state.RetainerSpace.EmptySlots >= 1;
+            var effectiveQty = canSplit ? takeQty : cand.Quantity;
+
+            if (!state.PlayerSpace.CanReceive(cand.RawItemId, cand.Flags, effectiveQty, cand.StackSize, allowPartialRemainder: !canSplit))
             {
-                if (cand.IsUnique
-                    && !InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer)
-                    && playerExistingBaseIds.Contains(cand.BaseItemId))
-                {
-                    continue;
-                }
+                state.BlockedByFullBag++;
+                continue;
+            }
 
-                var canStack = cand.StackSize > 1 && (cand.Flags & InventoryItem.ItemFlags.Collectable) == 0;
-                var roomKey = (cand.RawItemId, cand.Flags);
-                var firstPartialRoom = canStack ? PeekFirstPartialRoom(playerPartialSlots, roomKey) : 0;
-                var fitsPartial = firstPartialRoom > 0;
-                if (!fitsPartial && simulatedPlayerEmpty <= 0)
-                {
-                    blockedByFullBag++;
-                    continue;
-                }
+            var requiredSteps = canSplit ? 2 : 1;
+            if (state.Steps.Count + requiredSteps > state.MaxSteps)
+            {
+                state.HasMoreRemaining = true;
+                break;
+            }
 
-                if (steps.Count >= maxCount)
-                {
-                    hasMoreRemaining = true;
-                    break;
-                }
+            var outcome = state.PlayerSpace.TryCommitReceive(
+                cand.RawItemId,
+                cand.BaseItemId,
+                cand.Flags,
+                effectiveQty,
+                cand.StackSize,
+                cand.IsUnique,
+                allowPartialRemainder: !canSplit);
+            if (!outcome.Accepted)
+            {
+                state.BlockedByFullBag++;
+                continue;
+            }
 
-                var freedRetainerSlot = false;
-                if (fitsPartial)
-                {
-                    ConsumeFirstPartialRoom(playerPartialSlots, roomKey, cand.Quantity, out freedRetainerSlot);
-                }
-                else
-                {
-                    simulatedPlayerEmpty--;
-                    freedRetainerSlot = true;
-                    if (canStack && cand.Quantity < cand.StackSize)
-                    {
-                        AddPartialRoom(playerPartialSlots, roomKey, cand.StackSize - cand.Quantity);
-                    }
-                }
+            if (!canSplit && outcome.FreedSourceSlot)
+            {
+                state.RetainerSpace.FreeSlot();
+            }
 
-                if (freedRetainerSlot && InventorySafetyEvaluator.IsRetainerContainer(cand.SourceContainer))
-                {
-                    simulatedRetainerEmpty++;
-                }
+            if (!withdrawAll)
+            {
+                remainingNeeded[cand.BaseItemId] = Math.Max(0, needed - outcome.MovedQuantity);
+            }
 
-                if (cand.IsUnique)
-                {
-                    playerExistingBaseIds.Add(cand.BaseItemId);
-                }
+            state.TrackedWithdrawCount++;
+            var summaryNote = wantsSplit && !canSplit ? " (full stack - retainer full)" : string.Empty;
+            state.TrackedWithdrawSummary.Add($"{cand.ItemName} x{effectiveQty}{summaryNote}");
+            state.WithdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
 
-                withdrawCount++;
-                sortWithdrawSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
-                withdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
-
-                var stepTitle = InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer)
-                    ? $"Move {cand.ItemName} to inventory"
-                    : $"Withdraw {cand.ItemName}";
-
-                steps.Add(BuildMoveStep(
-                    stepTitle,
-                    activeId,
+            if (canSplit)
+            {
+                AddSplitAndWithdrawSteps(state.Steps, state.ActiveRetainerId, cand, takeQty, allowPartialMergeForSplit: !outcome.SplitTargetsEmptySlot);
+            }
+            else
+            {
+                state.Steps.Add(BuildMoveStep(
+                    $"Withdraw tracked {cand.ItemName}",
+                    state.ActiveRetainerId,
                     cand.SourceContainer,
                     cand.SourceSlot,
                     cand.RawItemId,
@@ -919,56 +818,132 @@ public sealed unsafe class RetainerSortPlanner
                     InventorySafetyEvaluator.PlayerBagContainers));
             }
         }
+    }
 
-        if (simulatedPlayerEmpty == 0 && depositCandidates.Count > 0 && simulatedRetainerEmpty > 0)
+    private void QueueDeposits(TransferPlanBuilder state, List<RetainerTransferCandidate> candidates)
+    {
+        foreach (var cand in candidates)
         {
-            QueueDeposits();
-            QueueTrackedWithdrawals();
-            QueueWithdrawals();
+            if (cand.IsUnique && state.RetainerSpace.HasBaseItem(cand.BaseItemId))
+            {
+                continue;
+            }
+
+            if (!state.RetainerSpace.CanReceive(cand.RawItemId, cand.Flags, cand.Quantity, cand.StackSize))
+            {
+                state.BlockedByFullRetainer++;
+                continue;
+            }
+
+            if (state.Steps.Count >= state.MaxSteps)
+            {
+                state.HasMoreRemaining = true;
+                break;
+            }
+
+            var outcome = state.RetainerSpace.TryCommitReceive(
+                cand.RawItemId,
+                cand.BaseItemId,
+                cand.Flags,
+                cand.Quantity,
+                cand.StackSize,
+                cand.IsUnique);
+            if (!outcome.Accepted)
+            {
+                state.BlockedByFullRetainer++;
+                continue;
+            }
+
+            if (outcome.FreedSourceSlot && !InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer))
+            {
+                state.PlayerSpace.FreeSlot();
+            }
+
+            state.DepositCount++;
+            state.DepositSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
+            state.DepositSlots.Add((cand.SourceContainer, cand.SourceSlot));
+
+            state.Steps.Add(BuildMoveStep(
+                $"Deposit {cand.ItemName}",
+                state.ActiveRetainerId,
+                cand.SourceContainer,
+                cand.SourceSlot,
+                cand.RawItemId,
+                cand.Flags,
+                cand.StackSize,
+                InventorySafetyEvaluator.RetainerBagContainers));
         }
-        else
+    }
+
+    private void QueueWithdrawals(TransferPlanBuilder state, List<RetainerTransferCandidate> candidates)
+    {
+        foreach (var cand in candidates)
         {
-            QueueTrackedWithdrawals();
-
-            var runWithdrawalsFirst = simulatedRetainerEmpty < depositCandidates.Count
-                && simulatedPlayerEmpty > 0
-                && withdrawCandidates.Count > 0;
-
-            if (runWithdrawalsFirst)
+            if (cand.IsUnique
+                && !InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer)
+                && state.PlayerSpace.HasBaseItem(cand.BaseItemId))
             {
-                QueueWithdrawals();
-                QueueDeposits();
+                continue;
             }
-            else
+
+            if (!state.PlayerSpace.CanReceive(cand.RawItemId, cand.Flags, cand.Quantity, cand.StackSize))
             {
-                QueueDeposits();
-                QueueWithdrawals();
+                state.BlockedByFullBag++;
+                continue;
             }
+
+            if (state.Steps.Count >= state.MaxSteps)
+            {
+                state.HasMoreRemaining = true;
+                break;
+            }
+
+            var outcome = state.PlayerSpace.TryCommitReceive(
+                cand.RawItemId,
+                cand.BaseItemId,
+                cand.Flags,
+                cand.Quantity,
+                cand.StackSize,
+                cand.IsUnique);
+            if (!outcome.Accepted)
+            {
+                state.BlockedByFullBag++;
+                continue;
+            }
+
+            if (outcome.FreedSourceSlot && InventorySafetyEvaluator.IsRetainerContainer(cand.SourceContainer))
+            {
+                state.RetainerSpace.FreeSlot();
+            }
+
+            state.WithdrawCount++;
+            state.SortWithdrawSummary.Add(cand.Quantity > 1 ? $"{cand.ItemName} x{cand.Quantity}" : cand.ItemName);
+            state.WithdrawSlots.Add((cand.SourceContainer, cand.SourceSlot));
+
+            var stepTitle = InventorySafetyEvaluator.IsArmouryContainer(cand.SourceContainer)
+                ? $"Move {cand.ItemName} to inventory"
+                : $"Withdraw {cand.ItemName}";
+
+            state.Steps.Add(BuildMoveStep(
+                stepTitle,
+                state.ActiveRetainerId,
+                cand.SourceContainer,
+                cand.SourceSlot,
+                cand.RawItemId,
+                cand.Flags,
+                cand.StackSize,
+                InventorySafetyEvaluator.PlayerBagContainers));
         }
-
-        return new RetainerSortPlan(
-            steps,
-            depositCount,
-            withdrawCount,
-            trackedWithdrawCount,
-            blockedByFullRetainer,
-            blockedByFullBag,
-            hasMoreRemaining,
-            trackedWithdrawSummary,
-            depositSummary,
-            sortWithdrawSummary,
-            depositSlots,
-            withdrawSlots);
     }
 
     private int ProjectLiveActiveRetainerWithdrawals(
         InventoryManager* manager,
         int baseFreeSlots,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
-        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        ExcelSheet<Item> itemSheet,
         HashSet<uint> gearsetIds,
         UnlockedJobGearProfile unlockedProfile,
-        HashSet<uint> playerUniqueBaseIds,
+        SlotSpaceTracker playerSpace,
         IReadOnlyDictionary<uint, int> missingTracked)
     {
         var projectedFreed = 0;
@@ -999,7 +974,7 @@ public sealed unsafe class RetainerSortPlanner
                 if (remainingTracked != null && remainingTracked.TryGetValue(baseId, out var needQty) && needQty > 0)
                 {
                     var tRow = itemSheet.GetRowOrDefault(baseId);
-                    if (tRow is not null && tRow.Value.IsUnique && playerUniqueBaseIds.Contains(baseId))
+                    if (tRow is not null && tRow.Value.IsUnique && playerSpace.HasBaseItem(baseId))
                     {
                         continue;
                     }
@@ -1031,12 +1006,12 @@ public sealed unsafe class RetainerSortPlanner
                     || ItemIdentity.IsCurrencyOrCrystal(baseId, row.Value)
                     || ItemIdentity.IsSoulCrystal(row.Value)
                     || ItemIdentity.IsRelicRarity(row.Value)
-                    || (row.Value.IsUnique && playerUniqueBaseIds.Contains(baseId)))
+                    || (row.Value.IsUnique && playerSpace.HasBaseItem(baseId)))
                 {
                     continue;
                 }
 
-                if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+                if (entry.Route.IsKeep)
                 {
                     if (safety.HasExplicitKeepOverride(baseId))
                     {
@@ -1061,10 +1036,10 @@ public sealed unsafe class RetainerSortPlanner
         KnownRetainerInfo ret,
         int baseFreeSlots,
         IReadOnlyDictionary<uint, MagicSortEntry> manifestEntries,
-        Lumina.Excel.ExcelSheet<Item> itemSheet,
+        ExcelSheet<Item> itemSheet,
         HashSet<uint> gearsetIds,
         UnlockedJobGearProfile unlockedProfile,
-        HashSet<uint> playerUniqueBaseIds,
+        SlotSpaceTracker playerSpace,
         IReadOnlyDictionary<uint, int> missingTracked)
     {
         var projectedFreed = 0;
@@ -1079,7 +1054,7 @@ public sealed unsafe class RetainerSortPlanner
                 }
 
                 var tRow = itemSheet.GetRowOrDefault(trackedId);
-                if (tRow is not null && tRow.Value.IsUnique && playerUniqueBaseIds.Contains(trackedId))
+                if (tRow is not null && tRow.Value.IsUnique && playerSpace.HasBaseItem(trackedId))
                 {
                     continue;
                 }
@@ -1112,12 +1087,12 @@ public sealed unsafe class RetainerSortPlanner
                 || ItemIdentity.IsCurrencyOrCrystal(baseId, row.Value)
                 || ItemIdentity.IsSoulCrystal(row.Value)
                 || ItemIdentity.IsRelicRarity(row.Value)
-                || (row.Value.IsUnique && playerUniqueBaseIds.Contains(baseId)))
+                || (row.Value.IsUnique && playerSpace.HasBaseItem(baseId)))
             {
                 continue;
             }
 
-            if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+            if (entry.Route.IsKeep)
             {
                 if (safety.HasExplicitKeepOverride(baseId))
                 {

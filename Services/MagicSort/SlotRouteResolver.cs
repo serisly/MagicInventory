@@ -8,13 +8,15 @@ using MagicInventory.Core;
 namespace MagicInventory.Services.MagicSort;
 
 public readonly record struct ResolvedSlotRoute(
-    string Route,
-    ulong TargetRetainerId,
+    ItemRoute Route,
     string TargetRetainerName,
     MagicSortEntry? ManifestEntry,
     bool IsTrackedInRetainer = false,
     bool IsPendingPrice = false,
-    bool NeedsRetainerVisit = false);
+    bool NeedsRetainerVisit = false)
+{
+    public ulong TargetRetainerId => Route.RetainerId;
+}
 
 public sealed unsafe class SlotRouteResolver
 {
@@ -93,10 +95,10 @@ public sealed unsafe class SlotRouteResolver
         {
             if (InventorySafetyEvaluator.IsMateriaExtractable(row, liveItem))
             {
-                return new ResolvedSlotRoute("Materia", 0, string.Empty, null);
+                return new ResolvedSlotRoute(ItemRoute.Materia, string.Empty, null);
             }
 
-            return new ResolvedSlotRoute("Keep", 0, string.Empty, null);
+            return new ResolvedSlotRoute(ItemRoute.Keep, string.Empty, null);
         }
 
         if (!ItemIdentity.CanLockOrTagItem(baseId, row))
@@ -106,7 +108,7 @@ public sealed unsafe class SlotRouteResolver
 
         if (InventorySafetyEvaluator.IsMateriaExtractable(row, liveItem))
         {
-            return new ResolvedSlotRoute("Materia", 0, string.Empty, null);
+            return new ResolvedSlotRoute(ItemRoute.Materia, string.Empty, null);
         }
 
         if (safety.IsItemTracked(baseId))
@@ -127,7 +129,7 @@ public sealed unsafe class SlotRouteResolver
 
             if (needsRetainerPull)
             {
-                return new ResolvedSlotRoute("Tracked", 0, string.Empty, null, IsTrackedInRetainer: true);
+                return new ResolvedSlotRoute(ItemRoute.Tracked, string.Empty, null, IsTrackedInRetainer: true);
             }
 
             return ResolveStayOrBagRoute(inRetainer, baseId, null);
@@ -135,9 +137,8 @@ public sealed unsafe class SlotRouteResolver
 
         var hasExplicitRelicStorageOverride = ItemIdentity.IsRelicRarity(row)
             && manifestEntries.TryGetValue(baseId, out var relicEntry)
-            && (string.Equals(relicEntry.Route, "Glamour", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(relicEntry.Route, "Armoire", StringComparison.OrdinalIgnoreCase)
-                || (string.Equals(relicEntry.Route, "Retainer", StringComparison.OrdinalIgnoreCase) && relicEntry.TargetRetainerId != 0));
+            && (relicEntry.Route.Kind is RouteKind.Glamour or RouteKind.Armoire
+                || relicEntry.Route.IsSpecificRetainer);
 
         if (gearsetIds.Contains(baseId)
             || ItemIdentity.IsSoulCrystal(row)
@@ -145,7 +146,7 @@ public sealed unsafe class SlotRouteResolver
         {
             if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
-                return new ResolvedSlotRoute("Armoury", 0, string.Empty, null);
+                return new ResolvedSlotRoute(ItemRoute.Armoury, string.Empty, null);
             }
 
             return ResolveStayOrBagRoute(inRetainer, baseId, null);
@@ -161,48 +162,48 @@ public sealed unsafe class SlotRouteResolver
             {
                 var activeId = HoldingsService.GetActiveRetainerId();
                 var activeName = HoldingsService.GetActiveRetainerName() ?? "Retainer";
-                return new ResolvedSlotRoute("Retainer", activeId, activeName, null);
+                return new ResolvedSlotRoute(ItemRoute.ForRetainer(activeId), activeName, null);
             }
 
             if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
-                return new ResolvedSlotRoute("Armoury", 0, string.Empty, null);
+                return new ResolvedSlotRoute(ItemRoute.Armoury, string.Empty, null);
             }
 
             return ResolveStayOrBagRoute(inRetainer, baseId, null);
         }
 
-        if (string.Equals(entry.Route, "Keep", StringComparison.OrdinalIgnoreCase))
+        if (entry.Route.IsKeep)
         {
             var needsVisit = entry.NeedsRetainerVisit;
             var isPendingPrice = entry.IsPendingRefresh && !needsVisit;
 
             if (!entry.IsPendingRefresh && includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
-                return new ResolvedSlotRoute("Armoury", 0, string.Empty, entry);
+                return new ResolvedSlotRoute(ItemRoute.Armoury, string.Empty, entry);
             }
 
             return ResolveStayOrBagRoute(inRetainer, baseId, entry, isPendingPrice, needsVisit);
         }
 
         var effectiveRoute = safety.ResolveEffectiveSlotRoute(entry, row, liveItem, manifestEntries, gearsetIds, unlockedProfile);
-        if (string.IsNullOrEmpty(effectiveRoute))
+        if (!effectiveRoute.HasValue)
         {
             if (includeBagToArmouryRoute && !inRetainer && !inArmoury && ItemIdentity.IsEquipment(row))
             {
-                return new ResolvedSlotRoute("Armoury", 0, string.Empty, entry);
+                return new ResolvedSlotRoute(ItemRoute.Armoury, string.Empty, entry);
             }
 
             return ResolveStayOrBagRoute(inRetainer, baseId, entry);
         }
 
-        if (string.Equals(effectiveRoute, "Retainer", StringComparison.OrdinalIgnoreCase))
+        if (effectiveRoute.Value.IsRetainer)
         {
             var retName = string.IsNullOrWhiteSpace(entry.TargetRetainerName) ? "Retainer" : entry.TargetRetainerName;
-            return new ResolvedSlotRoute("Retainer", entry.TargetRetainerId, retName, entry);
+            return new ResolvedSlotRoute(effectiveRoute.Value, retName, entry);
         }
 
-        return new ResolvedSlotRoute(effectiveRoute, 0, string.Empty, entry);
+        return new ResolvedSlotRoute(effectiveRoute.Value, string.Empty, entry);
     }
 
     private ResolvedSlotRoute ResolveStayOrBagRoute(
@@ -218,11 +219,11 @@ public sealed unsafe class SlotRouteResolver
             var activeName = HoldingsService.GetActiveRetainerName();
             if (activeId != 0 && !string.IsNullOrWhiteSpace(activeName))
             {
-                return new ResolvedSlotRoute("Retainer", activeId, activeName, entry);
+                return new ResolvedSlotRoute(ItemRoute.ForRetainer(activeId), activeName, entry);
             }
         }
 
-        return new ResolvedSlotRoute("Keep", 0, string.Empty, entry, IsPendingPrice: isPendingPrice, NeedsRetainerVisit: needsVisit);
+        return new ResolvedSlotRoute(ItemRoute.Keep, string.Empty, entry, IsPendingPrice: isPendingPrice, NeedsRetainerVisit: needsVisit);
     }
 
     public string FormatHoverTooltipLabel(
@@ -250,15 +251,15 @@ public sealed unsafe class SlotRouteResolver
         var entry = resolved.ManifestEntry;
         var isHq = ItemIdentity.IsHighQuality(rawItemId, liveItem != null ? liveItem->Flags : InventoryItem.ItemFlags.None);
 
-        switch (resolved.Route)
+        switch (resolved.Route.Kind)
         {
-            case "Retainer":
+            case RouteKind.Retainer:
                 return $"Magic Sort: {resolved.TargetRetainerName}";
 
-            case "Use":
+            case RouteKind.Use:
                 return "Magic Sort: Use";
 
-            case "Market":
+            case RouteKind.Market:
             {
                 long price = 0;
                 if (entry != null)
@@ -271,7 +272,7 @@ public sealed unsafe class SlotRouteResolver
                 return price > 0 ? $"Magic Sort: Market (~{price:N0}g){prioTag}" : $"Magic Sort: Market{prioTag}";
             }
 
-            case "Vendor":
+            case RouteKind.Vendor:
             {
                 var qty = liveItem != null && liveItem->Quantity > 0 ? liveItem->Quantity : 1;
                 var npcUnit = entry is { NpcSellPrice: > 0 } ? entry.NpcSellPrice : (long)itemRow.PriceLow;
@@ -279,22 +280,22 @@ public sealed unsafe class SlotRouteResolver
                 return total > 0 ? $"Magic Sort: Vendor ({total:N0}g)" : "Magic Sort: Vendor";
             }
 
-            case "GrandCompany":
+            case RouteKind.GrandCompany:
                 return "Magic Sort: GC Seals";
 
-            case "GoldSaucer":
+            case RouteKind.GoldSaucer:
                 return "Magic Sort: Gold Saucer";
 
-            case "Materia":
+            case RouteKind.Materia:
                 return "Magic Sort: Extract Materia";
 
-            case "Armoire":
+            case RouteKind.Armoire:
                 return "Magic Sort: Armoire";
 
-            case "Glamour":
+            case RouteKind.Glamour:
                 return "Magic Sort: Glamour Dresser";
 
-            case "Armoury":
+            case RouteKind.Armoury:
                 return "Magic Sort: Armoury";
 
             default:

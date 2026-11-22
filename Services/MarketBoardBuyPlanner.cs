@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Threading.Tasks;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game;
@@ -12,36 +11,17 @@ using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using Lumina.Excel.Sheets;
 using MagicInventory.Core;
+using MagicInventory.Services.MarketBoard;
 using MagicInventory.Services.Triage;
 
 namespace MagicInventory.Services;
 
-public sealed record MarketBuyCandidate(
-    int ListingIndex,
-    uint ItemId,
-    string ItemName,
-    uint Quantity,
-    uint UnitPrice,
-    uint TotalCost,
-    bool IsHq,
-    ulong RetainerId = 0);
-
-public readonly record struct MarketListingInput(
-    int ListingIndex,
-    uint Quantity,
-    uint UnitPrice,
-    uint TotalCost,
-    bool IsHq,
-    ulong RetainerId);
-
 public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 {
-    private const uint MedianSlackGil = 500;
     private const int MinSearchCooldownMs = 2500;
     private const double SkipMemoryMinutes = 2.0;
 
     private readonly IDalamudPluginInterface pluginInterface;
-    private readonly IFramework framework;
     private readonly IClientState clientState;
     private readonly IObjectTable objectTable;
     private readonly IDataManager dataManager;
@@ -53,15 +33,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
     private readonly MagicSortService magicSort;
     private readonly UniversalisClient universalis;
     private readonly HoldingsService holdings;
-    private readonly Action<string, string, string, DcCheapestListing, int>? onWorldHopOffer;
+    private readonly MarketBoardDcHintService dcHintService;
 
     private readonly Dictionary<uint, DateTime> skippedUntilUtcByItem = new();
-    private readonly Dictionary<uint, DateTime> lastDcHintUtcByItem = new();
 
     private bool isBuyBatchActive;
     private TrackedMaterialLine? activeTarget;
     private DateTime lastSearchDispatchedUtc = DateTime.MinValue;
-    private bool isDisposed;
 
     private uint lastBoughtItemId;
     private ulong lastBoughtRetainerId;
@@ -71,8 +49,6 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 
     private HashSet<ulong> ownRetainerIds = new();
     private DateTime lastOwnRetainerRefreshUtc = DateTime.MinValue;
-    private DateTime lastLifestreamCheckUtc = DateTime.MinValue;
-    private bool cachedLifestreamLoaded;
 
     private uint EffectiveMaxGilPerPurchase => (uint)Math.Max(100, configuration.BuyMaxGilPerPurchase);
     private double EffectiveOutlierMultiplier => Math.Max(1.1, configuration.BuyOutlierMultiplier);
@@ -96,7 +72,6 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
     {
         _ = condition;
         this.pluginInterface = pluginInterface;
-        this.framework = framework;
         this.clientState = clientState;
         this.objectTable = objectTable;
         this.dataManager = dataManager;
@@ -108,7 +83,14 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         this.magicSort = magicSort;
         this.universalis = universalis;
         this.holdings = holdings;
-        this.onWorldHopOffer = onWorldHopOffer;
+        dcHintService = new MarketBoardDcHintService(
+            pluginInterface,
+            framework,
+            objectTable,
+            chatGui,
+            configuration,
+            universalis,
+            onWorldHopOffer);
 
         this.transactionQueue.BatchEnded += OnTransactionBatchEnded;
     }
@@ -131,7 +113,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         if (IsAutoBuying)
         {
             var current = activeTarget != null ? activeTarget.Name : "items";
-            return new MagicSortButtonState(true, true, "Stop Buy", $"Stop buying tracked materials ({current}).");
+            return MagicSortButtonState.Enabled("Stop Buy", $"Stop buying tracked materials ({current}).");
         }
 
         var snapshot = tracker.GetSnapshot();
@@ -142,13 +124,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 
         if (transactionQueue.IsBusy)
         {
-            return new MagicSortButtonState(true, false, "Wait...", "Wait for the active operation to finish.");
+            return MagicSortButtonState.Disabled("Wait...", "Wait for the active operation to finish.");
         }
 
         var missing = snapshot.Lines.Where(l => !l.IsComplete).ToList();
         if (missing.Count == 0)
         {
-            return new MagicSortButtonState(true, false, "All Owned", "All tracked materials are already in your inventory.");
+            return MagicSortButtonState.Disabled("All Owned", "All tracked materials are already in your inventory.");
         }
 
         var unowned = missing.Where(l => !l.IsCoveredByHoldings && l.UnownedMissingCount > 0).ToList();
@@ -169,9 +151,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             var where = anyRetainer && anySaddlebag
                 ? "on your retainers / Chocobo Saddlebag"
                 : (anySaddlebag && !anyRetainer ? "in your Chocobo Saddlebag" : "on your retainers");
-            return new MagicSortButtonState(
-                true,
-                false,
+            return MagicSortButtonState.Disabled(
                 label,
                 $"Remaining materials are already stored {where}: {string.Join(", ", missing.Select(l => l.Name))}.");
         }
@@ -180,21 +160,13 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         var untradable = new List<TrackedMaterialLine>();
         foreach (var line in unowned)
         {
-            if (IsItemMarketable(line.ItemId))
-            {
-                buyable.Add(line);
-            }
-            else
-            {
-                untradable.Add(line);
-            }
+            if (IsItemMarketable(line.ItemId)) buyable.Add(line);
+            else untradable.Add(line);
         }
 
         if (buyable.Count == 0)
         {
-            return new MagicSortButtonState(
-                true,
-                false,
+            return MagicSortButtonState.Disabled(
                 $"Untradable ({untradable.Count})",
                 $"Remaining missing materials cannot be bought on the Market Board: {string.Join(", ", untradable.Select(l => l.Name))}.");
         }
@@ -202,37 +174,23 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         var cid = InventorySafetyEvaluator.GetCurrentContentId();
         if (configuration.GetRemainingMarketActionsToday(cid) <= 0)
         {
-            return new MagicSortButtonState(
-                true,
-                false,
+            return MagicSortButtonState.Disabled(
                 "Daily Limit",
                 $"Daily Market Board limit reached ({configuration.GetUsedMarketActionsToday(cid)}/{configuration.MarketDailyActionLimit}). Raise the limit in Settings or buy manually.");
         }
 
         if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearchResult"))
         {
-            return new MagicSortButtonState(
-                true,
-                false,
+            return MagicSortButtonState.Disabled(
                 $"Magic Buy ({buyable.Count})",
                 "Close the open listings popup (or use Magic Buy inside it).");
         }
 
         var next = FindNextUnownedMissing(DateTime.UtcNow);
-        if (next == null)
-        {
-            return new MagicSortButtonState(
-                true,
-                true,
-                $"Magic Buy ({buyable.Count})",
-                BuildPredictedBuyTooltip(buyable, untradable));
-        }
-
-        return new MagicSortButtonState(
-            true,
-            true,
-            $"Magic Buy ({buyable.Count})",
-            $"1 click = 1 item search & safe buy (next: {next.Name} x{next.UnownedMissingCount}).\n{BuildPredictedBuyTooltip(buyable, untradable)}");
+        var tooltip = next == null
+            ? BuildPredictedBuyTooltip(buyable, untradable)
+            : $"1 click = 1 item search & safe buy (next: {next.Name} x{next.UnownedMissingCount}).\n{BuildPredictedBuyTooltip(buyable, untradable)}";
+        return MagicSortButtonState.Enabled($"Magic Buy ({buyable.Count})", tooltip);
     }
 
     public void ToggleAutoBuy()
@@ -309,7 +267,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         activeTarget = target;
         var clickedSearchRow = false;
         var rowReadyAtUtc = DateTime.MinValue;
-        var pickedCandidate = (MarketBuyCandidate?)null;
+        MarketBuyCandidate? pickedCandidate = null;
         var preBag = 0;
         var yesConfirmed = false;
         var yesReadyAtUtc = DateTime.MinValue;
@@ -419,33 +377,14 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                             chatGui.Print($"Magic Buy skipped {target.Name}: no listings on {ResolveCurrentWorldName()}.");
                         }
 
-                        TriggerDataCenterPriceHintAsync(target.ItemId, target.Name, missingNeeded);
+                        dcHintService.TriggerHintAsync(target.ItemId, target.Name, missingNeeded, EffectiveMaxGilPerPurchase);
                         ((AtkUnitBase*)resultAddon)->Close(true);
                         transactionQueue.Cancel(null, QueueBatchOutcome.Succeeded);
                         return false;
                     }
 
-                    if (!HasBagSpaceForPurchase(inv, candidate))
-                    {
-                        transactionQueue.Cancel("Stopped: inventory is full.", QueueBatchOutcome.AbortedOnError);
-                        return false;
-                    }
-
-                    if (!ValidateListingUnchanged(proxy, inv, candidate))
-                    {
-                        transactionQueue.Cancel("Listing changed before purchase.", QueueBatchOutcome.AbortedOnError);
-                        return false;
-                    }
-
                     pickedCandidate = candidate;
-                    preBag = HoldingsService.GetLiveBagCount(candidate.ItemId);
-                    yesConfirmed = false;
-                    yesReadyAtUtc = DateTime.MinValue;
-
-                    var args = stackalloc AtkValue[2];
-                    args[0] = NativeUiHelpers.IntValue(2);
-                    args[1] = NativeUiHelpers.IntValue(candidate.ListingIndex);
-                    return NativeUiHelpers.FireCallback((AtkUnitBase*)resultAddon, true, new ReadOnlySpan<AtkValue>(args, 2));
+                    return TryDispatchBuyListing(resultAddon, proxy, inv, candidate, out preBag, out yesConfirmed, out yesReadyAtUtc);
                 },
                 HasServerAck: () =>
                 {
@@ -520,12 +459,12 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
 
         if (IsAutoBuying)
         {
-            return new MagicSortButtonState(true, true, "Stop Buy", "Stop the active Magic Buy sequence.");
+            return MagicSortButtonState.Enabled("Stop Buy", "Stop the active Magic Buy sequence.");
         }
 
         if (transactionQueue.IsBusy)
         {
-            return new MagicSortButtonState(true, false, "Buying...", "Completing Market Board purchase...");
+            return MagicSortButtonState.Disabled("Buying...", "Completing Market Board purchase...");
         }
 
         var infoProxy = InfoProxyItemSearch.Instance();
@@ -544,9 +483,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         var cid = InventorySafetyEvaluator.GetCurrentContentId();
         if (configuration.GetRemainingMarketActionsToday(cid) <= 0)
         {
-            return new MagicSortButtonState(
-                true,
-                false,
+            return MagicSortButtonState.Disabled(
                 "Daily Limit",
                 $"Daily Market Board limit reached ({configuration.GetUsedMarketActionsToday(cid)}/{configuration.MarketDailyActionLimit}). Raise the limit in Settings or buy manually.");
         }
@@ -556,12 +493,10 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         {
             return string.IsNullOrEmpty(blockReason)
                 ? MagicSortButtonState.Hidden
-                : new MagicSortButtonState(true, false, "Buy Blocked", blockReason);
+                : MagicSortButtonState.Disabled("Buy Blocked", blockReason);
         }
 
-        return new MagicSortButtonState(
-            true,
-            true,
+        return MagicSortButtonState.Enabled(
             $"Magic Buy x{candidate.Quantity} ({candidate.TotalCost:N0}g)",
             $"Buy {candidate.ItemName} x{candidate.Quantity} for {candidate.TotalCost:N0}g ({candidate.UnitPrice:N0}g ea; need {missingNeeded}).");
     }
@@ -619,7 +554,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                 chatGui.Print($"Magic Buy: no listings for {itemName} on {ResolveCurrentWorldName()}.");
             }
 
-            TriggerDataCenterPriceHintAsync(baseItemId, itemName, missingNeeded);
+            dcHintService.TriggerHintAsync(baseItemId, itemName, missingNeeded, EffectiveMaxGilPerPurchase);
             return;
         }
 
@@ -641,26 +576,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                     return false;
                 }
 
-                if (!HasBagSpaceForPurchase(inv, captured))
-                {
-                    transactionQueue.Cancel("Stopped: inventory is full.", QueueBatchOutcome.AbortedOnError);
-                    return false;
-                }
-
-                if (!ValidateListingUnchanged(proxy, inv, captured))
-                {
-                    transactionQueue.Cancel("Listing changed before purchase.", QueueBatchOutcome.AbortedOnError);
-                    return false;
-                }
-
-                preBag = HoldingsService.GetLiveBagCount(captured.ItemId);
-                yesConfirmed = false;
-                yesReadyAtUtc = DateTime.MinValue;
-
-                var args = stackalloc AtkValue[2];
-                args[0] = NativeUiHelpers.IntValue(2);
-                args[1] = NativeUiHelpers.IntValue(captured.ListingIndex);
-                return NativeUiHelpers.FireCallback((AtkUnitBase*)resultAddon, true, new ReadOnlySpan<AtkValue>(args, 2));
+                return TryDispatchBuyListing(resultAddon, proxy, inv, captured, out preBag, out yesConfirmed, out yesReadyAtUtc);
             },
             HasServerAck: () => PollPurchaseConfirmationAndAck(captured, preBag, ref yesConfirmed, ref yesReadyAtUtc),
             PacingProfile.MarketListing,
@@ -673,6 +589,38 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
             isBuyBatchActive = false;
             chatGui.PrintError(reason);
         }
+    }
+
+    private bool TryDispatchBuyListing(
+        AddonItemSearchResult* resultAddon,
+        InfoProxyItemSearch* proxy,
+        InventoryManager* inv,
+        MarketBuyCandidate candidate,
+        out int preBag,
+        out bool yesConfirmed,
+        out DateTime yesReadyAtUtc)
+    {
+        preBag = 0;
+        yesConfirmed = false;
+        yesReadyAtUtc = DateTime.MinValue;
+
+        if (!HasBagSpaceForPurchase(inv, candidate))
+        {
+            transactionQueue.Cancel("Stopped: inventory is full.", QueueBatchOutcome.AbortedOnError);
+            return false;
+        }
+
+        if (!ValidateListingUnchanged(proxy, inv, candidate))
+        {
+            transactionQueue.Cancel("Listing changed before purchase.", QueueBatchOutcome.AbortedOnError);
+            return false;
+        }
+
+        preBag = HoldingsService.GetLiveBagCount(candidate.ItemId);
+        var args = stackalloc AtkValue[2];
+        args[0] = NativeUiHelpers.IntValue(2);
+        args[1] = NativeUiHelpers.IntValue(candidate.ListingIndex);
+        return NativeUiHelpers.FireCallback((AtkUnitBase*)resultAddon, true, new ReadOnlySpan<AtkValue>(args, 2));
     }
 
     private bool PollPurchaseConfirmationAndAck(
@@ -948,145 +896,6 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         ownRetainerIds = set;
     }
 
-    public static MarketBuyCandidate? SelectBestListing(
-        IReadOnlyList<MarketListingInput> listings,
-        uint baseItemId,
-        string itemName,
-        int missingNeeded,
-        ulong currentGil,
-        ulong maxGilPerPurchase,
-        double outlierMultiplier,
-        ulong histAnchorNq,
-        ulong histAnchorHq,
-        out string blockReason)
-    {
-        blockReason = string.Empty;
-        if (listings.Count == 0 || missingNeeded <= 0)
-        {
-            return null;
-        }
-
-        var nqPrices = new List<uint>(listings.Count);
-        var hqPrices = new List<uint>(listings.Count);
-        for (var i = 0; i < listings.Count; i++)
-        {
-            if (listings[i].IsHq) hqPrices.Add(listings[i].UnitPrice);
-            else nqPrices.Add(listings[i].UnitPrice);
-        }
-
-        static ulong MedianOf(List<uint> list)
-        {
-            if (list.Count == 0) return 0;
-            list.Sort();
-            return list[list.Count / 2];
-        }
-
-        var liveMedianNq = MedianOf(nqPrices);
-        var liveMedianHq = MedianOf(hqPrices);
-        var anchorNq = histAnchorNq > 0 ? histAnchorNq : (liveMedianNq > 0 ? liveMedianNq : liveMedianHq);
-        var anchorHq = histAnchorHq > 0 ? histAnchorHq : (liveMedianHq > 0 ? liveMedianHq : anchorNq);
-
-        var maxSafeUnitNq = Math.Max((ulong)(anchorNq * outlierMultiplier), anchorNq + MedianSlackGil);
-        var maxSafeUnitHq = Math.Max((ulong)(anchorHq * outlierMultiplier), anchorHq + MedianSlackGil);
-
-        MarketBuyCandidate? bestCovering = null;
-        var safePartials = new List<MarketBuyCandidate>();
-        var sawTooPricey = false;
-        var sawOutlier = false;
-
-        foreach (var l in listings)
-        {
-            var maxSafeUnit = l.IsHq ? maxSafeUnitHq : maxSafeUnitNq;
-            if (l.UnitPrice > maxSafeUnit)
-            {
-                sawOutlier = true;
-                continue;
-            }
-
-            if (l.TotalCost > maxGilPerPurchase || l.TotalCost > currentGil)
-            {
-                sawTooPricey = true;
-                continue;
-            }
-
-            var cand = new MarketBuyCandidate(l.ListingIndex, baseItemId, itemName, l.Quantity, l.UnitPrice, l.TotalCost, l.IsHq, l.RetainerId);
-            if (l.Quantity >= (uint)missingNeeded)
-            {
-                if (bestCovering == null
-                    || cand.TotalCost < bestCovering.TotalCost
-                    || (cand.TotalCost == bestCovering.TotalCost && cand.Quantity < bestCovering.Quantity))
-                {
-                    bestCovering = cand;
-                }
-            }
-            else
-            {
-                safePartials.Add(cand);
-            }
-        }
-
-        MarketBuyCandidate? bestPartial = null;
-        if (safePartials.Count > 0)
-        {
-            var cheapestPartialUnit = safePartials.Min(p => p.UnitPrice);
-            var nearCheapestCeiling = Math.Max((ulong)Math.Ceiling(cheapestPartialUnit * 1.15), cheapestPartialUnit + 25UL);
-            foreach (var p in safePartials)
-            {
-                if (p.UnitPrice > nearCheapestCeiling)
-                {
-                    continue;
-                }
-
-                if (bestPartial == null
-                    || p.Quantity > bestPartial.Quantity
-                    || (p.Quantity == bestPartial.Quantity && p.TotalCost < bestPartial.TotalCost))
-                {
-                    bestPartial = p;
-                }
-            }
-        }
-
-        if (bestCovering != null)
-        {
-            if (bestCovering.Quantity > (uint)missingNeeded)
-            {
-                var idealSubtotal = (ulong)bestCovering.UnitPrice * (ulong)missingNeeded;
-                var neededIdealCost = idealSubtotal + (idealSubtotal * 5UL / 100UL);
-                if (bestPartial != null
-                    && (ulong)bestCovering.TotalCost > Math.Max((ulong)(neededIdealCost * 1.5), neededIdealCost + 500UL))
-                {
-                    return bestPartial;
-                }
-
-                if (bestCovering.Quantity > (uint)Math.Max(missingNeeded * 5, missingNeeded + 10)
-                    && (ulong)bestCovering.TotalCost > Math.Max(neededIdealCost * 3UL, neededIdealCost + 2000UL))
-                {
-                    blockReason = $"Smallest stack (x{bestCovering.Quantity} for {bestCovering.TotalCost:N0}g) far exceeds needed x{missingNeeded}.";
-                    return null;
-                }
-            }
-
-            return bestCovering;
-        }
-
-        if (bestPartial != null)
-        {
-            return bestPartial;
-        }
-
-        if (sawTooPricey)
-        {
-            blockReason = $"Listings exceed the {maxGilPerPurchase:N0}g safety cap or your Gil.";
-        }
-        else if (sawOutlier)
-        {
-            var shownAnchor = anchorNq > 0 ? anchorNq : anchorHq;
-            blockReason = $"Listings exceed recent prices (~{shownAnchor:N0}g median), skipped.";
-        }
-
-        return null;
-    }
-
     private MarketBuyCandidate? PickBestListing(
         InfoProxyItemSearch* infoProxy,
         uint baseItemId,
@@ -1165,7 +974,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                 : (histSnap.MinPriceHq > 0 ? (ulong)histSnap.MinPriceHq : 0UL);
         }
 
-        return SelectBestListing(
+        return MarketBoardListingSelector.SelectBestListing(
             inputs,
             baseItemId,
             itemName,
@@ -1258,7 +1067,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                 continue;
             }
 
-            var btnText = NormalizeSearchRowText(NativeUiHelpers.ReadTextNodeValue(renderer->AtkComponentButton.ButtonTextNode));
+            var btnText = MarketBoardListingSelector.NormalizeSearchRowText(NativeUiHelpers.ReadTextNodeValue(renderer->AtkComponentButton.ButtonTextNode));
             if (string.Equals(btnText, cleanExpected, StringComparison.OrdinalIgnoreCase))
             {
                 return renderer->ListItemIndex;
@@ -1278,7 +1087,7 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
                     continue;
                 }
 
-                var text = NormalizeSearchRowText(NativeUiHelpers.ReadTextNodeValue(node->GetAsAtkTextNode()));
+                var text = MarketBoardListingSelector.NormalizeSearchRowText(NativeUiHelpers.ReadTextNodeValue(node->GetAsAtkTextNode()));
                 if (string.Equals(text, cleanExpected, StringComparison.OrdinalIgnoreCase))
                 {
                     return renderer->ListItemIndex;
@@ -1287,32 +1096,6 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         }
 
         return -1;
-    }
-
-    private static string NormalizeSearchRowText(string raw)
-    {
-        var normalized = NativeUiHelpers.NormalizeItemLabel(raw);
-        var openParen = normalized.LastIndexOf(" (", StringComparison.Ordinal);
-        if (openParen > 0 && normalized.EndsWith(')'))
-        {
-            var inner = normalized.AsSpan(openParen + 2, normalized.Length - openParen - 3);
-            var allDigits = inner.Length > 0;
-            for (var i = 0; i < inner.Length; i++)
-            {
-                if (!char.IsDigit(inner[i]))
-                {
-                    allDigits = false;
-                    break;
-                }
-            }
-
-            if (allDigits)
-            {
-                return normalized[..openParen].TrimEnd();
-            }
-        }
-
-        return normalized;
     }
 
     private bool DoesPurchaseConfirmMatch(
@@ -1329,95 +1112,10 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         }
 
         var prompt = NativeUiHelpers.ReadTextNodeValue(yesNo->PromptText);
-        if (string.IsNullOrEmpty(prompt))
-        {
-            return false;
-        }
-
-        var cleanName = NativeUiHelpers.NormalizeItemLabel(expectedName);
-        var nameMatches = prompt.Contains(cleanName, StringComparison.OrdinalIgnoreCase);
-        if (!nameMatches && quantity > 1 && baseItemId > 0)
-        {
-            var plural = dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId)?.Plural.ExtractText();
-            if (!string.IsNullOrWhiteSpace(plural))
-            {
-                nameMatches = prompt.Contains(NativeUiHelpers.NormalizeItemLabel(plural), StringComparison.OrdinalIgnoreCase);
-            }
-        }
-
-        if (!nameMatches)
-        {
-            return false;
-        }
-
-        var numbers = ExtractExactPromptNumbers(prompt);
-        if (quantity > 1 && !numbers.Contains(quantity))
-        {
-            return false;
-        }
-
-        var subtotal = (long)unitPrice * Math.Max(1u, quantity);
-        return numbers.Contains(expectedTotalCost) || numbers.Contains(subtotal);
-    }
-
-    public static HashSet<long> ExtractExactPromptNumbers(string prompt)
-    {
-        var numbers = new HashSet<long>();
-        var i = 0;
-        var len = prompt.Length;
-        while (i < len)
-        {
-            if (!char.IsAsciiDigit(prompt[i]))
-            {
-                i++;
-                continue;
-            }
-
-            long value = 0;
-            var overflow = false;
-            var j = i;
-            while (j < len)
-            {
-                var ch = prompt[j];
-                if (char.IsAsciiDigit(ch))
-                {
-                    var d = ch - '0';
-                    if (value > (long.MaxValue - d) / 10)
-                    {
-                        overflow = true;
-                    }
-                    else
-                    {
-                        value = value * 10 + d;
-                    }
-
-                    j++;
-                    continue;
-                }
-
-                if ((ch is ',' or '.' or ' ' or '\u00A0' or '\u202F')
-                    && j + 3 < len
-                    && char.IsAsciiDigit(prompt[j + 1])
-                    && char.IsAsciiDigit(prompt[j + 2])
-                    && char.IsAsciiDigit(prompt[j + 3])
-                    && (j + 4 >= len || !char.IsAsciiDigit(prompt[j + 4])))
-                {
-                    j++;
-                    continue;
-                }
-
-                break;
-            }
-
-            if (!overflow && value > 0)
-            {
-                numbers.Add(value);
-            }
-
-            i = j;
-        }
-
-        return numbers;
+        var plural = quantity > 1 && baseItemId > 0
+            ? dataManager.GetExcelSheet<Item>()?.GetRowOrDefault(baseItemId)?.Plural.ExtractText()
+            : null;
+        return MarketBoardListingSelector.DoesPurchaseConfirmPromptMatch(prompt, expectedName, plural, unitPrice, quantity, expectedTotalCost);
     }
 
     private static int SampleJitterMs(int minMs, int maxMs)
@@ -1427,148 +1125,12 @@ public sealed unsafe class MarketBoardBuyPlanner : IDisposable
         return (a + b) / 2;
     }
 
-    private void TriggerDataCenterPriceHintAsync(uint baseItemId, string itemName, int missingNeeded)
-    {
-        var now = DateTime.UtcNow;
-        if (lastDcHintUtcByItem.TryGetValue(baseItemId, out var lastHint)
-            && (now - lastHint).TotalSeconds < 30.0)
-        {
-            return;
-        }
-
-        var player = objectTable.LocalPlayer;
-        var worldRow = player?.CurrentWorld.ValueNullable;
-        var currentWorld = worldRow?.Name.ExtractText() ?? string.Empty;
-        var dcName = worldRow?.DataCenter.ValueNullable?.Name.ExtractText() ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(dcName) || string.IsNullOrWhiteSpace(currentWorld))
-        {
-            return;
-        }
-
-        var inv = InventoryManager.Instance();
-        var currentGil = inv != null ? (long)inv->GetGil() : 0L;
-        long currentWorldUnit = 0;
-        if (universalis.TryGetAnyCachedPrice(currentWorld, baseItemId, out var localSnap))
-        {
-            currentWorldUnit = localSnap.MinPriceNq > 0 ? localSnap.MinPriceNq : localSnap.MinPriceAny;
-        }
-
-        lastDcHintUtcByItem[baseItemId] = now;
-        var promptTravel = configuration.EnableLifestreamWorldHopPrompt && IsLifestreamLoaded();
-        MarketBoardDcHintHelper.DispatchHint(
-            universalis,
-            framework,
-            chatGui,
-            dcName,
-            currentWorld,
-            baseItemId,
-            itemName,
-            Math.Max(1, missingNeeded),
-            currentWorldUnit,
-            EffectiveMaxGilPerPurchase,
-            Math.Max(0, configuration.WorldHopMinSavingsGil),
-            currentGil,
-            promptTravel,
-            () => isDisposed,
-            onWorldHopOffer);
-    }
-
-    private bool IsLifestreamLoaded()
-    {
-        var now = DateTime.UtcNow;
-        if ((now - lastLifestreamCheckUtc).TotalSeconds < 15.0)
-        {
-            return cachedLifestreamLoaded;
-        }
-
-        lastLifestreamCheckUtc = now;
-        cachedLifestreamLoaded = false;
-        try
-        {
-            foreach (var p in pluginInterface.InstalledPlugins)
-            {
-                if (p.IsLoaded && string.Equals(p.InternalName, "Lifestream", StringComparison.OrdinalIgnoreCase))
-                {
-                    cachedLifestreamLoaded = true;
-                    break;
-                }
-            }
-        }
-        catch
-        {
-        }
-
-        return cachedLifestreamLoaded;
-    }
-
     public void Dispose()
     {
-        isDisposed = true;
+        dcHintService.Dispose();
         transactionQueue.BatchEnded -= OnTransactionBatchEnded;
         isBuyBatchActive = false;
         activeTarget = null;
         skippedUntilUtcByItem.Clear();
-        lastDcHintUtcByItem.Clear();
-    }
-}
-
-internal static class MarketBoardDcHintHelper
-{
-    public static void DispatchHint(
-        UniversalisClient universalis,
-        IFramework framework,
-        IChatGui chatGui,
-        string dcName,
-        string currentWorld,
-        uint baseItemId,
-        string itemName,
-        int missingNeeded,
-        long currentWorldUnitPrice,
-        long maxGilPerPurchase,
-        long minSavingsGil,
-        long currentGil,
-        bool promptTravel,
-        Func<bool> isDisposed,
-        Action<string, string, string, DcCheapestListing, int>? onWorldHopOffer)
-    {
-        _ = Task.Run(async () =>
-        {
-            var best = await universalis.FetchDataCenterCheapestAsync(dcName, baseItemId, excludeWorld: currentWorld).ConfigureAwait(false);
-            if (isDisposed())
-            {
-                return;
-            }
-
-            await framework.RunOnFrameworkThread(() =>
-            {
-                if (isDisposed())
-                {
-                    return;
-                }
-
-                if (best == null)
-                {
-                    chatGui.Print($"Magic Inventory: No other listings for {itemName} found across {dcName}.");
-                    return;
-                }
-
-                var hqTag = best.IsHq ? " HQ" : string.Empty;
-                var subtotal = (long)best.UnitPrice * Math.Max(1, best.Quantity);
-                var offerTotalWithTax = subtotal + (subtotal * 5L / 100L);
-                chatGui.Print(
-                    $"Magic Inventory ({dcName} hint): {itemName} cheapest on {best.WorldName} at {best.UnitPrice:N0}g ea x{best.Quantity}{hqTag} (~{offerTotalWithTax:N0}g incl. tax).");
-
-                if (promptTravel && onWorldHopOffer != null)
-                {
-                    var affordable = offerTotalWithTax <= maxGilPerPurchase && offerTotalWithTax <= currentGil;
-                    var savingsOk = currentWorldUnitPrice <= 0
-                        || (currentWorldUnitPrice - best.UnitPrice) * Math.Max(1, missingNeeded) >= minSavingsGil;
-                    if (affordable && savingsOk)
-                    {
-                        onWorldHopOffer(itemName, currentWorld, dcName, best, missingNeeded);
-                    }
-                }
-            }).ConfigureAwait(false);
-        });
     }
 }

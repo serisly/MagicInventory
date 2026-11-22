@@ -29,11 +29,11 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
     private string? hoveredRetainerSortAddon;
     private bool glamourListHovered;
 
-    private readonly Dictionary<string, IReadOnlyList<string?>> contextSubmenusByTitle = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, IReadOnlyList<RouteFilter?>> contextSubmenusByTitle = new(StringComparer.OrdinalIgnoreCase);
     private string? activeContextSubmenuTitle;
-    private IReadOnlyList<string?>? activeContextRouteFilters;
+    private IReadOnlyList<RouteFilter?>? activeContextRouteFilters;
     private DateTime contextSubmenuArmedUtc = DateTime.MinValue;
-    private string? lastResolvedContextFilter;
+    private RouteFilter? lastResolvedContextFilter;
 
     private DateTime lastCacheUtc = DateTime.MinValue;
     private readonly Dictionary<(string AddonName, uint NodeId), SlotBadge> cachedBadges = new();
@@ -117,7 +117,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         }
     }
 
-    public void SetActiveContextSubmenuRoutes(string? submenuTitle, IReadOnlyList<string?>? routeFiltersByIndex)
+    public void SetActiveContextSubmenuRoutes(string? submenuTitle, IReadOnlyList<RouteFilter?>? routeFiltersByIndex)
     {
         if (routeFiltersByIndex == null || routeFiltersByIndex.Count == 0)
         {
@@ -130,7 +130,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             }
             else
             {
-                var empty = Array.Empty<string?>();
+                var empty = Array.Empty<RouteFilter?>();
                 activeContextSubmenuTitle = submenuTitle;
                 activeContextRouteFilters = empty;
                 contextSubmenusByTitle[submenuTitle] = empty;
@@ -193,7 +193,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         }
 
         var now = DateTime.UtcNow;
-        var contextChanged = hasContextHover && !string.Equals(contextRouteFilter, lastResolvedContextFilter, StringComparison.OrdinalIgnoreCase);
+        var contextChanged = hasContextHover && contextRouteFilter != lastResolvedContextFilter;
         var pollMs = hasContextHover ? 60.0 : 200.0;
         if (contextChanged || (now - lastCacheUtc).TotalMilliseconds >= pollMs)
         {
@@ -306,7 +306,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         }
     }
 
-    private void RebuildBadges(string? contextRouteFilter)
+    private void RebuildBadges(RouteFilter? contextRouteFilter)
     {
         cachedBadges.Clear();
         var manager = InventoryManager.Instance();
@@ -330,18 +330,16 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             return;
         }
 
-        if (!string.IsNullOrEmpty(contextRouteFilter))
+        if (contextRouteFilter.HasValue)
         {
+            var filter = contextRouteFilter.Value;
             magicSort.GetSlotsMatchingRouteFilter(
-                contextRouteFilter,
+                filter,
                 out var ctxPlayerSlots,
                 out var ctxRetainerSlots,
                 out var ctxArmourySlots);
-            var routeName = contextRouteFilter.StartsWith("Retainer:", StringComparison.OrdinalIgnoreCase)
-                ? "Retainer"
-                : contextRouteFilter;
-            var col = RoutePresentation.GetRouteColor(routeName);
-            var badgeLabel = RoutePresentation.GetShortBadgeLabel(routeName, string.Empty);
+            var col = filter.MatchAnySell ? ColorSellHighlight : RoutePresentation.GetRouteColor(filter.Route);
+            var badgeLabel = filter.MatchAnySell ? string.Empty : RoutePresentation.GetShortBadgeLabel(filter.Route, string.Empty);
 
             foreach (var vs in visualSlotScratch)
             {
@@ -478,7 +476,7 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         }
 
         var r = resolved.Value;
-        var shortLabel = inRetainer && string.Equals(r.Route, "Keep", StringComparison.OrdinalIgnoreCase)
+        var shortLabel = inRetainer && r.Route.IsKeep
             ? "Keep"
             : RoutePresentation.GetShortBadgeLabel(r.Route, r.TargetRetainerName);
         if (string.IsNullOrEmpty(shortLabel))
@@ -486,15 +484,15 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
             shortLabel = fallbackLabel;
         }
 
-        var color = inRetainer && string.Equals(r.Route, "Keep", StringComparison.OrdinalIgnoreCase)
+        var color = inRetainer && r.Route.IsKeep
             ? RoutePresentation.ColorTracked
             : RoutePresentation.GetRouteColor(r.Route);
         return new SlotBadge(shortLabel, color);
     }
 
-    private bool TryResolveHoveredContextMenuRouteFilter(out string routeFilter)
+    private bool TryResolveHoveredContextMenuRouteFilter(out RouteFilter routeFilter)
     {
-        routeFilter = string.Empty;
+        routeFilter = default;
         var routes = activeContextRouteFilters;
         if (routes == null && contextSubmenusByTitle.Count == 0)
         {
@@ -620,12 +618,12 @@ public sealed unsafe class InventoryRouteOverlay : IDisposable
         }
 
         var matched = routes[hoveredIdx];
-        if (string.IsNullOrWhiteSpace(matched))
+        if (!matched.HasValue)
         {
             return false;
         }
 
-        routeFilter = matched;
+        routeFilter = matched.Value;
         return true;
     }
 

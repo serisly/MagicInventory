@@ -85,7 +85,7 @@ public sealed unsafe class UseItemsPlanner
                 }
 
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Use", StringComparison.OrdinalIgnoreCase))
+                    || entry.Route.Kind != RouteKind.Use)
                 {
                     continue;
                 }
@@ -97,7 +97,7 @@ public sealed unsafe class UseItemsPlanner
                 }
 
                 var effRoute = safety.ResolveEffectiveSlotRoute(entry, itemRow.Value, slot, manifestEntries, gearsetIds, unlockedProfile);
-                if (!string.Equals(effRoute, "Use", StringComparison.OrdinalIgnoreCase))
+                if (effRoute?.Kind != RouteKind.Use)
                 {
                     continue;
                 }

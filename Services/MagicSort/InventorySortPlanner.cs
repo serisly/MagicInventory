@@ -193,7 +193,7 @@ public sealed unsafe class InventorySortPlanner
                         unlockedProfile,
                         includeBagToArmouryRoute: false,
                         missingTracked: missingTracked);
-                    if (!resolved.HasValue || resolved.Value.Route is not ("Market" or "Vendor" or "Retainer"))
+                    if (!resolved.HasValue || resolved.Value.Route.Kind is not (RouteKind.Market or RouteKind.Vendor or RouteKind.Retainer))
                     {
                         continue;
                     }
@@ -272,7 +272,7 @@ public sealed unsafe class InventorySortPlanner
                         unlockedProfile,
                         includeBagToArmouryRoute: true,
                         missingTracked: missingTracked);
-                    if (!resolved.HasValue || !string.Equals(resolved.Value.Route, "Armoury", StringComparison.OrdinalIgnoreCase))
+                    if (!resolved.HasValue || resolved.Value.Route.Kind != RouteKind.Armoury)
                     {
                         continue;
                     }

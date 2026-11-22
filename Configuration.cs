@@ -1,5 +1,6 @@
 using Dalamud.Configuration;
 using Dalamud.Plugin;
+using MagicInventory.Core;
 
 namespace MagicInventory;
 
@@ -137,6 +138,13 @@ public sealed class Configuration : IPluginConfiguration
 
         return GetOrCreateCharacter(contentId).ManualRouteOverrides.TryGetValue(baseItemId, out routeSpec!)
             && !string.IsNullOrWhiteSpace(routeSpec);
+    }
+
+    public bool TryGetManualRoute(ulong contentId, uint baseItemId, out ItemRoute route)
+    {
+        route = default;
+        return TryGetManualRouteOverride(contentId, baseItemId, out var spec)
+            && ItemRoute.TryParse(spec, out route);
     }
 
     public int GetMarketListingPriority(ulong contentId, uint baseItemId)

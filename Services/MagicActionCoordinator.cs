@@ -40,30 +40,6 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
     private const uint GlamourDresserCanonicalEObjId = 2009439;
     private const uint MarketBoardCanonicalEObjId = 2000402;
 
-    private readonly IFramework framework;
-    private readonly IClientState clientState;
-    private readonly IObjectTable objectTable;
-    private readonly ICondition condition;
-    private readonly IDataManager dataManager;
-    private readonly IGameGui gameGui;
-    private readonly IChatGui chatGui;
-    private readonly SafeTransactionQueue transactionQueue;
-    private readonly MagicSortService magicSort;
-    private readonly BellSweepService bellSweep;
-    private readonly MarketBoardBuyPlanner marketBoardBuy;
-    private readonly MaterialTrackerService materialTracker;
-
-    private readonly HashSet<uint> summoningBellIds;
-    private readonly HashSet<uint> armoireIds;
-    private readonly HashSet<uint> glamourDresserIds;
-    private readonly HashSet<uint> marketBoardIds;
-    private readonly string summoningBellLocalizedName;
-    private readonly string armoireLocalizedName;
-    private readonly string glamourDresserLocalizedName;
-    private readonly string marketBoardLocalizedName;
-
-    private PendingStationRequest? pendingStation;
-
     private enum StationKind
     {
         SummoningBell,
@@ -87,6 +63,49 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         public bool ClickedSubMenu { get; set; }
         public bool SwitchedGcTab { get; set; }
     }
+
+    private sealed record OpenStationDispatch(
+        MagicActionIntent Intent,
+        string[] Addons,
+        System.Action Dispatch);
+
+    private sealed record EObjStationRule(
+        StationKind Kind,
+        Func<MagicActionIntent, bool> MatchesIntent,
+        HashSet<uint> Ids,
+        string LocalizedName);
+
+    private sealed class StationDescriptor
+    {
+        public required StationKind Kind { get; init; }
+        public required string ReadyAddon { get; init; }
+        public required Action<PendingStationRequest, DateTime> OnReady { get; init; }
+        public bool AdvanceTalk { get; init; }
+        public Func<PendingStationRequest, string>? FormatTalkTimeout { get; init; }
+        public Func<string, bool>? SubMenuMatcher { get; init; }
+        public bool IncludeIconSelectMenu { get; init; }
+        public Func<PendingStationRequest, string>? FormatSubMenuFallback { get; init; }
+        public Action<PendingStationRequest, DateTime>? OnPendingTick { get; init; }
+    }
+
+    private readonly IFramework framework;
+    private readonly IClientState clientState;
+    private readonly IObjectTable objectTable;
+    private readonly ICondition condition;
+    private readonly IDataManager dataManager;
+    private readonly IGameGui gameGui;
+    private readonly IChatGui chatGui;
+    private readonly SafeTransactionQueue transactionQueue;
+    private readonly MagicSortService magicSort;
+    private readonly BellSweepService bellSweep;
+    private readonly MarketBoardBuyPlanner marketBoardBuy;
+    private readonly MaterialTrackerService materialTracker;
+
+    private readonly EObjStationRule[] eobjStationRules;
+    private readonly OpenStationDispatch[] openStationDispatches;
+    private readonly Dictionary<StationKind, StationDescriptor> stationDescriptors;
+
+    private PendingStationRequest? pendingStation;
 
     public MagicActionCoordinator(
         IFramework framework,
@@ -115,10 +134,16 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         this.marketBoardBuy = marketBoardBuy;
         this.materialTracker = materialTracker;
 
-        (summoningBellIds, summoningBellLocalizedName) = BuildEObjStationLookup(dataManager, SummoningBellCanonicalEObjId, "Summoning Bell");
-        (armoireIds, armoireLocalizedName) = BuildEObjStationLookup(dataManager, ArmoireCanonicalEObjId, "Armoire");
-        (glamourDresserIds, glamourDresserLocalizedName) = BuildEObjStationLookup(dataManager, GlamourDresserCanonicalEObjId, "Glamour Dresser");
-        (marketBoardIds, marketBoardLocalizedName) = BuildEObjStationLookup(dataManager, MarketBoardCanonicalEObjId, "Market Board");
+        eobjStationRules =
+        [
+            BuildEObjRule(dataManager, StationKind.SummoningBell, static i => i is MagicActionIntent.Sort or MagicActionIntent.Sell, SummoningBellCanonicalEObjId, "Summoning Bell"),
+            BuildEObjRule(dataManager, StationKind.Armoire, static i => i == MagicActionIntent.Sort, ArmoireCanonicalEObjId, "Armoire"),
+            BuildEObjRule(dataManager, StationKind.GlamourDresser, static i => i == MagicActionIntent.Sort, GlamourDresserCanonicalEObjId, "Glamour Dresser"),
+            BuildEObjRule(dataManager, StationKind.MarketBoard, static i => i == MagicActionIntent.Buy, MarketBoardCanonicalEObjId, "Market Board"),
+        ];
+
+        openStationDispatches = BuildOpenStationDispatches();
+        stationDescriptors = BuildStationDescriptors();
 
         this.magicSort.IsOrchestratorActive = () => IsAnyOrchestratorActive;
         this.magicSort.OnUserStopRequested = () => StopAll("Stopped.");
@@ -173,7 +198,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
         if (intent == MagicActionIntent.Use)
         {
-            magicSort.ExecuteUseAll();
+            magicSort.ExecuteAction(StationActionId.UseAll);
             return;
         }
 
@@ -196,7 +221,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                     || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Inventory")
                     || magicSort.CountInventorySortMoves() > 0))
             {
-                magicSort.ExecuteInventorySort();
+                magicSort.ExecuteAction(StationActionId.InventorySort);
                 return;
             }
 
@@ -226,89 +251,157 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         };
     }
 
+    private OpenStationDispatch[] BuildOpenStationDispatches() =>
+    [
+        new(MagicActionIntent.Sort, ["RetainerList"], () => bellSweep.StartBellSweep(marketSellOnly: false)),
+        new(MagicActionIntent.Sort, ["InventoryRetainerLarge", "InventoryRetainer"], () => magicSort.ExecuteAction(StationActionId.RetainerSort)),
+        new(MagicActionIntent.Sort, ["Materialize"], () => magicSort.ExecuteAction(StationActionId.MateriaExtract)),
+        new(MagicActionIntent.Sort, ["Cabinet"], () => magicSort.ExecuteAction(StationActionId.ArmoireStore)),
+        new(MagicActionIntent.Sort, ["MiragePrismPrismBoxCrystallize"], () => magicSort.ExecuteAction(StationActionId.GlamourStore)),
+        new(MagicActionIntent.Sell, ["RetainerSellList"], () => magicSort.ExecuteAction(StationActionId.MarketSell)),
+        new(MagicActionIntent.Sell, ["RetainerList"], () => bellSweep.StartBellSweep(marketSellOnly: true)),
+        new(MagicActionIntent.Sell, ["Shop"], () => magicSort.ExecuteAction(StationActionId.VendorSell)),
+        new(MagicActionIntent.Sell, ["GrandCompanySupplyList"], () => magicSort.ExecuteAction(StationActionId.GrandCompany)),
+        new(MagicActionIntent.Buy, ["ItemSearchResult"], () => marketBoardBuy.ExecuteBuyBestListing()),
+        new(MagicActionIntent.Buy, ["ItemSearch"], () => marketBoardBuy.ToggleAutoBuy()),
+    ];
+
+    private Dictionary<StationKind, StationDescriptor> BuildStationDescriptors()
+    {
+        var descriptors = new StationDescriptor[]
+        {
+            new()
+            {
+                Kind = StationKind.SummoningBell,
+                ReadyAddon = "RetainerList",
+                OnReady = (req, _) =>
+                {
+                    pendingStation = null;
+                    bellSweep.StartBellSweep(marketSellOnly: req.Intent == MagicActionIntent.Sell);
+                },
+            },
+            new()
+            {
+                Kind = StationKind.Armoire,
+                ReadyAddon = "Cabinet",
+                OnReady = (_, _) =>
+                {
+                    pendingStation = null;
+                    magicSort.ExecuteAction(StationActionId.ArmoireStore);
+                },
+                SubMenuMatcher = MatchesArmoirePlaceMenu,
+                FormatSubMenuFallback = static _ => "Select 'Place items in the armoire' and click Magic Store.",
+            },
+            new()
+            {
+                Kind = StationKind.GlamourDresser,
+                ReadyAddon = "MiragePrismPrismBoxCrystallize",
+                OnReady = (_, _) =>
+                {
+                    pendingStation = null;
+                    magicSort.ExecuteAction(StationActionId.GlamourStore);
+                },
+                OnPendingTick = (req, now) =>
+                {
+                    if (!NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBox"))
+                    {
+                        return;
+                    }
+
+                    if (req.PrismBoxSeenUtc == DateTime.MinValue)
+                    {
+                        req.PrismBoxSeenUtc = now;
+                    }
+                    else if ((now - req.PrismBoxSeenUtc).TotalSeconds >= GlamourCrystallizeSettleGraceSeconds)
+                    {
+                        pendingStation = null;
+                        chatGui.Print("Open the Glamour Creation list inside the Glamour Dresser, then click Magic Store.");
+                    }
+                },
+            },
+            new()
+            {
+                Kind = StationKind.MarketBoard,
+                ReadyAddon = "ItemSearch",
+                OnReady = (_, _) =>
+                {
+                    pendingStation = null;
+                    marketBoardBuy.ToggleAutoBuy();
+                },
+            },
+            new()
+            {
+                Kind = StationKind.VendorNpc,
+                ReadyAddon = "Shop",
+                OnReady = (_, _) =>
+                {
+                    pendingStation = null;
+                    magicSort.ExecuteAction(StationActionId.VendorSell);
+                },
+                AdvanceTalk = true,
+                FormatTalkTimeout = static req => $"Stopped: {req.StationName} dialogue did not open a shop window.",
+                SubMenuMatcher = MatchesShopSubMenu,
+                IncludeIconSelectMenu = true,
+                FormatSubMenuFallback = static req => $"{req.StationName} has multiple menus. Open a shop window, then click Magic Sell.",
+            },
+            new()
+            {
+                Kind = StationKind.GrandCompanyNpc,
+                ReadyAddon = "GrandCompanySupplyList",
+                OnReady = (req, now) =>
+                {
+                    var gcAddon = (AddonGrandCompanySupplyList*)NativeUiHelpers.GetReadyAddon(gameGui, "GrandCompanySupplyList");
+                    if (gcAddon != null && gcAddon->SelectedTab != 2)
+                    {
+                        if (req.SwitchedGcTab)
+                        {
+                            pendingStation = null;
+                            chatGui.Print("Expert Delivery tab is unavailable or locked on this character.");
+                        }
+                        else
+                        {
+                            req.SwitchedGcTab = true;
+                            magicSort.ExecuteAction(StationActionId.GrandCompany, fromOrchestrator: true);
+                            req.ReadyAtUtc = DateTime.MinValue;
+                            req.StartedUtc = now;
+                        }
+                    }
+                    else
+                    {
+                        pendingStation = null;
+                        magicSort.ExecuteAction(StationActionId.GrandCompany);
+                    }
+                },
+                AdvanceTalk = true,
+                FormatTalkTimeout = static _ => "Stopped: Grand Company dialogue did not open supply menu.",
+                SubMenuMatcher = MatchesGcSupplyMenu,
+                FormatSubMenuFallback = static _ => "Open the Grand Company Expert Delivery tab, then click Magic Sell.",
+            },
+        };
+
+        return descriptors.ToDictionary(static d => d.Kind);
+    }
+
     private bool TryDispatchOpenStation(MagicActionIntent intent)
     {
-        switch (intent)
+        foreach (var entry in openStationDispatches)
         {
-            case MagicActionIntent.Sort:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerList"))
+            if (entry.Intent != intent)
+            {
+                continue;
+            }
+
+            foreach (var addon in entry.Addons)
+            {
+                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, addon))
                 {
-                    bellSweep.StartBellSweep(marketSellOnly: false);
+                    entry.Dispatch();
                     return true;
                 }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainerLarge")
-                    || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "InventoryRetainer"))
-                {
-                    magicSort.ExecuteRetainerSort();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Materialize"))
-                {
-                    magicSort.ExecuteMateriaExtractSort();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
-                {
-                    magicSort.ExecuteArmoireStore();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
-                {
-                    magicSort.ExecuteGlamourDresserStore();
-                    return true;
-                }
-
-                return false;
-
-            case MagicActionIntent.Sell:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerSellList"))
-                {
-                    magicSort.ExecuteMarketSort();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerList"))
-                {
-                    bellSweep.StartBellSweep(marketSellOnly: true);
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Shop"))
-                {
-                    magicSort.ExecuteVendorSort();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyList"))
-                {
-                    magicSort.ExecuteGrandCompanySort();
-                    return true;
-                }
-
-                return false;
-
-            case MagicActionIntent.Buy:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearchResult"))
-                {
-                    marketBoardBuy.ExecuteBuyBestListing();
-                    return true;
-                }
-
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearch"))
-                {
-                    marketBoardBuy.ToggleAutoBuy();
-                    return true;
-                }
-
-                return false;
-
-            default:
-                return false;
+            }
         }
+
+        return false;
     }
 
     private void OnFrameworkUpdate(IFramework _)
@@ -347,199 +440,66 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             return;
         }
 
-        switch (req.Station)
+        if (!stationDescriptors.TryGetValue(req.Station, out var descriptor))
         {
-            case StationKind.SummoningBell:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "RetainerList"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        pendingStation = null;
-                        bellSweep.StartBellSweep(marketSellOnly: req.Intent == MagicActionIntent.Sell);
-                    }
-                }
-
-                break;
-
-            case StationKind.Armoire:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Cabinet"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        pendingStation = null;
-                        magicSort.ExecuteArmoireStore();
-                    }
-                }
-                else if (!req.ClickedSubMenu && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        if (TryClickArmoirePlaceMenuEntry())
-                        {
-                            req.ClickedSubMenu = true;
-                            req.ReadyAtUtc = DateTime.MinValue;
-                            req.StartedUtc = now;
-                        }
-                        else
-                        {
-                            pendingStation = null;
-                            chatGui.Print("Select 'Place items in the armoire' and click Magic Store.");
-                        }
-                    }
-                }
-
-                break;
-
-            case StationKind.GlamourDresser:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBoxCrystallize"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        pendingStation = null;
-                        magicSort.ExecuteGlamourDresserStore();
-                    }
-                }
-                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "MiragePrismPrismBox"))
-                {
-                    if (req.PrismBoxSeenUtc == DateTime.MinValue)
-                    {
-                        req.PrismBoxSeenUtc = now;
-                    }
-                    else if ((now - req.PrismBoxSeenUtc).TotalSeconds >= GlamourCrystallizeSettleGraceSeconds)
-                    {
-                        pendingStation = null;
-                        chatGui.Print("Open the Glamour Creation list inside the Glamour Dresser, then click Magic Store.");
-                    }
-                }
-
-                break;
-
-            case StationKind.MarketBoard:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "ItemSearch"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        pendingStation = null;
-                        marketBoardBuy.ToggleAutoBuy();
-                    }
-                }
-
-                break;
-
-            case StationKind.VendorNpc:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Shop"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        pendingStation = null;
-                        magicSort.ExecuteVendorSort();
-                    }
-                }
-                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Talk"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        if (req.TalkAdvances >= MaxTalkAdvances)
-                        {
-                            pendingStation = null;
-                            chatGui.Print($"Stopped: {req.StationName} dialogue did not open a shop window.");
-                        }
-                        else
-                        {
-                            req.TalkAdvances++;
-                            TryAdvanceTalkDialog();
-                            req.ReadyAtUtc = DateTime.MinValue;
-                        }
-                    }
-                }
-                else if (!req.ClickedSubMenu
-                    && (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectIconString")
-                        || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString")))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        if (TryClickShopPurchaseSubMenu())
-                        {
-                            req.ClickedSubMenu = true;
-                            req.ReadyAtUtc = DateTime.MinValue;
-                            req.StartedUtc = now;
-                        }
-                        else
-                        {
-                            pendingStation = null;
-                            chatGui.Print($"{req.StationName} has multiple menus. Open a shop window, then click Magic Sell.");
-                        }
-                    }
-                }
-
-                break;
-
-            case StationKind.GrandCompanyNpc:
-                if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "GrandCompanySupplyList"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        var gcAddon = (FFXIVClientStructs.FFXIV.Client.UI.AddonGrandCompanySupplyList*)NativeUiHelpers.GetReadyAddon(gameGui, "GrandCompanySupplyList");
-                        if (gcAddon != null && gcAddon->SelectedTab != 2)
-                        {
-                            if (req.SwitchedGcTab)
-                            {
-                                pendingStation = null;
-                                chatGui.Print("Expert Delivery tab is unavailable or locked on this character.");
-                            }
-                            else
-                            {
-                                req.SwitchedGcTab = true;
-                                magicSort.ExecuteGrandCompanySort();
-                                req.ReadyAtUtc = DateTime.MinValue;
-                                req.StartedUtc = now;
-                            }
-                        }
-                        else
-                        {
-                            pendingStation = null;
-                            magicSort.ExecuteGrandCompanySort();
-                        }
-                    }
-                }
-                else if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Talk"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        if (req.TalkAdvances >= MaxTalkAdvances)
-                        {
-                            pendingStation = null;
-                            chatGui.Print("Stopped: Grand Company dialogue did not open supply menu.");
-                        }
-                        else
-                        {
-                            req.TalkAdvances++;
-                            TryAdvanceTalkDialog();
-                            req.ReadyAtUtc = DateTime.MinValue;
-                        }
-                    }
-                }
-                else if (!req.ClickedSubMenu
-                    && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString"))
-                {
-                    if (WaitHumanBeat(req, now))
-                    {
-                        if (TryClickGcSupplyMenuEntry())
-                        {
-                            req.ClickedSubMenu = true;
-                            req.ReadyAtUtc = DateTime.MinValue;
-                            req.StartedUtc = now;
-                        }
-                        else
-                        {
-                            pendingStation = null;
-                            chatGui.Print("Open the Grand Company Expert Delivery tab, then click Magic Sell.");
-                        }
-                    }
-                }
-
-                break;
+            pendingStation = null;
+            return;
         }
+
+        if (NativeUiHelpers.IsAddonOpenAndReady(gameGui, descriptor.ReadyAddon))
+        {
+            if (WaitHumanBeat(req, now))
+            {
+                descriptor.OnReady(req, now);
+            }
+
+            return;
+        }
+
+        if (descriptor.AdvanceTalk && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "Talk"))
+        {
+            if (WaitHumanBeat(req, now))
+            {
+                if (req.TalkAdvances >= MaxTalkAdvances)
+                {
+                    pendingStation = null;
+                    chatGui.Print(descriptor.FormatTalkTimeout!(req));
+                }
+                else
+                {
+                    req.TalkAdvances++;
+                    TryAdvanceTalkDialog();
+                    req.ReadyAtUtc = DateTime.MinValue;
+                }
+            }
+
+            return;
+        }
+
+        if (descriptor.SubMenuMatcher != null
+            && !req.ClickedSubMenu
+            && ((descriptor.IncludeIconSelectMenu && NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectIconString"))
+                || NativeUiHelpers.IsAddonOpenAndReady(gameGui, "SelectString")))
+        {
+            if (WaitHumanBeat(req, now))
+            {
+                if (TryClickPopupMenuEntry(descriptor.SubMenuMatcher, descriptor.IncludeIconSelectMenu))
+                {
+                    req.ClickedSubMenu = true;
+                    req.ReadyAtUtc = DateTime.MinValue;
+                    req.StartedUtc = now;
+                }
+                else
+                {
+                    pendingStation = null;
+                    chatGui.Print(descriptor.FormatSubMenuFallback!(req));
+                }
+            }
+
+            return;
+        }
+
+        descriptor.OnPendingTick?.Invoke(req, now);
     }
 
     private static bool WaitHumanBeat(PendingStationRequest req, DateTime now)
@@ -566,7 +526,7 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         return NativeUiHelpers.FireCallback(talk, true, new ReadOnlySpan<AtkValue>(args, 1));
     }
 
-    private static bool MatchesShopSubMenu(string text)
+    internal static bool MatchesShopSubMenu(string text)
     {
         if (string.IsNullOrWhiteSpace(text)
             || text.Contains("Buyback", StringComparison.OrdinalIgnoreCase)
@@ -585,114 +545,58 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
             || text.Contains("購入", StringComparison.Ordinal);
     }
 
-    private bool TryClickShopPurchaseSubMenu()
-    {
-        var iconSelect = (AddonSelectIconString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectIconString");
-        if (iconSelect != null && iconSelect->PopupMenu.EntryNames != null)
-        {
-            var count = iconSelect->PopupMenu.EntryCount;
-            for (var i = 0; i < count; i++)
-            {
-                var ptr = iconSelect->PopupMenu.EntryNames[i].Value;
-                if (ptr == null)
-                {
-                    continue;
-                }
+    internal static bool MatchesArmoirePlaceMenu(string text)
+        => !string.IsNullOrWhiteSpace(text)
+            && (text.Contains("Place items in the armoire", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Place", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("einlagern", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Déposer", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("しまう", StringComparison.Ordinal));
 
-                var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-                if (MatchesShopSubMenu(text))
-                {
-                    var args = stackalloc AtkValue[1];
-                    args[0] = NativeUiHelpers.IntValue(i);
-                    return NativeUiHelpers.FireCallback((AtkUnitBase*)iconSelect, true, new ReadOnlySpan<AtkValue>(args, 1));
-                }
+    internal static bool MatchesGcSupplyMenu(string text)
+        => !string.IsNullOrWhiteSpace(text)
+            && (text.Contains("supply and provisioning", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("Liefereinsätze", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("ravitaillement", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("調達任務", StringComparison.Ordinal));
+
+    private bool TryClickPopupMenuEntry(Func<string, bool> matchesEntry, bool includeIconSelect = false)
+    {
+        if (includeIconSelect)
+        {
+            var iconSelect = (AddonSelectIconString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectIconString");
+            if (iconSelect != null && TryClickPopupMenu((AtkUnitBase*)iconSelect, &iconSelect->PopupMenu.PopupMenu, matchesEntry))
+            {
+                return true;
             }
         }
 
         var strSelect = (AddonSelectString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectString");
-        if (strSelect != null && strSelect->PopupMenu.EntryNames != null)
-        {
-            var count = strSelect->PopupMenu.EntryCount;
-            for (var i = 0; i < count; i++)
-            {
-                var ptr = strSelect->PopupMenu.EntryNames[i].Value;
-                if (ptr == null)
-                {
-                    continue;
-                }
-
-                var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-                if (MatchesShopSubMenu(text))
-                {
-                    var args = stackalloc AtkValue[1];
-                    args[0] = NativeUiHelpers.IntValue(i);
-                    return NativeUiHelpers.FireCallback((AtkUnitBase*)strSelect, true, new ReadOnlySpan<AtkValue>(args, 1));
-                }
-            }
-        }
-
-        return false;
+        return strSelect != null && TryClickPopupMenu((AtkUnitBase*)strSelect, &strSelect->PopupMenu.PopupMenu, matchesEntry);
     }
 
-    private bool TryClickArmoirePlaceMenuEntry()
+    private static bool TryClickPopupMenu(AtkUnitBase* addon, PopupMenu* menu, Func<string, bool> matchesEntry)
     {
-        var selectAddon = (AddonSelectString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectString");
-        if (selectAddon == null || selectAddon->PopupMenu.EntryNames == null)
+        if (menu == null || menu->EntryNames == null)
         {
             return false;
         }
 
-        var count = selectAddon->PopupMenu.EntryCount;
+        var count = menu->EntryCount;
         for (var i = 0; i < count; i++)
         {
-            var ptr = selectAddon->PopupMenu.EntryNames[i].Value;
+            var ptr = menu->EntryNames[i].Value;
             if (ptr == null)
             {
                 continue;
             }
 
             var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-            if (text.Contains("Place items in the armoire", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("Place", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("einlagern", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("Déposer", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("しまう", StringComparison.Ordinal))
+            if (matchesEntry(text))
             {
                 var args = stackalloc AtkValue[1];
                 args[0] = NativeUiHelpers.IntValue(i);
-                return NativeUiHelpers.FireCallback((AtkUnitBase*)selectAddon, true, new ReadOnlySpan<AtkValue>(args, 1));
-            }
-        }
-
-        return false;
-    }
-
-    private bool TryClickGcSupplyMenuEntry()
-    {
-        var selectAddon = (AddonSelectString*)NativeUiHelpers.GetReadyAddon(gameGui, "SelectString");
-        if (selectAddon == null || selectAddon->PopupMenu.EntryNames == null)
-        {
-            return false;
-        }
-
-        var count = selectAddon->PopupMenu.EntryCount;
-        for (var i = 0; i < count; i++)
-        {
-            var ptr = selectAddon->PopupMenu.EntryNames[i].Value;
-            if (ptr == null)
-            {
-                continue;
-            }
-
-            var text = MemoryHelper.ReadSeStringNullTerminated((nint)ptr).TextValue.Trim();
-            if (text.Contains("supply and provisioning", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("Liefereinsätze", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("ravitaillement", StringComparison.OrdinalIgnoreCase)
-                || text.Contains("調達任務", StringComparison.Ordinal))
-            {
-                var args = stackalloc AtkValue[1];
-                args[0] = NativeUiHelpers.IntValue(i);
-                return NativeUiHelpers.FireCallback((AtkUnitBase*)selectAddon, true, new ReadOnlySpan<AtkValue>(args, 1));
+                return NativeUiHelpers.FireCallback(addon, true, new ReadOnlySpan<AtkValue>(args, 1));
             }
         }
 
@@ -816,40 +720,16 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
 
         if (obj.ObjectKind == ObjectKind.EventObj)
         {
-            if ((intent is MagicActionIntent.Sort or MagicActionIntent.Sell)
-                && (summoningBellIds.Contains(obj.BaseId)
-                    || string.Equals(name, summoningBellLocalizedName, StringComparison.OrdinalIgnoreCase)))
+            foreach (var rule in eobjStationRules)
             {
-                kind = StationKind.SummoningBell;
-                maxRange = EventObjectInteractRangeYalms;
-                return true;
-            }
-
-            if (intent == MagicActionIntent.Sort
-                && (armoireIds.Contains(obj.BaseId)
-                    || string.Equals(name, armoireLocalizedName, StringComparison.OrdinalIgnoreCase)))
-            {
-                kind = StationKind.Armoire;
-                maxRange = EventObjectInteractRangeYalms;
-                return true;
-            }
-
-            if (intent == MagicActionIntent.Sort
-                && (glamourDresserIds.Contains(obj.BaseId)
-                    || string.Equals(name, glamourDresserLocalizedName, StringComparison.OrdinalIgnoreCase)))
-            {
-                kind = StationKind.GlamourDresser;
-                maxRange = EventObjectInteractRangeYalms;
-                return true;
-            }
-
-            if (intent == MagicActionIntent.Buy
-                && (marketBoardIds.Contains(obj.BaseId)
-                    || string.Equals(name, marketBoardLocalizedName, StringComparison.OrdinalIgnoreCase)))
-            {
-                kind = StationKind.MarketBoard;
-                maxRange = EventObjectInteractRangeYalms;
-                return true;
+                if (rule.MatchesIntent(intent)
+                    && (rule.Ids.Contains(obj.BaseId)
+                        || string.Equals(name, rule.LocalizedName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    kind = rule.Kind;
+                    maxRange = EventObjectInteractRangeYalms;
+                    return true;
+                }
             }
 
             return false;
@@ -876,8 +756,10 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         return false;
     }
 
-    private static (HashSet<uint> Ids, string LocalizedName) BuildEObjStationLookup(
+    private static EObjStationRule BuildEObjRule(
         IDataManager dataManager,
+        StationKind kind,
+        Func<MagicActionIntent, bool> matchesIntent,
         uint canonicalRowId,
         string fallbackName)
     {
@@ -885,47 +767,38 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
         var eobjSheet = dataManager.GetExcelSheet<EObjName>();
         if (eobjSheet == null)
         {
-            return (ids, fallbackName);
+            return new EObjStationRule(kind, matchesIntent, ids, fallbackName);
         }
 
         var canonicalName = eobjSheet.GetRowOrDefault(canonicalRowId)?.Singular.ExtractText()?.Trim();
         if (string.IsNullOrWhiteSpace(canonicalName))
         {
-            return (ids, fallbackName);
+            return new EObjStationRule(kind, matchesIntent, ids, fallbackName);
         }
 
         foreach (var row in eobjSheet)
         {
-            if (row.RowId == 0)
-            {
-                continue;
-            }
-
-            if (string.Equals(row.Singular.ExtractText().Trim(), canonicalName, StringComparison.OrdinalIgnoreCase))
+            if (row.RowId != 0
+                && string.Equals(row.Singular.ExtractText().Trim(), canonicalName, StringComparison.OrdinalIgnoreCase))
             {
                 ids.Add(row.RowId);
             }
         }
 
-        return (ids, canonicalName);
+        return new EObjStationRule(kind, matchesIntent, ids, canonicalName);
     }
 
     private bool HasGilShopHandler(uint enpcId)
     {
-        var enpcSheet = dataManager.GetExcelSheet<ENpcBase>();
-        var row = enpcSheet?.GetRowOrDefault(enpcId);
-        if (row is null)
+        var row = dataManager.GetExcelSheet<ENpcBase>()?.GetRowOrDefault(enpcId);
+        var gilShopSheet = dataManager.GetExcelSheet<GilShop>();
+        if (row is null || gilShopSheet == null)
         {
             return false;
         }
 
-        var gilShopSheet = dataManager.GetExcelSheet<GilShop>();
         var topicSheet = dataManager.GetExcelSheet<TopicSelect>();
         var preHandlerSheet = dataManager.GetExcelSheet<PreHandler>();
-        if (gilShopSheet == null)
-        {
-            return false;
-        }
 
         bool IsGilShopOrWrapped(uint handlerId)
         {
@@ -939,16 +812,10 @@ public sealed unsafe class MagicActionCoordinator : IDisposable
                 return true;
             }
 
-            if (preHandlerSheet != null && preHandlerSheet.TryGetRow(handlerId, out var pre))
-            {
-                var targetId = pre.Target.RowId;
-                if (targetId != 0 && gilShopSheet.HasRow(targetId))
-                {
-                    return true;
-                }
-            }
-
-            return false;
+            return preHandlerSheet != null
+                && preHandlerSheet.TryGetRow(handlerId, out var pre)
+                && pre.Target.RowId != 0
+                && gilShopSheet.HasRow(pre.Target.RowId);
         }
 
         foreach (var dataRef in row.Value.ENpcData)

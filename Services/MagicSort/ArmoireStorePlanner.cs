@@ -97,7 +97,7 @@ public sealed unsafe class ArmoireStorePlanner
                 }
 
                 if (!manifestEntries.TryGetValue(baseId, out var entry)
-                    || !string.Equals(entry.Route, "Armoire", StringComparison.OrdinalIgnoreCase))
+                    || entry.Route.Kind != RouteKind.Armoire)
                 {
                     continue;
                 }
@@ -136,10 +136,7 @@ public sealed unsafe class ArmoireStorePlanner
                     continue;
                 }
 
-                if (!string.Equals(
-                    safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile),
-                    "Armoire",
-                    StringComparison.OrdinalIgnoreCase))
+                if (safety.ResolveEffectiveSlotRoute(entry, itemRow, slot, manifestEntries, gearsetIds, unlockedProfile)?.Kind != RouteKind.Armoire)
                 {
                     continue;
                 }
@@ -453,7 +450,7 @@ public sealed unsafe class ArmoireStorePlanner
     }
 
     private bool HasManualArmoireOverride(uint baseItemId)
-        => safety.HasManualRouteOverride(baseItemId, "Armoire");
+        => safety.HasManualRouteOverride(baseItemId, RouteKind.Armoire);
 
     private void LoadCabinetLookup()
     {
